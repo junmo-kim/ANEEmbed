@@ -19,13 +19,24 @@ public struct RuntimeInfo: Sendable, Equatable {
     public var backend: String
     /// Model functions in use (empty for runtimes without named functions).
     public var functions: [String]
+    /// Loaded functions that are not served (they failed the self-test, or the package has no case for them).
+    public var notServed: [String]
+    /// Loaded with `--selftest skip`: every function serves unchecked.
+    public var selfTestSkipped: Bool
 
-    public init(maxTokens: Int, maxImageTokens: Int, bucketLengths: [Int], backend: String, functions: [String] = []) {
+    /// Serving, but with less than was loaded or without the self-test (`/health` says "degraded").
+    public var degraded: Bool { !notServed.isEmpty || selfTestSkipped }
+
+    public init(maxTokens: Int, maxImageTokens: Int, bucketLengths: [Int], backend: String, functions: [String] = [],
+                notServed: [String] = [], selfTestSkipped: Bool = false)
+    {
         self.maxTokens = maxTokens
         self.maxImageTokens = maxImageTokens
         self.bucketLengths = bucketLengths
         self.backend = backend
         self.functions = functions
+        self.notServed = notServed
+        self.selfTestSkipped = selfTestSkipped
     }
 }
 

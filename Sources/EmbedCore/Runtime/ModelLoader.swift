@@ -81,6 +81,8 @@ public enum ModelLoader {
             }
 
             var report = LoadReport()
+            let loaded = buckets.functionNames + (long?.functionNames ?? []) + (vision?.functionNames ?? [])
+            let loadedImageTokens = vision?.maxTokens ?? 0
             if let suite {
                 let testStarted = Date()
                 let results = await suite.run(buckets: buckets, long: long, vision: vision,
@@ -92,7 +94,8 @@ public enum ModelLoader {
                         + (result.relativeError.map { ", rel err \($0)" } ?? "") + (result.error.map { ", \($0)" } ?? ""))
                 }
                 log(String(format: "self-test: %@ in %.1fs", selfTest.summary, selfTest.seconds))
-                try? selfTest.save(to: directory)
+                // Merged with the last run's records of functions this --max-tokens did not load, so doctor stays truthful.
+                try? selfTest.merged(with: SelfTestReport.load(from: directory)).save(to: directory)
                 report.selfTest = selfTest
                 // Allowlist: only functions with a passing result in this run serve.
                 let servable = selfTest.servable
@@ -104,18 +107,25 @@ public enum ModelLoader {
                                        hint: "see `aneembed doctor`; please report the macOS build")
                 }
             }
-            if let long, long.lengths.last != longLengths.last {
-                let limit = long.lengths.last ?? buckets.lengths.last!
-                log("texts are limited to \(limit) tokens: long-text functions failed the self-test")
-            }
             let longRunner = long.flatMap {
                 $0.lengths.isEmpty ? nil : LongTextEngine(runner: $0, rows: table, maxIdlePerLength: max(1, config.limits.longConcurrency))
             }
             let visionEncoder = vision.flatMap { $0.budgets.isEmpty ? nil : $0 }
             report.functions = buckets.functionNames + (long?.functionNames ?? []) + (visionEncoder?.functionNames ?? [])
+            let notServed = loaded.filter { !report.functions.contains($0) }
             let runtime = BucketTextRuntime(runner: buckets, rows: table, long: longRunner, vision: visionEncoder,
                                             maxIdleBuffers: max(2, config.limits.queryConcurrency), backend: "coreml-ane",
-                                            functions: report.functions, warmed: report.selfTest != nil)
+                                            functions: report.functions, notServed: notServed,
+                                            selfTestSkipped: suite == nil, warmed: report.selfTest != nil)
+            // Whatever was dropped, say what the limits are now.
+            if runtime.info.maxTokens < config.maxTokens {
+                log("texts are limited to \(runtime.info.maxTokens) tokens (--max-tokens \(config.maxTokens)): "
+                    + "\(notServed.joined(separator: ", ")) not served")
+            }
+            if runtime.info.maxImageTokens < loadedImageTokens {
+                log("images are limited to \(runtime.info.maxImageTokens) soft tokens (0: no images): "
+                    + "\(notServed.filter { $0.hasPrefix("vision_") }.joined(separator: ", ")) not served")
+            }
             report.seconds = Date().timeIntervalSince(started)
             let service = EmbeddingService(tokenizer: tokenizer, runtime: runtime, limits: config.limits, modelName: config.modelName)
             return (service, report)

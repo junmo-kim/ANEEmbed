@@ -11,14 +11,19 @@ public final class BucketTextRuntime: EmbeddingRuntime {
     let buffers: BucketBufferPool
     public let backend: String
     private let functions: [String]
+    private let notServed: [String]
+    private let selfTestSkipped: Bool
     /// Every function already ran once (the load-time self-test), so `warm()` has nothing left to do.
     private let warmed: Bool
 
     public init(runner: any BucketFunctionRunner, rows: any TokenRowSource, long: (any LongTextRunner)? = nil,
                 vision: (any VisionEncoder)? = nil, costs: [Int: Double] = PackingPlanner.defaultCosts,
-                maxIdleBuffers: Int = 4, backend: String, functions: [String] = [], warmed: Bool = false)
+                maxIdleBuffers: Int = 4, backend: String, functions: [String] = [], notServed: [String] = [],
+                selfTestSkipped: Bool = false, warmed: Bool = false)
     {
         self.functions = functions
+        self.notServed = notServed
+        self.selfTestSkipped = selfTestSkipped
         self.warmed = warmed
         planner = PackingPlanner(lengths: runner.lengths, costs: costs)
         self.runner = runner
@@ -35,7 +40,8 @@ public final class BucketTextRuntime: EmbeddingRuntime {
 
     public var info: RuntimeInfo {
         RuntimeInfo(maxTokens: max(planner.maxLength, long?.maxTokens ?? 0), maxImageTokens: vision?.maxTokens ?? 0,
-                    bucketLengths: planner.lengths, backend: backend, functions: functions)
+                    bucketLengths: planner.lengths, backend: backend, functions: functions, notServed: notServed,
+                    selfTestSkipped: selfTestSkipped)
     }
 
     public func warm() async throws {

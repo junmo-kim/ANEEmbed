@@ -39,6 +39,23 @@ struct HTTPContractTests {
         #expect(model?[0]["dimensions"] == [768, 512, 256, 128])
     }
 
+    /// Functions that failed the self-test (or a skipped self-test) leave the server up but degraded: still 200,
+    /// so a client keeps working, with what is not served and the context limit that remains.
+    @Test func healthReportsADegradedModel() async {
+        let lengths = [64, 128, 256, 512, 768, 1024, 1280, 1536]
+        let runtime = BucketTextRuntime(runner: PoolingFakeRunner(lengths: lengths), rows: HashedTokenRows(), backend: "fake",
+                                        notServed: ["winp2048_b512"])
+        let degraded = Router(state: ServerState(.ready(EmbeddingService(tokenizer: ByteTokenizer(), runtime: runtime))), modelName: "m")
+        let (status, body) = await call("GET", "/health", router: degraded)
+        #expect(status == 200 && body["status"] == "degraded")
+        #expect(body["not_served"] == ["winp2048_b512"] && body["max_context_length"]?.intValue == 1536)
+        let unchecked = BucketTextRuntime(runner: PoolingFakeRunner(), rows: HashedTokenRows(), backend: "coreml-ane",
+                                          selfTestSkipped: true)
+        let skipped = Router(state: ServerState(.ready(EmbeddingService(tokenizer: ByteTokenizer(), runtime: unchecked))), modelName: "m")
+        let (skippedStatus, skippedBody) = await call("GET", "/health", router: skipped)
+        #expect(skippedStatus == 200 && skippedBody["status"] == "degraded" && skippedBody["selftest"] == "skipped")
+    }
+
     @Test func loadingAndFailedStates() async {
         let loading = Router(state: ServerState(.loading), modelName: "m")
         #expect(await call("GET", "/health", router: loading) == (503, ["status": "loading"]))

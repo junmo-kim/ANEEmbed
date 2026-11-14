@@ -252,6 +252,26 @@ struct SelfTestTests {
         #expect(narrow.map(\.passed) == [false] && narrow[0].error != nil)
     }
 
+    /// A load with a smaller --max-tokens tests fewer functions; the records of the others stay (same OS build and
+    /// binary), so doctor still shows an earlier failure.
+    @Test func reportsMergeWithTheLastRunOfTheSameBuild() {
+        let earlier = SelfTestReport(osBuild: "26A", ranAt: Date(timeIntervalSince1970: 1), seconds: 1, results: [
+            SelfTestResult(function: "embed_64", kind: "bucket", passed: true, cosine: 1),
+            SelfTestResult(function: "winp2048_b512", kind: "winp", passed: false, cosine: 0.5),
+        ], binary: "x")
+        let now = SelfTestReport(osBuild: "26A", ranAt: Date(timeIntervalSince1970: 2), seconds: 1, results: [
+            SelfTestResult(function: "embed_64", kind: "bucket", passed: false, cosine: 0.9),
+        ], binary: "x")
+        let merged = now.merged(with: earlier)
+        #expect(merged.results.map(\.function) == ["embed_64", "winp2048_b512"])
+        #expect(merged.results.map(\.passed) == [false, false])
+        #expect(now.merged(with: SelfTestReport(osBuild: "26B", ranAt: .distantPast, seconds: 0, results: earlier.results,
+                                                binary: "x")).results.count == 1)
+        #expect(now.merged(with: SelfTestReport(osBuild: "26A", ranAt: .distantPast, seconds: 0, results: earlier.results,
+                                                binary: "y")).results.count == 1)
+        #expect(now.merged(with: nil) == now)
+    }
+
     @Test func reportRoundTripsAndSummarizes() throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("aneembed-selftest-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)

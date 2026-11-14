@@ -2,7 +2,8 @@
 //
 //   POST  /v1/embeddings (/embeddings)   OpenAI-compatible embeddings
 //   GET   /v1/models (/models)           the model id and its limits
-//   GET   /health                        200 ready, 503 loading or failed
+//   GET   /health                        200 ready ("ok", or "degraded" when loaded functions are not served
+//                                        or the self-test was skipped), 503 loading or failed
 //   POST  /mcp                           MCP JSON-RPC (one message per request)
 //   QUERY /{tool}?<options>              one-shot tool call (RFC 10008 QUERY, as in macvis): the body is the
 //                                        raw input (UTF-8 text for embed_text, image bytes for embed_image)
@@ -42,7 +43,14 @@ public struct Router: Sendable {
 
     func health() -> HTTPResponse {
         switch state.status {
-        case .ready: return .json(200, ["status": "ok"])
+        case .ready(let service):
+            let info = service.runtime.info
+            guard info.degraded else { return .json(200, ["status": "ok"]) }
+            var body: JSONObject = ["status": "degraded", "max_context_length": .int(service.maxTokens),
+                                    "max_image_tokens": .int(service.maxImageTokens)]
+            if !info.notServed.isEmpty { body["not_served"] = .array(info.notServed.map(JSONValue.string)) }
+            if info.selfTestSkipped { body["selftest"] = "skipped" }
+            return .json(200, .object(body))
         case .loading: return .json(503, ["status": "loading"])
         case .failed(let error): return .json(503, ["status": "error", "detail": .string(error.message)])
         }

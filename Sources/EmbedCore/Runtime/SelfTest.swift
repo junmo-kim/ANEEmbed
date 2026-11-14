@@ -24,7 +24,7 @@ public struct SelfTestResult: Sendable, Equatable {
     public var error: String?
 
     public var json: JSONValue {
-        var object: JSONObject = ["function": .string(function), "pass": .bool(passed),
+        var object: JSONObject = ["function": .string(function), "kind": .string(kind), "pass": .bool(passed),
                                   "cos": .number((cosine * 1e6).rounded() / 1e6)]
         if let relativeError { object["rel_err"] = .number((relativeError * 1e5).rounded() / 1e5) }
         if let unusedRowsMaxAbs { object["unused_max_abs"] = .number(unusedRowsMaxAbs) }
@@ -41,6 +41,8 @@ public struct SelfTestReport: Sendable, Equatable {
     public var results: [SelfTestResult]
     /// Whether the package carried self-test data at all.
     public var available: Bool
+    /// SHA-256 of the executable that ran it (the Neural Engine compile is per executable).
+    public var binary: String
 
     public var failed: [SelfTestResult] { results.filter { !$0.passed } }
 
@@ -50,12 +52,26 @@ public struct SelfTestReport: Sendable, Equatable {
         Set(results.map(\.function)).subtracting(failed.map(\.function))
     }
 
-    public init(osBuild: String, ranAt: Date, seconds: Double, results: [SelfTestResult], available: Bool = true) {
+    public init(osBuild: String, ranAt: Date, seconds: Double, results: [SelfTestResult], available: Bool = true,
+                binary: String = Executable.identity)
+    {
         self.osBuild = osBuild
         self.ranAt = ranAt
         self.seconds = seconds
         self.results = results
         self.available = available
+        self.binary = binary
+    }
+
+    /// This run plus the records of `previous` for functions this run did not test, when both ran on the same
+    /// macOS build with the same executable (a load with a smaller --max-tokens tests fewer functions, and an
+    /// earlier failure must stay visible to doctor).
+    public func merged(with previous: SelfTestReport?) -> SelfTestReport {
+        guard let previous, previous.osBuild == osBuild, previous.binary == binary, previous.available else { return self }
+        let tested = Set(results.map(\.function))
+        var merged = self
+        merged.results += previous.results.filter { !tested.contains($0.function) }
+        return merged
     }
 
     public var summary: String {
@@ -70,7 +86,7 @@ public struct SelfTestReport: Sendable, Equatable {
         [
             "os_build": .string(osBuild), "ran_at": .string(ISO8601DateFormatter().string(from: ranAt)),
             "seconds": .number((seconds * 100).rounded() / 100), "summary": .string(summary),
-            "available": .bool(available), "results": .array(results.map(\.json)),
+            "available": .bool(available), "binary_sha256": .string(binary), "results": .array(results.map(\.json)),
         ]
     }
 
@@ -85,14 +101,14 @@ public struct SelfTestReport: Sendable, Equatable {
         else { return nil }
         let results = (root["results"]?.arrayValue ?? []).compactMap { item -> SelfTestResult? in
             guard let function = item["function"]?.stringValue, let passed = item["pass"]?.boolValue else { return nil }
-            return SelfTestResult(function: function, kind: "", passed: passed, cosine: item["cos"]?.doubleValue ?? 0,
+            return SelfTestResult(function: function, kind: item["kind"]?.stringValue ?? "", passed: passed, cosine: item["cos"]?.doubleValue ?? 0,
                                   relativeError: item["rel_err"]?.doubleValue, unusedRowsMaxAbs: item["unused_max_abs"]?.doubleValue,
                                   error: item["error"]?.stringValue)
         }
         return SelfTestReport(osBuild: build,
                               ranAt: root["ran_at"]?.stringValue.flatMap { ISO8601DateFormatter().date(from: $0) } ?? .distantPast,
                               seconds: root["seconds"]?.doubleValue ?? 0, results: results,
-                              available: root["available"]?.boolValue ?? true)
+                              available: root["available"]?.boolValue ?? true, binary: root["binary_sha256"]?.stringValue ?? "")
     }
 }
 
