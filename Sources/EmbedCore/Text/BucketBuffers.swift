@@ -55,12 +55,28 @@ public final class BucketBuffers: @unchecked Sendable {
     }
 
     /// Fills everything for a call whose texts are token ids: rows, biases and pool.
-    public func prepare(_ call: PackedCall, ids: [[Int32]], table: TokenTable) {
+    public func prepare(_ call: PackedCall, ids: [[Int32]], rows: some TokenRowSource) {
+        prepare(call, sequences: ids.map { ModelSequence(ids: $0) }, rows: rows)
+    }
+
+    /// Fills everything for a call: each sequence's rows (token rows or given rows), biases and pool.
+    public func prepare(_ call: PackedCall, sequences: [ModelSequence], rows: some TokenRowSource) {
         precondition(call.length == length)
         for segment in call.segments {
-            let tokens = ids[segment.item]
-            precondition(tokens.count == segment.length)
-            table.gather(tokens, into: embedsRow(segment.offset))
+            let sequence = sequences[segment.item]
+            precondition(sequence.count == segment.length)
+            var position = segment.offset
+            for part in sequence.parts {
+                switch part {
+                case .ids(let ids):
+                    rows.gather(ids, into: embedsRow(position))
+                    position += ids.count
+                case .rows(let values):
+                    let count = values.count / BucketContract.hidden
+                    values.withUnsafeBufferPointer { embedsRow(position).update(from: $0.baseAddress!, count: values.count) }
+                    position += count
+                }
+            }
         }
         setLayout(call.segments)
     }
@@ -128,6 +144,43 @@ public final class BucketBuffers: @unchecked Sendable {
         let lower = max(segment.offset, row - BucketContract.window)
         let upper = min(segment.offset + segment.length, row + BucketContract.window + 1)
         return (lower, upper)
+    }
+}
+
+/// What one pooled sequence is made of: token ids (looked up and scaled) and/or raw model rows
+/// (image soft tokens, 512 fp16 values per row, not scaled).
+public enum SequencePart: Sendable {
+    case ids([Int32])
+    case rows([Float16])
+}
+
+public struct ModelSequence: Sendable {
+    public var parts: [SequencePart]
+
+    public init(parts: [SequencePart]) {
+        self.parts = parts
+    }
+
+    public init(ids: [Int32]) {
+        parts = [.ids(ids)]
+    }
+
+    /// `<bos> <|image> rows <image|> <eos>`
+    public static func image(rows: [Float16]) -> ModelSequence {
+        ModelSequence(parts: [
+            .ids([SpecialTokens.bos, SpecialTokens.imageStart]), .rows(rows),
+            .ids([SpecialTokens.imageEnd, SpecialTokens.eos]),
+        ])
+    }
+
+    /// Rows this sequence occupies.
+    public var count: Int {
+        parts.reduce(0) { total, part in
+            switch part {
+            case .ids(let ids): return total + ids.count
+            case .rows(let rows): return total + rows.count / BucketContract.hidden
+            }
+        }
     }
 }
 

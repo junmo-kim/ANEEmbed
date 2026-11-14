@@ -82,10 +82,10 @@ struct BucketBufferTests {
         let (data, _) = TokenTableTests.table()
         let table = try TokenTable(data: data)
         let buffers = BucketBuffers(length: 64)
-        buffers.prepare(PackedCall(length: 64, segments: layout([3, 2])), ids: [[1, 2, 3], [0, 1]], table: table)
+        buffers.prepare(PackedCall(length: 64, segments: layout([3, 2])), ids: [[1, 2, 3], [0, 1]], rows: table)
         let row4 = Array(UnsafeBufferPointer(start: buffers.embedsRow(4), count: TokenTable.width))
         #expect(row4.map(Float.init) == table.row(1))
-        buffers.prepare(PackedCall(length: 64, segments: layout([2])), ids: [[3, 3]], table: table)
+        buffers.prepare(PackedCall(length: 64, segments: layout([2])), ids: [[3, 3]], rows: table)
         let stale = UnsafeBufferPointer(start: buffers.embedsRow(2), count: 3 * TokenTable.width)
         #expect(stale.allSatisfy { $0 == 0 })
     }
