@@ -1,0 +1,160 @@
+// Reusable input buffers for one bucket length, and a pool of them.
+//
+// Building an S x S bias from scratch costs S^2 writes (4M fp16 values at 2048) per call. A buffer
+// instead remembers the layout it was last filled with and only rewrites the blocks that change:
+// resetting the old blocks to -1e4 and opening the new ones costs the sum of len^2 over the texts.
+// Steady state allocates nothing.
+import Foundation
+
+public final class BucketBuffers: @unchecked Sendable {
+    public let length: Int
+    public let slots: Int
+    public let inputsEmbeds: UnsafeMutablePointer<Float16>
+    public let globalBias: UnsafeMutablePointer<Float16>
+    /// Same memory as `globalBias` when every key is inside the window anyway (S <= window + 1).
+    public let localBias: UnsafeMutablePointer<Float16>
+    public let pool: UnsafeMutablePointer<Float16>
+    public var localSharesGlobal: Bool { localBias == globalBias }
+
+    /// Layout of the last fill.
+    private var segments: [PackedSegment] = []
+    private var used: Int
+    /// Rows below this may hold old token data (rows >= used are padding).
+    private var dirtyRows = 0
+
+    public static let alignment = 16_384  // page aligned
+
+    public init(length: Int) {
+        self.length = length
+        slots = BucketContract.slots(forLength: length)
+        let hidden = BucketContract.hidden
+        func allocate(_ count: Int, fill: Float16) -> UnsafeMutablePointer<Float16> {
+            let raw = UnsafeMutableRawPointer.allocate(byteCount: count * 2, alignment: Self.alignment)
+            let pointer = raw.bindMemory(to: Float16.self, capacity: count)
+            pointer.initialize(repeating: fill, count: count)
+            return pointer
+        }
+        inputsEmbeds = allocate(length * hidden, fill: 0)
+        globalBias = allocate(length * length, fill: BucketContract.blocked)
+        localBias = length <= BucketContract.window + 1 ? globalBias : allocate(length * length, fill: BucketContract.blocked)
+        pool = allocate(slots * length, fill: 0)
+        used = length  // no padding diagonal is open yet
+    }
+
+    deinit {
+        inputsEmbeds.deallocate()
+        globalBias.deallocate()
+        if localBias != globalBias { localBias.deallocate() }
+        pool.deallocate()
+    }
+
+    /// Row `position` of inputs_embeds (512 fp16 values), for callers that write rows themselves
+    /// (image soft tokens).
+    public func embedsRow(_ position: Int) -> UnsafeMutablePointer<Float16> {
+        inputsEmbeds + position * BucketContract.hidden
+    }
+
+    /// Fills everything for a call whose texts are token ids: rows, biases and pool.
+    public func prepare(_ call: PackedCall, ids: [[Int32]], table: TokenTable) {
+        precondition(call.length == length)
+        for segment in call.segments {
+            let tokens = ids[segment.item]
+            precondition(tokens.count == segment.length)
+            table.gather(tokens, into: embedsRow(segment.offset))
+        }
+        setLayout(call.segments)
+    }
+
+    /// Sets biases and pool for `newSegments` and zeroes stale padding rows of inputs_embeds.
+    public func setLayout(_ newSegments: [PackedSegment]) {
+        precondition(newSegments.count <= slots)
+        var newUsed = 0
+        for segment in newSegments {
+            precondition(segment.offset == newUsed && segment.length > 0, "segments must be contiguous from row 0")
+            newUsed += segment.length
+        }
+        precondition(newUsed <= length)
+        // Same layout as the last call (repeated batch shapes, a warm buffer): biases and pool are already right.
+        if newSegments == segments && newUsed == used { return }
+        let blocked = BucketContract.blocked
+
+        // 1. Close the previous blocks and padding diagonal.
+        for segment in segments {
+            for row in segment.offset..<(segment.offset + segment.length) {
+                (globalBias + row * length + segment.offset).update(repeating: blocked, count: segment.length)
+                if !localSharesGlobal {
+                    let (lower, upper) = band(row: row, segment: segment)
+                    (localBias + row * length + lower).update(repeating: blocked, count: upper - lower)
+                }
+            }
+        }
+        for row in used..<length {
+            globalBias[row * length + row] = blocked
+            if !localSharesGlobal { localBias[row * length + row] = blocked }
+        }
+        for (slot, segment) in segments.enumerated() {
+            (pool + slot * length + segment.offset).update(repeating: 0, count: segment.length)
+        }
+
+        // 2. Open the new blocks (local: inside the window) and the padding diagonal.
+        for (slot, segment) in newSegments.enumerated() {
+            for row in segment.offset..<(segment.offset + segment.length) {
+                (globalBias + row * length + segment.offset).update(repeating: 0, count: segment.length)
+                if !localSharesGlobal {
+                    let (lower, upper) = band(row: row, segment: segment)
+                    (localBias + row * length + lower).update(repeating: 0, count: upper - lower)
+                }
+            }
+            let weight = Float16(1 / Float(segment.length))
+            (pool + slot * length + segment.offset).update(repeating: weight, count: segment.length)
+        }
+        for row in newUsed..<length {
+            globalBias[row * length + row] = 0
+            if !localSharesGlobal { localBias[row * length + row] = 0 }
+        }
+
+        // 3. Padding rows must be finite; zero the ones that held tokens before.
+        if dirtyRows > newUsed {
+            embedsRow(newUsed).update(repeating: 0, count: (dirtyRows - newUsed) * BucketContract.hidden)
+        }
+        dirtyRows = newUsed
+        segments = newSegments
+        used = newUsed
+    }
+
+    /// Columns [lower, upper) of `row` that are inside both the segment and the window.
+    @inline(__always)
+    private func band(row: Int, segment: PackedSegment) -> (Int, Int) {
+        let lower = max(segment.offset, row - BucketContract.window)
+        let upper = min(segment.offset + segment.length, row + BucketContract.window + 1)
+        return (lower, upper)
+    }
+}
+
+/// Idle buffers per bucket length. A call checks one out, fills it, runs, and returns it.
+public final class BucketBufferPool: @unchecked Sendable {
+    private let lock = NSLock()
+    private var idle: [Int: [BucketBuffers]] = [:]
+    private let maxIdlePerLength: Int
+
+    public init(maxIdlePerLength: Int = 4) {
+        self.maxIdlePerLength = maxIdlePerLength
+    }
+
+    public func checkout(length: Int) -> BucketBuffers {
+        if let buffers = lock.withLock({ idle[length]?.popLast() }) { return buffers }
+        return BucketBuffers(length: length)
+    }
+
+    public func checkin(_ buffers: BucketBuffers) {
+        lock.withLock {
+            var list = idle[buffers.length, default: []]
+            if list.count < maxIdlePerLength { list.append(buffers) }
+            idle[buffers.length] = list
+        }
+    }
+
+    public func idleCount(length: Int) -> Int {
+        lock.withLock { idle[length]?.count ?? 0 }
+    }
+}
