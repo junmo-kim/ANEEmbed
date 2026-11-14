@@ -18,7 +18,8 @@ Reference per text: ids = [<bos>] + tokenizer(text) + [<eos>], last_hidden_state
 tokens, L2-normalized (this equals sentence-transformers `encode`, checked below). Images: the processor
 with its default 280-token budget, the same pooling over <bos> <|image> soft tokens <image|> <eos>.
 
-Usage (venv with torch transformers sentence-transformers tokenizers pillow numpy; CPU only):
+Usage (the tools/convert venv; CPU only). corpus.json and the image folder come from tools/convert
+(fetch.py data, corpus.py, images.py), the model from `fetch.py models`:
     python -I scripts/accuracy/reference.py --hf-dir DIR --corpus corpus.json --images DIR --out reference.json
 """
 import argparse
@@ -32,7 +33,7 @@ import torch
 
 PROMPT = "title: none | text: "
 BOS, EOS = 2, 1
-DOCS = (0, 1, 2, 3, 5, 6)  # en, ko, ja, zh README; ko and ja constitution (corpus.py order)
+DOCS = (0, 1, 2, 3, 5, 6)  # en, ko, ja, zh README; ko and ja constitution (tools/convert/corpus.py order)
 
 
 def main():

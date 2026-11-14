@@ -210,7 +210,8 @@ budget. `usage.prompt_tokens` matched the reference token count in all 113 reque
 | images, up to 8 per request | 13 | 0.999957 | 0.999979 |
 
 The default `--max-tokens 2048` gives the same numbers for everything up to 2048 tokens (same functions).
-To reproduce: `scripts/accuracy/reference.py` writes the reference vectors (needs PyTorch and the original
+To reproduce: `tools/convert/fetch.py data`, `corpus.py` and `images.py` rebuild the inputs from pinned public
+sources, `scripts/accuracy/reference.py` writes the reference vectors (needs PyTorch and the original
 model), `scripts/accuracy/compare.py` queries a running `aneembed serve` (standard library only).
 
 The tokenizer is checked token for token against Hugging Face `tokenizers` on 12,420 generated texts
@@ -269,6 +270,10 @@ aneembed bench --image photo.jpg --buckets --breakdown   # latency, memory, per-
 
 The test binary is another executable, so the first `ModelTests` run compiles the model for the Neural
 Engine again (minutes).
+
+The model package itself is built by [`tools/convert`](tools/convert/README.md) (Python, CPU only) from the
+original weights at a pinned revision; a rebuild reproduces its weights, compiled program and self-test byte for
+byte.
 
 ## License
 
