@@ -74,9 +74,9 @@ public struct PackingPlanner: Sendable {
     /// Estimated cost of one call per bucket length (any unit).
     public let costs: [Int: Double]
 
-    /// Placeholder per-call latencies in ms (M-series ANE, order of magnitude only). Replace with the
-    /// numbers measured by `aneembed models warm --measure` once the final package exists.
-    public static let defaultCosts: [Int: Double] = [64: 2.5, 128: 3.5, 256: 6, 512: 12, 1024: 45, 2048: 180]
+    /// Per-call latency in ms of each bucket, one text filling it (`aneembed bench --buckets`, Apple M4,
+    /// macOS 27). Only the ratios matter to the planner; other chips scale them roughly together.
+    public static let defaultCosts: [Int: Double] = [64: 5.0, 128: 6.5, 256: 12.0, 512: 30.6, 1024: 80.7, 2048: 247.3]
 
     public init(lengths: [Int] = BucketContract.lengths, costs: [Int: Double] = PackingPlanner.defaultCosts) {
         precondition(!lengths.isEmpty)
