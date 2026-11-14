@@ -147,25 +147,79 @@ public struct SelfTestSuite: Sendable {
         }
     }
 
+    /// Built-in tolerance of each kind. A package may tighten it, never loosen it, and a limit a kind does not
+    /// measure (relative error outside vision, unused rows outside packing) does not apply.
+    static let defaultTolerance: [String: Tolerance] = [
+        "bucket": Tolerance(minCosine: 0.999, maxRelativeError: nil, unusedRowsMaxAbs: 1e-3),
+        "winp": Tolerance(minCosine: 0.999, maxRelativeError: nil, unusedRowsMaxAbs: 1e-3),
+        "winl": Tolerance(minCosine: 0.999, maxRelativeError: nil, unusedRowsMaxAbs: nil),
+        "vision": Tolerance(minCosine: 0.999, maxRelativeError: 0.05, unusedRowsMaxAbs: nil),
+    ]
+
+    /// The tolerance a case of `kind` is held to: the stricter of the package's value and the built-in one.
+    public func tolerance(for kind: String) -> Tolerance {
+        let base = Self.defaultTolerance[kind] ?? Tolerance(minCosine: 0.999, maxRelativeError: nil, unusedRowsMaxAbs: nil)
+        let declared = tolerance[kind]
+        func stricter(_ limit: Double?, _ declared: Double?) -> Double? { limit.map { min($0, declared ?? $0) } }
+        return Tolerance(minCosine: max(base.minCosine, declared?.minCosine ?? 0),
+                         maxRelativeError: stricter(base.maxRelativeError, declared?.maxRelativeError),
+                         unusedRowsMaxAbs: stricter(base.unusedRowsMaxAbs, declared?.unusedRowsMaxAbs))
+    }
+
+    /// Largest dimension of a data block and of a document; keeps every product far from Int overflow.
+    static let maxDimension = 1 << 20
+
+    /// Parses and checks every field the run indexes or multiplies with, so a malformed file is an error here
+    /// and never an overflow or an out-of-bounds trap later.
     public init(json: Data, blob: Data) throws {
         let root = try JSONValue.parse(json)
         guard root["format"]?.stringValue == "aneembed-selftest/1" else { throw SelfTestError.invalid("unknown format") }
         self.blob = blob
-        func block(_ value: JSONValue?) throws -> (Int, [Int]) {
-            guard let offset = value?["offset"]?.intValue, let shape = value?["shape"]?.arrayValue?.compactMap(\.intValue),
-                offset >= 0, offset + shape.reduce(4, *) <= blob.count
-            else { throw SelfTestError.invalid("bad data block") }
+        func block(_ value: JSONValue?, _ name: String) throws -> (Int, [Int]) {
+            guard let offset = value?["offset"]?.intValue, let items = value?["shape"]?.arrayValue, offset >= 0,
+                !items.isEmpty, items.count <= 3
+            else { throw SelfTestError.invalid("\(name): bad data block") }
+            var count = 4
+            var shape: [Int] = []
+            for item in items {
+                guard let dimension = item.intValue, (1...Self.maxDimension).contains(dimension) else {
+                    throw SelfTestError.invalid("\(name): bad shape")
+                }
+                let (product, overflow) = count.multipliedReportingOverflow(by: dimension)
+                guard !overflow else { throw SelfTestError.invalid("\(name): shape too large") }
+                count = product
+                shape.append(dimension)
+            }
+            let (end, overflow) = offset.addingReportingOverflow(count)
+            guard !overflow, end <= blob.count else { throw SelfTestError.invalid("\(name): block outside \(ModelLayout.selfTestData)") }
             return (offset, shape)
         }
-        let (digestOffset, digestShape) = try block(root["digest"])
+        func ids(_ value: JSONValue?, _ name: String) throws -> [Int32] {
+            guard let items = value?.arrayValue, items.count <= Self.maxDimension else { throw SelfTestError.invalid("\(name): not a list") }
+            return try items.map { item in
+                guard let id = item.intValue, let id32 = Int32(exactly: id), id32 >= 0 else {
+                    throw SelfTestError.invalid("\(name): bad token id")
+                }
+                return id32
+            }
+        }
+        let (digestOffset, digestShape) = try block(root["digest"], "digest")
         guard digestShape == [BucketContract.hidden, Self.digestWidth] else { throw SelfTestError.invalid("digest shape \(digestShape)") }
-        digest = Self.floats(blob, offset: digestOffset, count: digestShape.reduce(1, *))
-        documentIDs = (root["doc_ids"]?.arrayValue ?? []).compactMap { $0.intValue.map(Int32.init) }
+        digest = Self.floats(blob, offset: digestOffset, count: BucketContract.hidden * Self.digestWidth)
+        documentIDs = root["doc_ids"] == nil ? [] : try ids(root["doc_ids"], "doc_ids")
         var tolerance: [String: Tolerance] = [:]
         for (kind, value) in root["tolerance"]?.objectValue?.pairs ?? [] {
-            guard let minCosine = value["min_cos"]?.doubleValue else { continue }
-            tolerance[kind] = Tolerance(minCosine: minCosine, maxRelativeError: value["max_rel_err"]?.doubleValue,
-                                        unusedRowsMaxAbs: value["zero_rows_max_abs"]?.doubleValue)
+            func limit(_ key: String) throws -> Double? {
+                guard let item = value[key] else { return nil }
+                guard let number = item.doubleValue, number.isFinite, number >= 0 else {
+                    throw SelfTestError.invalid("tolerance \(kind).\(key)")
+                }
+                return number
+            }
+            guard let minCosine = try limit("min_cos") else { continue }
+            guard minCosine <= 1 else { throw SelfTestError.invalid("tolerance \(kind).min_cos") }
+            tolerance[kind] = Tolerance(minCosine: minCosine, maxRelativeError: try limit("max_rel_err"),
+                                        unusedRowsMaxAbs: try limit("zero_rows_max_abs"))
         }
         self.tolerance = tolerance
         var cases: [Case] = []
@@ -173,13 +227,42 @@ public struct SelfTestSuite: Sendable {
             guard let function = test["function"]?.stringValue, let kind = test["kind"]?.stringValue else {
                 throw SelfTestError.invalid("test without function or kind")
             }
-            let (offset, shape) = try block(test["expected"])
-            let grid = test["grid"]?.arrayValue?.compactMap(\.intValue) ?? []
-            cases.append(Case(
-                function: function, kind: kind,
-                sequences: (test["sequences"]?.arrayValue ?? []).map { ($0.arrayValue ?? []).compactMap { $0.intValue.map(Int32.init) } },
-                documentRows: test["doc_rows"]?.intValue ?? 0,
-                grid: grid.count == 2 ? (grid[0], grid[1]) : (0, 0), expectedOffset: offset, expectedShape: shape))
+            let (offset, shape) = try block(test["expected"], function)
+            var item = Case(function: function, kind: kind, sequences: [], documentRows: 0, grid: (0, 0),
+                            expectedOffset: offset, expectedShape: shape)
+            switch kind {
+            case "bucket", "winp":
+                guard let length = BucketContract.lengths.first(where: { BucketContract.functionName(forLength: $0) == function }),
+                    BucketContract.isWindowed(length) == (kind == "winp"), let list = test["sequences"]?.arrayValue
+                else { throw SelfTestError.invalid("\(function): not a \(kind) function or no sequences") }
+                item.sequences = try list.map { try ids($0, function) }
+                let total = item.sequences.reduce(0) { $0 + $1.count }
+                guard !item.sequences.isEmpty, item.sequences.count <= BucketContract.slots(forLength: length),
+                    item.sequences.allSatisfy({ !$0.isEmpty }), total <= length
+                else { throw SelfTestError.invalid("\(function): sequences do not fit \(length) rows") }
+                guard shape == [item.sequences.count, BucketContract.dimension] else {
+                    throw SelfTestError.invalid("\(function): expected shape \(shape)")
+                }
+            case "winl":
+                guard let length = WindowContract.longLengths.first(where: { WindowContract.longName($0) == function }),
+                    let rows = test["doc_rows"]?.intValue, rows >= 1, rows <= min(length, documentIDs.count)
+                else { throw SelfTestError.invalid("\(function): bad doc_rows") }
+                guard shape == [BucketContract.dimension] else { throw SelfTestError.invalid("\(function): expected shape \(shape)") }
+                item.documentRows = rows
+            case "vision":
+                let grid = test["grid"]?.arrayValue?.compactMap(\.intValue) ?? []
+                guard let budget = Int(function.dropFirst("vision_".count)), function.hasPrefix("vision_"),
+                    CoreMLVisionEncoder.allBudgets.contains(budget), grid.count == 2,
+                    grid.allSatisfy({ $0 >= 3 && $0 <= 3 * budget && $0 % 3 == 0 })
+                else { throw SelfTestError.invalid("\(function): bad grid") }
+                let tokens = (grid[0] / 3) * (grid[1] / 3)
+                guard tokens <= budget else { throw SelfTestError.invalid("\(function): grid of \(tokens) tokens") }
+                guard shape == [tokens, Self.digestWidth] else { throw SelfTestError.invalid("\(function): expected shape \(shape)") }
+                item.grid = (grid[0], grid[1])
+            default:
+                break  // a kind this build does not know: its function has no case and is not served
+            }
+            cases.append(item)
         }
         self.cases = cases
     }
@@ -235,7 +318,7 @@ public struct SelfTestSuite: Sendable {
     {
         var results: [SelfTestResult] = []
         for test in cases {
-            let tolerance = self.tolerance[test.kind] ?? Tolerance(minCosine: 0.999, maxRelativeError: 0.05)
+            let tolerance = self.tolerance(for: test.kind)
             var result = SelfTestResult(function: test.function, kind: test.kind, passed: false, cosine: 0)
             do {
                 switch test.kind {
@@ -308,6 +391,10 @@ public struct SelfTestSuite: Sendable {
     private func runBucket(_ test: Case, length: Int, runner: any BucketFunctionRunner, rows: any TokenRowSource,
                            into result: inout SelfTestResult) async throws
     {
+        let total = test.sequences.reduce(0) { $0 + $1.count }
+        guard !test.sequences.isEmpty, test.sequences.count <= BucketContract.slots(forLength: length), total <= length,
+            test.sequences.allSatisfy({ !$0.isEmpty })
+        else { throw SelfTestError.invalid("\(test.function): sequences do not fit \(length) rows") }
         var offset = 0
         let segments = test.sequences.enumerated().map { index, ids -> PackedSegment in
             defer { offset += ids.count }
@@ -316,10 +403,15 @@ public struct SelfTestSuite: Sendable {
         let buffers = BucketBuffers(length: length)
         buffers.prepare(PackedCall(length: length, segments: segments), ids: test.sequences, rows: rows)
         let output = try await runner.run(buffers)
+        let width = BucketContract.dimension
+        guard output.count >= test.sequences.count, output.allSatisfy({ $0.count == width }) else {
+            throw RuntimeError.model("\(test.function) returned \(output.count) rows of \(output.first?.count ?? 0) values")
+        }
         let reference = expected(test)
+        guard reference.count == test.sequences.count * width else { throw SelfTestError.invalid("\(test.function): expected shape") }
         var worst = 1.0
         for row in test.sequences.indices {
-            let cosine = Self.metrics(output[row], Array(reference[(row * 768)..<((row + 1) * 768)])).cosine
+            let cosine = Self.metrics(output[row], Array(reference[(row * width)..<((row + 1) * width)])).cosine
             if !(cosine >= worst) { worst = cosine }  // keeps a NaN (Swift's min(1.0, .nan) is 1.0)
         }
         result.cosine = worst
@@ -334,6 +426,9 @@ public struct SelfTestSuite: Sendable {
         let buffers = LongBuffers(length: length)
         buffers.prepare(ids: Array(documentIDs.prefix(n)), rows: rows)
         let embedding = try await runner.run(buffers)
+        guard embedding.count == BucketContract.dimension else {
+            throw RuntimeError.model("\(test.function) returned \(embedding.count) values")
+        }
         result.cosine = Self.metrics(embedding, expected(test)).cosine
     }
 }
