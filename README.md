@@ -164,6 +164,11 @@ tokens took 493 s in that run (not investigated further). ² M5 Ultra has two Ne
 two documents at once. The M5 Ultra numbers were taken while another Neural Engine embedding service was
 running on the same machine.
 
+M4 vs M5 Ultra: a single request runs on one Neural Engine, so one request is only 1.2–1.6× faster on the
+M5 Ultra (most at 32 tokens, where reading the weights dominates; about 1.3× at 2048 and 8192 tokens, where compute
+dominates). Concurrent and batched work spreads over its two Neural Engines (32 cores vs 16), which is where the
+2–2.5× gap comes from. Memory does not depend on the chip.
+
 Where the time goes (M4): over 98% of every text request is the Neural Engine. For a 2048-token text the
 host spends 0.4 ms tokenizing, 0.1 ms on token rows, biases and pool, and 0.15 ms on Core ML inputs, the
 output and JSON, around a 247 ms call. An image spends 16 ms decoding and resizing, 438 ms in the vision
