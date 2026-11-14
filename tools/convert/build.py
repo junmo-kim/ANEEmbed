@@ -6,7 +6,9 @@
 fetch.py models downloads both inputs at the pinned revisions (see sources.json and README.md).
 
 Stages (default: all, in order; each is idempotent and skips finished work unless --force):
-  convert   one single-function .mlpackage per function into <work>/fn/  (fp16 ML Program, macOS 15)
+  convert   one single-function .mlpackage per function into <work>/fn/  (fp16 ML Program, macOS 15):
+            embed_{64..1280} (full attention), winp{1536,2048}_b512 (windowed, packing),
+            winl{3072,4096,6144,8192}_b512 (windowed, one long text per call)
   merge     multifunction merge -> <out>/EmbeddingGemma2Text.mlpackage (coremltools dedups identical weights)
   compile   xcrun coremlcompiler -> <out>/EmbeddingGemma2Text.mlmodelc
   assets    embeddings.bf16 (from model.safetensors), tokenizer.json, vision package + position table (copied
@@ -63,43 +65,27 @@ def hf_revision(hf_dir):
 
 def function_specs():
     """(name, kind, args, inputs [(name, shape)], outputs [(name, dtype)])"""
-    from eg2 import BUCKETS, CHUNK, HALO, LONG_BUCKETS, k_for
-    W = CHUNK + 2 * HALO
+    from eg2 import BAND, BUCKETS, WINDOW_LONG, WINDOW_PACK, k_for
+    from host import function_name
     specs = []
     for S in BUCKETS:
-        specs.append((f"embed_{S}", "bucket", (S,),
+        specs.append((function_name(S), "bucket", (S,),
                       [("inputs_embeds", (1, S, 512)), ("global_bias", (1, 1, S, S)), ("local_bias", (1, 1, S, S)),
                        ("pool", (k_for(S), S))], [("embedding", "fp32")]))
-    for i in range(24):
-        if i % 6 != 5:
-            specs.append((f"long_swa_l{i}", "swa", (i,),
-                          [("hidden_window", (1, W, 512)), ("inputs_embeds", (1, CHUNK, 512)), ("bias", (1, 1, CHUNK, W))],
-                          [("hidden_out", "fp16")]))
-    for S in LONG_BUCKETS:
-        for i in (5, 11, 17):
-            specs.append((f"long{S}_glb_l{i}", "glb", (i, S),
-                          [("hidden", (1, S, 512)), ("inputs_embeds", (1, S, 512)), ("key_bias", (1, 1, 1, S))],
-                          [("hidden_out", "fp16")]))
-        specs.append((f"long{S}_head", "head", (S,),
-                      [("hidden", (1, S, 512)), ("inputs_embeds", (1, S, 512)), ("key_bias", (1, 1, 1, S)),
+    for S in WINDOW_PACK:
+        specs.append((function_name(S), "winp", (S,),
+                      [("inputs_embeds", (1, S, 512)), ("band_bias", (1, 1, S, BAND)), ("global_bias", (1, 1, S, S)),
+                       ("pool", (k_for(S), S))], [("embedding", "fp32")]))
+    for S in WINDOW_LONG:
+        specs.append((function_name(S, long=True), "winl", (S,),
+                      [("inputs_embeds", (1, S, 512)), ("band_bias", (1, 1, S, BAND)), ("key_bias", (1, 1, 1, S)),
                        ("pool", (1, S))], [("embedding", "fp32")]))
     return specs
 
 
-def output_shape(kind, args):
-    from eg2 import CHUNK, k_for
-    if kind == "bucket":
-        return (k_for(args[0]), 768)
-    if kind == "swa":
-        return (1, CHUNK, 512)
-    if kind == "glb":
-        return (1, args[1], 512)
-    return (1, 768)
-
-
 def make_module(W, kind, args):
-    from eg2 import Bucket, GlobalHead, GlobalLayer, SwaLayer
-    return {"bucket": Bucket, "swa": SwaLayer, "glb": GlobalLayer, "head": GlobalHead}[kind](W, *args).eval()
+    from eg2 import Bucket, Window
+    return {"bucket": Bucket, "winp": Window, "winl": Window}[kind](W, *args).eval()
 
 
 def convert_one(W, spec, path):

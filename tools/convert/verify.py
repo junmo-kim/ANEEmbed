@@ -2,8 +2,10 @@
 equals HF sentence-transformers at cos 1.000000, see verify_hf.py). Inputs are built only from shipped artifacts
 through host.py (the documented host contract).
 
-Usage: verify.py text <dist> <corpus.json> --hf-dir <snapshot>    buckets: single full/half, packed short, mixed
-       verify.py long <dist> <corpus.json> --hf-dir <snapshot>    long path 2049..8192 via host.LongPath
+Usage: verify.py text <dist> <corpus.json> --hf-dir <snapshot>    embed_S and winp: single full/half, packed short,
+                                                                  mixed long + short, two long
+       verify.py long <dist> <corpus.json> --hf-dir <snapshot>    winl: one text of 2049..8192 tokens per call,
+                                                                  incl. the lengths at and just over each size
 corpus.json comes from corpus.py, the snapshot from fetch.py models.
 Prints one line per case and a final SUMMARY json {category: {n, min, median}}."""
 import argparse
@@ -50,20 +52,26 @@ def text_rows(d, n, start=0):
     return tab.rows(seq)
 
 
-def add(cat, c):
+allv = []
+
+
+def add(cat, c, total=True):
     res.setdefault(cat, []).append(c)
+    if total:
+        allv.append(c)
 
 
 def summary():
     s = {k: {"n": len(v), "min": round(min(v), 6), "median": round(float(np.median(v)), 6)} for k, v in res.items()}
-    allv = [c for k, v in res.items() if not k.startswith("embed_") for c in v]
     s["ALL"] = {"n": len(allv), "min": round(min(allv), 6), "median": round(float(np.median(allv)), 6)}
     print("SUMMARY", json.dumps(s), flush=True)
 
 
 if mode == "text":
-    for S in host.BUCKETS:
-        m = fn(f"embed_{S}")
+    MIXED = {1024: 600, 1280: 850, 1536: 1100, 2048: 1500}   # + 422 rows of short texts <= S
+    for S in host.PACK_SIZES:
+        name = host.function_name(S)
+        m = fn(name)
         K = host.k_for(S)
         rng = np.random.default_rng(S)
         cases = []
@@ -80,44 +88,43 @@ if mode == "text":
                 tot += n
             cases.append(("packed_short", [((trial * 5 + j) % len(ids), n) for j, n in enumerate(lens)]))
         if S >= 1024:
-            big = 600 if S == 1024 else 1500
-            cases.append(("mixed_long_short", [(1, big), (4, 120), (11, 64), (6, 200), (8, 31), (2, 7)]))
+            cases.append(("mixed_long_short", [(1, MIXED[S]), (4, 120), (11, 64), (6, 200), (8, 31), (2, 7)]))
             cases.append(("two_long", [(5, S // 2 - 40), (9, S // 2 - 30)]))
         for cat, spec in cases:
             rows = [text_rows(d, n, start=53 * d + n) for d, n in spec]
-            out = m.predict(host.pack_bucket(rows, S))["embedding"]
+            t = time.perf_counter()
+            out = m.predict(host.pack(rows, S))["embedding"]
+            dt = (time.perf_counter() - t) * 1000
             cs = [host.cos(out[k], ref_embed(W, r)) for k, r in enumerate(rows)]
             zero = float(np.abs(out[len(rows):]).max()) if len(rows) < K else 0.0
             for c in cs:
                 add(cat, c)
-                add(f"embed_{S}", c)
-            print(f"S={S} {cat} lens={[n for _, n in spec]} cos={[round(c, 6) for c in cs]} unused-max|x|={zero:.3g}", flush=True)
+                add(name, c, total=False)
+            print(f"{name} {cat} lens={[n for _, n in spec]} cos={[round(c, 6) for c in cs]} unused-max|x|={zero:.3g} "
+                  f"predict={dt:.0f} ms", flush=True)
         del m
     summary()
 
 if mode == "long":
     fns = {}
     t0 = time.time()
-    for S in host.LONG_BUCKETS:
-        for nm in host.LongPath.names(S):
-            if nm not in fns:
-                fns[nm] = fn(nm)
-    print(f"loaded {len(fns)} long-path functions in {time.time() - t0:.1f}s", flush=True)
-    lp = host.LongPath(fns)
-    long_docs = [i for i, x in enumerate(ids) if len(x) >= 8192]
-    lengths = [2049, 2600, 3300, 4096, 4097, 5000, 6100, 7000, 8192]
+    for S in host.WINDOW_LONG:
+        fns[S] = fn(host.function_name(S, long=True))
+    print(f"loaded {len(fns)} long functions in {time.time() - t0:.1f}s", flush=True)
+    lengths = [2049, 2600, 3072, 3073, 3500, 4096, 4097, 5000, 6144, 6145, 7000, 8191, 8192]
     j = 0
     for L in lengths:
         cand = [i for i, x in enumerate(ids) if len(x) >= L]
-        for r in range(4 if L in (2049, 4096, 4097, 8192) else 3):
+        S = host.long_size(L)
+        for r in range(4 if L in (2049, 3073, 4097, 6145, 8192) else 3):
             d = cand[(j + r * 3) % len(cand)]
             seq = ids[d][:L - 1] + [host.EOS]
             rows = tab.rows(seq)
-            tm = []
-            e = lp.run(rows, timing=tm)
+            t = time.perf_counter()
+            e = np.asarray(fns[S].predict(host.long_feed(rows, S))["embedding"][0], np.float32)
+            dt = (time.perf_counter() - t) * 1000
             c = host.cos(e, ref_embed(W, rows))
-            band = "2049-4096" if L <= 4096 else "4097-8192"
-            add(f"long_{band}", c)
-            print(f"long n={L} doc={docs[d]['name']} cos={c:.6f} predict-sum={tm[0] * 1000:.0f} ms", flush=True)
+            add(f"winl{S}", c)
+            print(f"long n={L} winl{S} doc={docs[d]['name']} cos={c:.6f} predict={dt:.0f} ms", flush=True)
         j += 1
     summary()

@@ -3,32 +3,47 @@
 This is the executable spec the Swift runtime mirrors. It only reads the shipped artifacts
 (embeddings.bf16, position_embeddings.f16, tokenizer.json, the .mlmodelc packages).
 
-Text, <= 2048 tokens:   pack sequences into the smallest bucket embed_S (see pack_bucket) -> embedding rows.
-Text, 2049..8192:       long path, 20 sliding-layer calls per chunk + 4 global calls (see LongPath.run).
+Text, <= 1280 rows:     pack sequences into embed_S, S in BUCKETS (pack_bucket) -> one embedding row each.
+Text, 1281..2048 rows:  windowed packing function winp{1536,2048}_b512 (pack_window); shorter sequences can
+                        share the call. pack() picks the right feed for any packing size.
+Text, 2049..8192 rows:  one call of winl{S}_b512, S = smallest of WINDOW_LONG >= n (long_feed), one document.
 Image:                  HF Gemma4ImageProcessor pixels -> vision_{70,140,280} -> image tokens, wrapped as
                         <bos><|image> tokens <image|><eos> and embedded like a text sequence (packable).
+
+Windowed functions take the sliding-window mask as a band, band_bias [1,1,S,1536]: row r, column c is query row
+r against key row (r // 512) * 512 - 512 + c; 0 if both rows belong to the same sequence and |r - key| <= 512,
+or key == r; else -1e4. Columns whose key row is outside [0, S) are never read by the graph.
 """
-import json
 import math
-import os
-import time
 
 import numpy as np
 
 NEG = -1e4
 WINDOW = 512
-CHUNK, HALO = 1024, 512
-BUCKETS = (64, 128, 256, 512, 1024, 2048)
-LONG_BUCKETS = (4096, 8192)
+BUCKETS = (64, 128, 256, 512, 768, 1024, 1280)
+BLOCK, HALO = 512, 512
+BAND = BLOCK + 2 * HALO
+WINDOW_PACK = (1536, 2048)
+WINDOW_LONG = (3072, 4096, 6144, 8192)
+PACK_SIZES = BUCKETS + WINDOW_PACK
 SCALE = math.sqrt(512)
 BOS, EOS, PAD, BOI, EOI, IMAGE = 2, 1, 0, 255999, 258882, 258880
-SLIDING = [i for i in range(24) if i % 6 != 5]
-GLOBAL = [5, 11, 17, 23]
 DOC_PREFIX = "title: none | text: "
 
 
 def k_for(S):
     return max(8, S // 32)
+
+
+def function_name(S, long=False):
+    """embed_S (S in BUCKETS), winp{S}_b512 (S in WINDOW_PACK), winl{S}_b512 (long=True, S in WINDOW_LONG)"""
+    if long:
+        assert S in WINDOW_LONG
+        return f"winl{S}_b{BLOCK}"
+    if S in BUCKETS:
+        return f"embed_{S}"
+    assert S in WINDOW_PACK
+    return f"winp{S}_b{BLOCK}"
 
 
 class TokenTable:
@@ -52,16 +67,14 @@ class Tokenizer:
         return [BOS] + self.t.encode(prefix + text, add_special_tokens=False).ids + [EOS]
 
 
-# ---------------------------------------------------------------- buckets (<= 2048 rows per call)
+# ---------------------------------------------------------------- packing functions (<= 2048 rows per call)
 
 def bucket_for(total):
-    return next(S for S in BUCKETS if S >= total)
+    """smallest packing size (embed_S or winp) that holds `total` rows"""
+    return next(S for S in PACK_SIZES if S >= total)
 
 
-def pack_bucket(rows, S):
-    """rows: list of fp32 [n_k,512] sequences (sum n_k <= S, count <= K). Returns the embed_S feed (fp16).
-    Sequences occupy consecutive rows from 0; RoPE is relative so restarting positions is unnecessary
-    (the functions use absolute positions 0..S-1 internally)."""
+def _segments(rows, S):
     K = k_for(S)
     assert len(rows) <= K and sum(len(r) for r in rows) <= S
     x = np.zeros((1, S, 512), np.float32)
@@ -77,23 +90,47 @@ def pack_bucket(rows, S):
     i = np.arange(S)
     same = ((seg[:, None] == seg[None, :]) & (seg[None, :] >= 0)) | (i[:, None] == i[None, :])
     g = np.where(same, 0.0, NEG).astype(np.float16).reshape(1, 1, S, S)
+    return x, seg, pool, same, g
+
+
+def pack_bucket(rows, S):
+    """rows: list of fp32 [n_k,512] sequences (sum n_k <= S, count <= K). Returns the embed_S feed (fp16).
+    Sequences occupy consecutive rows from 0; RoPE is relative so restarting positions is unnecessary
+    (the functions use absolute positions 0..S-1 internally)."""
+    x, seg, pool, same, g = _segments(rows, S)
+    i = np.arange(S)
     loc = np.where(same & (np.abs(i[:, None] - i[None, :]) <= WINDOW), 0.0, NEG).astype(np.float16).reshape(1, 1, S, S)
     return {"inputs_embeds": x.astype(np.float16), "global_bias": g, "local_bias": loc, "pool": pool.astype(np.float16)}
 
 
-# ---------------------------------------------------------------- long path (2049..8192 rows)
+def band_bias(S, seg):
+    """seg [S]: sequence id per row (-1 = padding) -> band_bias [1,1,S,BAND] fp16 (see the module docstring)"""
+    nb = S // BLOCK
+    qa = np.arange(S).reshape(nb, BLOCK)[:, :, None]
+    ka = (np.arange(nb) * BLOCK - HALO)[:, None, None] + np.arange(BAND)[None, None, :]
+    kin = (ka >= 0) & (ka < S)
+    kseg = np.where(kin, seg[np.clip(ka, 0, S - 1)], -1)
+    qseg = seg[qa]
+    ok = ((np.abs(qa - ka) <= WINDOW) & (kseg == qseg) & (kseg >= 0)) | (qa == ka)
+    return np.where(ok, 0.0, NEG).astype(np.float16).reshape(1, 1, S, BAND)
 
-def long_bucket(n):
-    return next(S for S in LONG_BUCKETS if S >= n)
+
+def pack_window(rows, S):
+    """winp{S}_b512 feed: as pack_bucket, with band_bias instead of local_bias."""
+    x, seg, pool, _, g = _segments(rows, S)
+    return {"inputs_embeds": x.astype(np.float16), "band_bias": band_bias(S, seg), "global_bias": g,
+            "pool": pool.astype(np.float16)}
 
 
-def chunk_bias(b, n):
-    """[1,1,C,W] for chunk b: query rows b*C..b*C+C-1, key rows b*C-H .. b*C-H+W-1 (window-local)."""
-    W = CHUNK + 2 * HALO
-    qa = b * CHUNK + np.arange(CHUNK)[:, None]
-    ka = b * CHUNK - HALO + np.arange(W)[None, :]
-    ok = ((np.abs(qa - ka) <= WINDOW) & (ka >= 0) & (ka < n)) | (ka == qa)
-    return np.where(ok, 0.0, NEG).astype(np.float16).reshape(1, 1, CHUNK, W)
+def pack(rows, S):
+    """feed of the packing function of size S (embed_S or winp{S}_b512)"""
+    return pack_bucket(rows, S) if S in BUCKETS else pack_window(rows, S)
+
+
+# ---------------------------------------------------------------- long texts (2049..8192 rows, one per call)
+
+def long_size(n):
+    return next(S for S in WINDOW_LONG if S >= n)
 
 
 LONG_POOL_WEIGHT = 1.0 / 1024
@@ -106,51 +143,16 @@ def long_pool(n, S):
     return np.where(np.arange(S) < n, LONG_POOL_WEIGHT, 0.0).astype(np.float16).reshape(1, S)
 
 
-class LongPath:
-    """fns: dict name -> object with .predict(dict) -> dict (Core ML function handles)."""
-
-    def __init__(self, fns):
-        self.fns = fns
-
-    @staticmethod
-    def names(S):
-        return [f"long_swa_l{i}" for i in SLIDING] + [f"long{S}_glb_l{i}" for i in GLOBAL[:-1]] + [f"long{S}_head"]
-
-    def run(self, rows, skip_pad_chunks=True, timing=None):
-        n = len(rows)
-        S = long_bucket(n)
-        nb = S // CHUNK
-        x0 = np.zeros((1, S, 512), np.float16)
-        x0[0, :n] = rows
-        biases = [chunk_bias(b, n) for b in range(nb)]
-        key_bias = np.where(np.arange(S) < n, 0.0, NEG).astype(np.float16).reshape(1, 1, 1, S)
-        pool = long_pool(n, S)
-        live = [b for b in range(nb) if not (skip_pad_chunks and b * CHUNK >= n)]
-        x = x0
-        tp = 0.0
-        for i in range(24):
-            t = time.perf_counter()
-            if i in SLIDING:
-                xp = np.zeros((1, S + 2 * HALO, 512), np.float16)
-                xp[:, HALO:HALO + S] = x
-                out = x.copy()                     # skipped (all-padding) chunks keep their previous rows
-                f = self.fns[f"long_swa_l{i}"]
-                for b in live:
-                    out[:, b * CHUNK:(b + 1) * CHUNK] = f.predict({
-                        "hidden_window": xp[:, b * CHUNK:b * CHUNK + CHUNK + 2 * HALO],
-                        "inputs_embeds": x0[:, b * CHUNK:(b + 1) * CHUNK],
-                        "bias": biases[b]})["hidden_out"]
-                x = out
-            elif i != 23:
-                x = self.fns[f"long{S}_glb_l{i}"].predict({"hidden": x, "inputs_embeds": x0, "key_bias": key_bias})[
-                    "hidden_out"].astype(np.float16)
-            else:
-                e = self.fns[f"long{S}_head"].predict({"hidden": x, "inputs_embeds": x0, "key_bias": key_bias,
-                                                       "pool": pool})["embedding"]
-            tp += time.perf_counter() - t
-        if timing is not None:
-            timing.append(tp)
-        return np.asarray(e[0], np.float32)
+def long_feed(rows, S):
+    """winl{S}_b512 feed for one sequence rows [n,512] (n <= S): token rows, band, key_bias, pool"""
+    n = len(rows)
+    assert n <= S
+    x = np.zeros((1, S, 512), np.float16)
+    x[0, :n] = rows
+    seg = np.where(np.arange(S) < n, 0, -1)
+    return {"inputs_embeds": x, "band_bias": band_bias(S, seg),
+            "key_bias": np.where(np.arange(S) < n, 0.0, NEG).astype(np.float16).reshape(1, 1, 1, S),
+            "pool": long_pool(n, S)}
 
 
 # ---------------------------------------------------------------- images

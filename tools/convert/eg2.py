@@ -10,14 +10,17 @@ against it (see verify_hf.py). Differences are numerically neutral rewrites that
   * RoPE tables are graph constants at absolute positions 0..S-1. A runtime positions / rope input miscompiles.
   * Every mask is a runtime input (bias tensor). Graph-constant masks miscompile on the ANE for S > 512.
   * The per-layer-embedding (PLE) projection is computed per layer from a [512,512] slice of the [12288,512]
-    weight, so the bucket functions and the long-path layer functions carry identical weight constants and
-    the multifunction merge stores them once.
+    weight, so every function carries identical weight constants and the multifunction merge stores them once.
+  * Sliding layers of the windowed functions attend block by block: query block b (B = 512 rows) sees the key
+    rows b*B - 512 .. b*B + B + 512 (static, clipped slices; the band mask is an input). Padding the keys in the
+    graph (F.pad) made the layer about 3x slower on the ANE, so the slices are clipped instead.
 
 Modules (all fp32 here; converted with compute_precision=FLOAT16):
-  Bucket(S, K)        embed_S          one call embeds up to K packed sequences of total length <= S
-  SwaLayer(i)         long_swa_l{i}    sliding layer i on one 1024-row chunk with 512-row halos
-  GlobalLayer(i, S)   long{S}_glb_l{i} global layer i over the whole (padded) document, S in {4096, 8192}
-  GlobalHead(S)       long{S}_head     global layer 23 + final norm + mean pool + projection + L2 normalize
+  Bucket(S)           embed_S          up to k_for(S) packed sequences of total length <= S, full S x S attention
+  Window(S)           winp{S}_b512     packed sequences, total <= S: sliding layers over [S, 1536] bands,
+                                       global layers over [S, S] (global_bias)
+                      winl{S}_b512     one sequence of n <= S rows: sliding layers over bands, global layers
+                                       over all S keys with key_bias; pool [1, S] (2^-10 on valid rows)
   Reference(S)        fp32 ground truth (attention_mask input, constant band), HF-equivalent
 """
 import json
@@ -31,10 +34,12 @@ from safetensors import safe_open
 
 NEG = -1e4            # additive mask value (fp16-safe)
 WINDOW = 512          # config.sliding_window; HF bidirectional sliding mask keeps |i - j| <= 512
-CHUNK = 1024          # long path: query rows per sliding-layer call
-HALO = 512            # long path: key rows on each side of the chunk (== WINDOW)
-LONG_BUCKETS = (4096, 8192)
-BUCKETS = (64, 128, 256, 512, 1024, 2048)
+BUCKETS = (64, 128, 256, 512, 768, 1024, 1280)   # embed_S: full attention, packing
+BLOCK = 512           # windowed functions: query rows per sliding-attention block
+HALO = 512            # key rows on each side of a block (== WINDOW)
+BAND = BLOCK + 2 * HALO   # band_bias columns: keys b*BLOCK - HALO .. b*BLOCK + BLOCK + HALO - 1
+WINDOW_PACK = (1536, 2048)                # winp{S}_b512: windowed, packing
+WINDOW_LONG = (3072, 4096, 6144, 8192)    # winl{S}_b512: windowed, one sequence per call
 SCALE = math.sqrt(512)
 
 
@@ -111,22 +116,18 @@ class Weights(nn.Module):
         self.global_layers = [i for i, m in enumerate(self.layers) if not m.swa]
 
 
-def layer(W, i, x, x0, cq, sq, ck, sk, bias, q0=0, nq=None):
-    """Decoder layer i. x [1,Nk,512] hidden rows used as keys; queries (and the residual stream) are rows
-    q0..q0+nq of x (all rows when nq is None). x0 = inputs_embeds of the query rows (per-layer input)."""
+def layer(W, i, x, x0, c, s, attend):
+    """Decoder layer i over x [1,S,512]; x0 = inputs_embeds (per-layer input).
+    attend(q, k, v, kvh) -> [1,4,S,hd] is the attention (masks are bound by the caller)."""
     m = W.layers[i]
     hd, kvh = m.hd, m.kvh
     h = rms(x, m.input_layernorm)
-    if nq is not None:
-        x, hq = x[:, q0:q0 + nq], h[:, q0:q0 + nq]
-    else:
-        hq = h
-    q = rms(F.linear(hq, m.q_proj).reshape(1, -1, 4, hd).transpose(1, 2), m.q_norm)
+    q = rms(F.linear(h, m.q_proj).reshape(1, -1, 4, hd).transpose(1, 2), m.q_norm)
     k = rms(F.linear(h, m.k_proj).reshape(1, -1, kvh, hd).transpose(1, 2), m.k_norm)
     v = rms(F.linear(h, m.v_proj).reshape(1, -1, kvh, hd).transpose(1, 2))
-    q = q * cq + rot_half(q, hd // 2) * sq
-    k = k * ck + rot_half(k, hd // 2) * sk
-    o = attend_fold(q, k, v, bias, kvh).transpose(1, 2).reshape(1, -1, 4 * hd)
+    q = q * c + rot_half(q, hd // 2) * s
+    k = k * c + rot_half(k, hd // 2) * s
+    o = attend(q, k, v, kvh).transpose(1, 2).reshape(1, -1, 4 * hd)
     x = x + rms(F.linear(o, m.o_proj), m.post_attention_layernorm)
     h = rms(x, m.pre_feedforward_layernorm)
     h = F.linear(F.gelu(F.linear(h, m.gate_proj), approximate="tanh") * F.linear(h, m.up_proj), m.down_proj)
@@ -135,6 +136,28 @@ def layer(W, i, x, x0, cq, sq, ck, sk, bias, q0=0, nq=None):
     gte = F.gelu(F.linear(x, m.ple_gate), approximate="tanh") * ple
     x = x + rms(F.linear(gte, m.ple_proj), m.ple_block_post_per_layer_input_norm)
     return x * m.scalar
+
+
+def full_attention(bias):
+    """all keys, one additive bias broadcastable to [1,4,S,S]"""
+    def attend(q, k, v, kvh):
+        return attend_fold(q, k, v, bias, kvh)
+    return attend
+
+
+def band_attention(band, S):
+    """Block-local attention: query block b (rows b*BLOCK ..) against key rows b*BLOCK - HALO .. b*BLOCK + BLOCK +
+    HALO, clipped to [0, S). band [1,1,S,BAND]: row r, column c <-> key row (r // BLOCK) * BLOCK - HALO + c
+    (columns outside [0, S) are never read). Unrolled over the S / BLOCK blocks on static slices."""
+    def attend(q, k, v, kvh):
+        outs = []
+        for b in range(S // BLOCK):
+            lo = b * BLOCK - HALO
+            clo, chi = max(lo, 0), min(lo + BAND, S)
+            bb = band[:, :, b * BLOCK:(b + 1) * BLOCK, clo - lo:chi - lo]
+            outs.append(attend_fold(q[:, :, b * BLOCK:(b + 1) * BLOCK], k[:, :, clo:chi], v[:, :, clo:chi], bb, kvh))
+        return torch.cat(outs, dim=2)
+    return attend
 
 
 def head(W, x, pool):
@@ -170,51 +193,32 @@ class Bucket(nn.Module):
 
     def forward(self, inputs_embeds, global_bias, local_bias, pool):
         x = inputs_embeds
+        glb, loc = full_attention(global_bias), full_attention(local_bias)
         for i, m in enumerate(self.W.layers):
             c, s = self.t.get(m)
-            x = layer(self.W, i, x, inputs_embeds, c, s, c, s, local_bias if m.swa else global_bias)
+            x = layer(self.W, i, x, inputs_embeds, c, s, loc if m.swa else glb)
         return head(self.W, x, pool)
 
 
-class SwaLayer(nn.Module):
-    """long_swa_l{i}: hidden_window [1,C+2H,512], inputs_embeds [1,C,512], bias [1,1,C,C+2H] -> hidden_out [1,C,512]
-    RoPE positions are window-local (RoPE only depends on i - j)."""
-
-    def __init__(self, W, i):
-        super().__init__()
-        self.W, self.i = W, i
-        assert W.layers[i].swa
-        self.t = _Tables(W, CHUNK + 2 * HALO)
-
-    def forward(self, hidden_window, inputs_embeds, bias):
-        c, s = self.t.get(self.W.layers[self.i])
-        return layer(self.W, self.i, hidden_window, inputs_embeds, c[HALO:HALO + CHUNK], s[HALO:HALO + CHUNK], c, s,
-                     bias, q0=HALO, nq=CHUNK)
-
-
-class GlobalLayer(nn.Module):
-    """long{S}_glb_l{i}: hidden [1,S,512], inputs_embeds [1,S,512], key_bias [1,1,1,S] -> hidden_out [1,S,512]"""
-
-    def __init__(self, W, i, S):
-        super().__init__()
-        self.W, self.i = W, i
-        assert not W.layers[i].swa
-        self.t = _Tables(W, S)
-
-    def forward(self, hidden, inputs_embeds, key_bias):
-        c, s = self.t.get(self.W.layers[self.i])
-        return layer(self.W, self.i, hidden, inputs_embeds, c, s, c, s, key_bias)
-
-
-class GlobalHead(GlobalLayer):
-    """long{S}_head: the last layer (23, global) fused with the output head.
-    hidden, inputs_embeds, key_bias as GlobalLayer, pool [1,S] (host.long_pool: 2^-10 on the n valid rows; not 1/n, which underflows fp16) -> embedding [1,768]"""
+class Window(nn.Module):
+    """winp{S}_b512 (packed): inputs_embeds [1,S,512], band_bias [1,1,S,BAND], global_bias [1,1,S,S], pool [K,S]
+    winl{S}_b512 (long):    inputs_embeds [1,S,512], band_bias [1,1,S,BAND], key_bias [1,1,1,S],    pool [1,S]
+    -> embedding [K or 1, 768]. Sliding layers use band_attention, global layers attend to all S keys with the
+    third input (global_bias or key_bias, which broadcasts over query rows)."""
 
     def __init__(self, W, S):
-        super().__init__(W, W.L - 1, S)
+        super().__init__()
+        assert S % BLOCK == 0
+        self.W, self.S = W, S
+        self.t = _Tables(W, S)
 
-    def forward(self, hidden, inputs_embeds, key_bias, pool):
-        return head(self.W, super().forward(hidden, inputs_embeds, key_bias), pool)
+    def forward(self, inputs_embeds, band_bias, global_or_key_bias, pool):
+        x = inputs_embeds
+        loc, glb = band_attention(band_bias, self.S), full_attention(global_or_key_bias)
+        for i, m in enumerate(self.W.layers):
+            c, s = self.t.get(m)
+            x = layer(self.W, i, x, inputs_embeds, c, s, loc if m.swa else glb)
+        return head(self.W, x, pool)
 
 
 class Reference(nn.Module):

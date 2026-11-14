@@ -8,17 +8,17 @@ in selftest.bin (little-endian float32, offsets in selftest.json). Inputs:
 
   bucket embed_S     sequences (token id lists incl. <bos>/<eos>) packed with host.pack_bucket
                      -> compare each embedding row (cosine) and require unused rows ~0
-  long_swa_l{i}      document = first 1800 rows of `doc_ids`, chunk b=1 (rows 1024..2047; 776 valid)
-                     hidden_window = padded document rows 512..2559, inputs_embeds = rows 1024..2047,
-                     bias = host.chunk_bias(1, 1800)
-  long{S}_glb_l{i}   document = first S-300 rows of `doc_ids`; hidden = inputs_embeds = padded document,
-                     key_bias for n = S-300
-  long{S}_head       as glb, plus pool = host.long_pool(n, S) (2^-10 on valid rows) -> compare the embedding (cosine)
+  winp winp{S}_b512  the same with host.pack_window (band_bias instead of local_bias); one sequence spans
+                     several 512-row blocks so the band and the block boundaries are exercised
+  winl winl{S}_b512  document = first `doc_rows` ids of `doc_ids` (n > the next smaller long size or 2048, so
+                     the last block is partial and padding rows exist), fed with host.long_feed
+                     -> compare the embedding (cosine)
   vision_{B}         procedural image (see pattern()) of gx x gy patches -> compare image tokens
 
-Layer tests compare a digest of the layer's residual update: D = (hidden_out - hidden_in)[valid query rows] @ R,
-R = digest matrix [512,8] from selftest.bin. Vision compares D = image_tokens[valid tokens] @ R.
-Metrics: cosine of flattened D and relative error |Da - Dr|_F / |Dr|_F.
+Expectations: text = eg2.Reference fp32 (equal to Hugging Face, verify_hf.py), vision = Hugging Face fp32 image
+features. Vision compares the digest D = image_tokens[valid tokens] @ R, R = digest matrix [512,8] from
+selftest.bin. Metrics: cosine (text: per embedding row; vision: of flattened D) and relative error
+|Da - Dr|_F / |Dr|_F (vision).
 """
 import json
 import os
@@ -29,7 +29,8 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import host  # noqa: E402
 
-DOC_N_SWA = 1800
+WINP_LENGTHS = {1536: (1300, 37, 150), 2048: (1700, 37, 200, 9)}
+WINL_ROWS = {3072: 2600, 4096: 3500, 6144: 5900, 8192: 8000}
 VISION_GRIDS = {70: (27, 18), 140: (36, 30), 280: (48, 45)}   # patch grid (cols, rows): 54 / 120 / 240 tokens
 DIGEST_DIMS = 8
 
@@ -52,8 +53,8 @@ def pattern(gx, gy, budget):
     return pv, pos
 
 
-def bucket_sequences(doc, S):
-    lens = {64: (40, 11, 9), 128: (80, 30, 12)}.get(S, (S * 5 // 8, 37, S // 8 + 3))
+def framed(doc, lens):
+    """consecutive slices of doc, each framed as <bos> ... <eos>, of the given total lengths"""
     seqs, off = [], 0
     for n in lens:
         seqs.append([host.BOS] + doc[off:off + n - 2] + [host.EOS])
@@ -61,12 +62,16 @@ def bucket_sequences(doc, S):
     return seqs
 
 
+def bucket_sequences(doc, S):
+    return framed(doc, {64: (40, 11, 9), 128: (80, 30, 12)}.get(S, (S * 5 // 8, 37, S // 8 + 3)))
+
+
 # ------------------------------------------------------------------------------------------- generation
 
 def generate(hf_dir, out_dir):
     import torch
     import build
-    from eg2 import GlobalHead, GlobalLayer, SwaLayer, Bucket, Weights, ref_embed
+    from eg2 import Weights, ref_embed
     torch.set_num_threads(8)
     W = Weights(hf_dir)
     tab = host.TokenTable(f"{out_dir}/embeddings.bf16")
@@ -87,40 +92,30 @@ def generate(hf_dir, out_dir):
         return {"offset": off, "shape": list(a.shape)}
 
     tests = []
-    spec = {s[0]: s for s in build.function_specs()}
 
     def run_torch(mod, feed):
         with torch.no_grad():
             return mod(*[torch.from_numpy(np.asarray(v, np.float32)) for v in feed.values()]).numpy()
 
-    for S in host.BUCKETS:
-        seqs = bucket_sequences(doc, S)
-        exp = np.stack([ref_embed(W, tab.rows(s)) for s in seqs])
-        # also record what the fp32 bucket graph itself gives (sanity: equals the reference)
-        got = run_torch(Bucket(W, S).eval(), host.pack_bucket([tab.rows(s) for s in seqs], S))
-        assert min(host.cos(got[k], exp[k]) for k in range(len(seqs))) > 0.9999
-        tests.append({"function": f"embed_{S}", "kind": "bucket", "sequences": seqs, "expected": put(exp)})
-        print(f"[selftest] embed_{S} lens={[len(s) for s in seqs]}", flush=True)
-    for name, (fn, kind, args, ins, outs) in spec.items():
-        if kind == "swa":
-            feed, qin, nvalid = swa_feed(tab, doc)
-            y = run_torch(SwaLayer(W, args[0]).eval(), feed)
-            d = ((y - qin.astype(np.float32))[0, :nvalid]) @ R
-            tests.append({"function": fn, "kind": kind, "doc_rows": DOC_N_SWA, "chunk": 1, "valid_rows": nvalid,
-                          "expected": put(d)})
-        elif kind in ("glb", "head"):
-            S = args[-1]
-            feed, n = glb_feed(tab, doc, S, kind == "head")
-            if kind == "glb":
-                y = run_torch(GlobalLayer(W, args[0], S).eval(), feed)
-                d = ((y - feed["hidden"].astype(np.float32))[0, :n]) @ R
-                tests.append({"function": fn, "kind": kind, "doc_rows": n, "valid_rows": n, "expected": put(d)})
-            else:
-                e = run_torch(GlobalHead(W, S).eval(), feed)
-                tests.append({"function": fn, "kind": kind, "doc_rows": n, "expected": put(e)})
+    for name, kind, args, _, _ in build.function_specs():
+        S = args[0]
+        if kind in ("bucket", "winp"):
+            seqs = bucket_sequences(doc, S) if kind == "bucket" else framed(doc, WINP_LENGTHS[S])
+            rows = [tab.rows(q) for q in seqs]
+            exp = np.stack([ref_embed(W, r) for r in rows])
+            # sanity: the fp32 graph itself equals the reference
+            got = run_torch(build.make_module(W, kind, args), host.pack(rows, S))
+            assert min(host.cos(got[k], exp[k]) for k in range(len(seqs))) > 0.9999
+            tests.append({"function": name, "kind": kind, "sequences": seqs, "expected": put(exp)})
+            print(f"[selftest] {name} lens={[len(q) for q in seqs]}", flush=True)
         else:
-            continue
-        print(f"[selftest] {fn}", flush=True)
+            n = WINL_ROWS[S]
+            rows = tab.rows(doc[:n])
+            exp = ref_embed(W, rows)
+            got = run_torch(build.make_module(W, kind, args), host.long_feed(rows, S))[0]
+            assert host.cos(got, exp) > 0.9999
+            tests.append({"function": name, "kind": kind, "doc_rows": n, "expected": put(exp)})
+            print(f"[selftest] {name} doc_rows={n}", flush=True)
     # vision: fp32 HF vision tower + embedder on the procedural image
     from transformers import AutoModel
     hfm = AutoModel.from_pretrained(hf_dir, dtype=torch.float32).eval()
@@ -151,35 +146,20 @@ def generate(hf_dir, out_dir):
     print(f"[selftest] {len(tests)} tests, selftest.bin {len(blob)} bytes", flush=True)
 
 
-TOLERANCE = {   # filled from measurements (see README); min cosine / max relative error
+TOLERANCE = {   # min cosine / max relative error; measured values are >= 0.9999 (see README)
     "bucket": {"min_cos": 0.9990, "zero_rows_max_abs": 1e-3},
-    "head": {"min_cos": 0.9990},
-    "swa": {"min_cos": 0.9990, "max_rel_err": 0.05},
-    "glb": {"min_cos": 0.9990, "max_rel_err": 0.05},
+    "winp": {"min_cos": 0.9990, "zero_rows_max_abs": 1e-3},
+    "winl": {"min_cos": 0.9990},
     "vision": {"min_cos": 0.9990, "max_rel_err": 0.05},
 }
 
 
-def swa_feed(tab, doc):
-    n, b, C, H = DOC_N_SWA, 1, host.CHUNK, host.HALO
-    x = np.zeros((1, 2 * C + 2 * H, 512), np.float16)       # padded document (H zero rows in front)
-    x[0, H:H + n] = tab.rows(doc[:n])
-    feed = {"hidden_window": x[:, b * C:b * C + C + 2 * H], "inputs_embeds": x[:, H + b * C:H + (b + 1) * C],
-            "bias": host.chunk_bias(b, n)}
-    return feed, feed["hidden_window"][:, H:H + C], min(C, n - b * C)
-
-
-def glb_feed(tab, doc, S, with_pool):
-    n = S - 300
-    x = np.zeros((1, S, 512), np.float16)
-    x[0, :n] = tab.rows(doc[:n])
-    feed = {"hidden": x, "inputs_embeds": x, "key_bias": np.where(np.arange(S) < n, 0.0, host.NEG).astype(np.float16).reshape(1, 1, 1, S)}
-    if with_pool:
-        feed["pool"] = host.long_pool(n, S)
-    return feed, n
-
-
 # ------------------------------------------------------------------------------------------- runner
+
+def function_size(name):
+    """embed_768 -> 768, winp1536_b512 -> 1536, winl8192_b512 -> 8192"""
+    return int(name.split("_")[1]) if name.startswith("embed_") else int(name[4:].split("_")[0])
+
 
 def metrics(a, b):
     a, b = np.asarray(a, np.float64).ravel(), np.asarray(b, np.float64).ravel()
@@ -209,28 +189,16 @@ def run(dist, only=None, compute_units="ane", verbose=True):
         m = ct.models.CompiledMLModel(f"{dist}/{pkg}.mlmodelc", compute_units=cu, function_name=fn)
         exp = get(t["expected"])
         r = {"function": fn}
-        if kind == "bucket":
-            S = int(fn.split("_")[1])
-            out = m.predict(host.pack_bucket([tab.rows(s) for s in t["sequences"]], S))["embedding"]
+        if kind in ("bucket", "winp"):
+            S = function_size(fn)
+            out = m.predict(host.pack([tab.rows(q) for q in t["sequences"]], S))["embedding"]
             k = len(t["sequences"])
             r["min_cos"] = min(host.cos(out[i], exp[i]) for i in range(k))
             r["zero_rows_max_abs"] = float(np.abs(out[k:]).max()) if k < len(out) else 0.0
             ok = r["min_cos"] >= tol[kind]["min_cos"] and r["zero_rows_max_abs"] <= tol[kind]["zero_rows_max_abs"]
-        elif kind == "swa":
-            feed, qin, nv = swa_feed(tab, doc)
-            y = m.predict(feed)["hidden_out"]
-            r["min_cos"], r["rel_err"] = metrics(((y.astype(np.float32) - qin.astype(np.float32))[0, :nv]) @ R, exp)
-            ok = r["min_cos"] >= tol[kind]["min_cos"] and r["rel_err"] <= tol[kind]["max_rel_err"]
-        elif kind == "glb":
-            S = int(fn.split("_")[0][4:])
-            feed, n = glb_feed(tab, doc, S, False)
-            y = m.predict(feed)["hidden_out"]
-            r["min_cos"], r["rel_err"] = metrics(((y.astype(np.float32) - feed["hidden"].astype(np.float32))[0, :n]) @ R, exp)
-            ok = r["min_cos"] >= tol[kind]["min_cos"] and r["rel_err"] <= tol[kind]["max_rel_err"]
-        elif kind == "head":
-            S = int(fn.split("_")[0][4:])
-            feed, n = glb_feed(tab, doc, S, True)
-            e = m.predict(feed)["embedding"]
+        elif kind == "winl":
+            S = function_size(fn)
+            e = m.predict(host.long_feed(tab.rows(doc[:t["doc_rows"]]), S))["embedding"]
             r["min_cos"] = host.cos(e, exp)
             ok = r["min_cos"] >= tol[kind]["min_cos"]
         else:

@@ -9,15 +9,15 @@ package can be rebuilt and audited.
 |---|---|
 | `sources.json` | Every input, pinned: the two Hugging Face repositories (revision + sha256) and the evaluation texts and images (GitHub commit, Wikisource page revision or Python package version, path, license, sha256). |
 | `fetch.py` | `models`: downloads `google/embeddinggemma-2` and the FluidInference vision package at the pinned revisions. `data`: downloads the evaluation files (and copies the ones that ship inside pinned packages). Checks every sha256. |
-| `eg2.py` | The EmbeddingGemma 2 text encoder re-written in PyTorch for the ANE: bucket, sliding-layer, global-layer and head modules, plus `Reference`, an fp32 ground truth equal to Hugging Face. |
-| `host.py` | Executable spec of the host contract (token rows, bucket packing, long path, vision feed) in numpy. The Swift runtime mirrors it. |
+| `eg2.py` | The EmbeddingGemma 2 text encoder re-written in PyTorch for the ANE: `Bucket` (full attention) and `Window` (block-local sliding attention over a band, full global attention) modules, plus `Reference`, an fp32 ground truth equal to Hugging Face. |
+| `host.py` | Executable spec of the host contract (token rows, packing, band bias, long-text feed, vision feed) in numpy. The Swift runtime mirrors it. |
 | `build.py` | Builds the package, stage by stage (below). |
 | `selftest.py` | Generates `selftest.json` / `selftest.bin` (fp32 expectations) and runs them: `selftest.py run <dist>`. |
 | `manifest.py` | Writes `manifest.json` (called by `build.py`). |
-| `verify.py` | The package on CPU + ANE through `host.py` against `eg2.Reference` (fp32): buckets, packing, long path. |
+| `verify.py` | The package on CPU + ANE through `host.py` against `eg2.Reference` (fp32): `text` (every packing function: single, packed, mixed) and `long` (2049–8192 tokens, including the lengths at and just over each size). |
 | `verify_hf.py` | Anchors to Hugging Face: `eg2.Reference` against `transformers` / `sentence-transformers` fp32 (`anchor`), and the image path on CPU + ANE against `transformers` fp32 for all three image budgets (`images`). |
 | `corpus.py`, `images.py` | Build the evaluation corpus (`corpus.json`, 12 documents) and image folder (13 images) from the fetched files. |
-| `selftest_negative.py` | Optional negative control: rebuilds three global-layer functions with the usual `repeat_interleave` attention; their self-tests fail on the ANE (cosine about 0.55) while the layer tests pass on the CPU. |
+| `selftest_negative.py` | Optional negative control: rebuilds `winp2048_b512`, `winl4096_b512` and `winl8192_b512` with the usual `repeat_interleave` attention and runs their self-tests on the CPU and on the ANE (results below). |
 
 `scripts/accuracy/` at the repository root is the other half: it measures a running `aneembed serve` (the Swift
 runtime, over HTTP) against the same fp32 reference on the same public data. `verify*.py` here test the package
@@ -36,10 +36,10 @@ uv pip install --python .venv/bin/python -r requirements.txt
 
 `requirements.txt` pins every package of the environment that built the published package. Conversion and the
 fp32 references run on the CPU only: no step selects MPS or the GPU (torch has no separate CPU wheel for macOS;
-the PyPI wheel is used). On an M5 Ultra a full build takes about 2.5 minutes and 11 GB of RAM (peak resident
-size), and needs about 6 GB of disk: 1.7 GB of downloads, 2.0 GB of intermediate per-function packages, 1.5 GB of
+the PyPI wheel is used). On an M5 Ultra a full build takes about 5.5 minutes and 16 GB of RAM (peak resident
+size), and needs about 7.5 GB of disk: 1.7 GB of downloads, 3.4 GB of intermediate per-function packages, 1.6 GB of
 output and 0.7 GB for the environment. The first `selftest.py run` on a new directory also waits for the ANE
-compile (about 4 minutes for all functions). Run the scripts with `python -I` (they find their own modules;
+compile (about 10 minutes for all functions on an M5 Ultra). Run the scripts with `python -I` (they find their own modules;
 nothing is read from the current directory).
 
 ## Reproducing the package
@@ -49,23 +49,25 @@ W=../../.cache                                    # any directory (.cache/ is gi
 .venv/bin/python -I fetch.py models --dest $W/models     # 1.7 GB, sha256 checked
 .venv/bin/python -I build.py --hf-dir $W/models/embeddinggemma-2 \
     --vision-dir $W/models/embeddinggemma-2-coreml --out $W/dist
-.venv/bin/python -I selftest.py run $W/dist               # SELFTEST PASS 37/37 ...
+.venv/bin/python -I selftest.py run $W/dist               # SELFTEST PASS 16/16 ...
 ```
 
 Any directory works for `--dest` and `--out`; intermediate per-function packages go to `<out>/../work`
 (`--work` to change). Stages, in order (`--stages` to run a subset; each skips finished work unless `--force`):
 
-1. **convert**: checks the sha256 of `model.safetensors`, then traces each of the 34 functions (`embed_64` …
-   `embed_2048`, `long_swa_l{i}`, `long{4096,8192}_glb_l{5,11,17}`, `long{4096,8192}_head`) and converts it with
-   coremltools to an fp16 ML Program (minimum macOS 15), one `.mlpackage` per function.
+1. **convert**: checks the sha256 of `model.safetensors`, then traces each of the 13 functions and converts it
+   with coremltools to an fp16 ML Program (minimum macOS 15), one `.mlpackage` per function:
+   - `embed_64` … `embed_1280` (7): full attention, packing;
+   - `winp1536_b512`, `winp2048_b512`: windowed attention, packing;
+   - `winl3072_b512`, `winl4096_b512`, `winl6144_b512`, `winl8192_b512`: windowed attention, one long text per call.
 2. **merge**: merges them into one multifunction `EmbeddingGemma2Text.mlpackage`; identical weight constants are
-   stored once (305 MB instead of 2.05 GB).
+   stored once (363 MB instead of 3.4 GB).
 3. **compile**: `xcrun coremlcompiler compile` to `EmbeddingGemma2Text.mlmodelc`.
 4. **assets**: extracts `embeddings.bf16` (unchanged bf16 rows) from `model.safetensors`, copies `tokenizer.json`,
    copies the FluidInference vision package and `position_embeddings.f16` unchanged (sha256 checked) and compiles
    it, writes `LICENSE` (Apache-2.0 text from the pinned `transformers` wheel) and `NOTICE`.
-5. **selftest**: one golden test per function (37), expectations from the fp32 reference (Hugging Face fp32 for the
-   vision functions). The token ids are the tokenized `LICENSE`.
+5. **selftest**: one golden test per function (16: 13 text, 3 vision), expectations from the fp32 reference (Hugging
+   Face fp32 for the vision functions). The token ids are the tokenized `LICENSE`.
 6. **manifest**: `manifest.json` with every file's sha256 and size, function signatures, host contract and
    provenance.
 
@@ -101,7 +103,7 @@ HF=$W/models/embeddinggemma-2
 .venv/bin/python -I verify_hf.py anchor $W/dist $W/data/corpus.json --hf-dir $HF   # reference == official fp32
 .venv/bin/python -I verify_hf.py images $W/dist $W/data/images --hf-dir $HF        # image path vs official fp32
 .venv/bin/python -I verify.py text $W/dist $W/data/corpus.json --hf-dir $HF        # buckets, packing
-.venv/bin/python -I verify.py long $W/dist $W/data/corpus.json --hf-dir $HF        # 2049..8192 tokens
+.venv/bin/python -I verify.py long $W/dist $W/data/corpus.json --hf-dir $HF        # 2049..8192 tokens (winl)
 ```
 
 Each prints one line per case and a final `SUMMARY` with the minimum and median cosine per category. The corpus
@@ -118,9 +120,16 @@ returns wrong numbers. What we hit, and what the code does about it:
 - **Attention uses the fold layout** (`eg2.attend_fold`): the query heads that share a K/V head are folded into
   the row dimension. The usual `repeat_interleave` layout returns zeros for query heads 1–3 of the global layers
   (one K/V head) at long sequence lengths; an explicit K/V copy is wrong as well. `selftest_negative.py`
-  reproduces it. Do not change the attention layout without running the self-test on the ANE.
+  reproduces it: rebuilt with `repeat_interleave`, `winp2048_b512`, `winl4096_b512` and `winl8192_b512` fail their
+  self-tests on CPU + ANE (min cosine 0.960, 0.952, 0.885; M5 Ultra, macOS 27.0.1), while on the CPU the first two
+  pass (0.99994, 0.99953) and `winl8192_b512` scores 0.9975 (fp16 precision of that layout). Do not change the
+  attention layout without running the self-test on the ANE.
 - **Masks are runtime inputs and RoPE tables are graph constants.** A sliding-window mask built into the graph
-  and a runtime positions input both produced wrong results.
+  and a runtime positions input both produced wrong results. The windowed functions therefore take the band as
+  an input too (`band_bias`, `[1,1,S,1536]`, see `host.band_bias`).
+- **Windowed sliding layers slice, they do not pad.** Each 512-row query block attends to the key rows
+  `b*512-512 … b*512+1023` taken as static slices clipped to `[0, S)`; padding the keys inside the graph
+  (`F.pad`) gave the same numbers but made the layer about 3x slower on the ANE.
 - **Do not trust `MLComputePlan` for correctness.** It reports which device each operation is planned on, not
   whether the ANE computes it correctly. Only comparing outputs catches a miscompile.
 - **Run the self-test** (`selftest.py run <dist>`, or `aneembed`, which runs it at load) on every Mac and macOS

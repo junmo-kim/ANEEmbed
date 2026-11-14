@@ -56,7 +56,7 @@ def write(a, revision):
     prompts = json.load(open(f"{a.hf_dir}/config_sentence_transformers.json"))["prompts"]
     m = {
         "name": "embeddinggemma-2-ane",
-        "manifest_version": 1,
+        "manifest_version": 2,
         "created": datetime.date.today().isoformat(),
         "source_model": {"id": "google/embeddinggemma-2", "revision": revision, "license": "Apache-2.0",
                          "model.safetensors_sha256": "197a32965d4b1105faf060417baa899e193fb73cd401f42ec9295234d5553d79",
@@ -83,9 +83,11 @@ def write(a, revision):
             "EmbeddingGemma2Vision": {"mlpackage": "EmbeddingGemma2Vision.mlpackage", "mlmodelc": "EmbeddingGemma2Vision.mlmodelc",
                                       "compute_units": "cpuAndNeuralEngine", "functions": vis_sigs},
         },
-        "buckets": [{"function": f"embed_{S}", "tokens": S, "slots": host.k_for(S)} for S in host.BUCKETS],
+        "layout": "layoutR: embed_S buckets up to 1280 rows, windowed packing functions up to 2048, one windowed "
+                  "call per long text up to 8192",
+        "buckets": [{"function": host.function_name(S), "tokens": S, "slots": host.k_for(S)} for S in host.BUCKETS],
         "bucket_contract": {
-            "use": "texts/images of total length <= 2048 rows; pick the smallest S >= total rows of the packed sequences",
+            "use": "texts/images of total length <= 1280 rows; pick the smallest S >= total rows of the packed sequences",
             "inputs_embeds": "[1,S,512] fp16: sequences back to back from row 0, zero rows after",
             "global_bias": "[1,1,S,S] fp16: 0 if row i and column j belong to the same sequence or i == j, else -10000",
             "local_bias": "[1,1,S,S] fp16: global_bias AND |i-j| <= 512 (else -10000); equals global_bias when S <= 512",
@@ -94,31 +96,25 @@ def write(a, revision):
             "embedding": "[K,768] fp32: row k = L2-normalized embedding of sequence k; unused rows are 0",
             "positions": "none: RoPE uses absolute positions 0..S-1 inside the graph (exact, RoPE is relative and the "
                          "bias is block diagonal)"},
-        "long_path": {
-            "tokens": [2049, 8192], "buckets": list(host.LONG_BUCKETS), "S": "4096 if n <= 4096 else 8192",
-            "chunk": host.CHUNK, "halo": host.HALO, "sliding_window": host.WINDOW,
-            "sliding_layers": host.SLIDING, "global_layers": host.GLOBAL,
-            "inputs": {
-                "x0": "[1,S,512] fp16 token rows (as for buckets), rows >= n zero",
-                "chunk_bias(b)": "[1,1,1024,2048] fp16: query row q = b*1024 + r, key row k = b*1024 - 512 + c; 0 if "
-                                 "(|q-k| <= 512 and 0 <= k < n) or k == q, else -10000",
-                "key_bias": "[1,1,1,S] fp16: 0 for k < n, else -10000",
-                "pool": "[1,S] fp16: 2^-10 (0.0009765625) for rows < n, else 0. Not 1/n: 1/n underflows fp16 in the "
-                        "in-graph pooling for large n (cos 0.9996 instead of 0.9999 at n=8192); the scale cancels in the L2 "
-                        "normalization"},
-            "call_order": [
-                "x = x0",
-                "for layer i in 0..23:",
-                "  sliding i: xp = [512 zero rows; x; 512 zero rows]; for each chunk b with b*1024 < n: "
-                "out[b*1024:(b+1)*1024] = long_swa_l{i}(hidden_window=xp[b*1024 : b*1024+2048], "
-                "inputs_embeds=x0[b*1024:(b+1)*1024], bias=chunk_bias(b)).hidden_out; chunks with b*1024 >= n keep "
-                "their rows; x = out (read all chunks from the previous x: double buffer)",
-                "  global i in {5,11,17}: x = long{S}_glb_l{i}(hidden=x, inputs_embeds=x0, key_bias).hidden_out",
-                "  i = 23: embedding = long{S}_head(hidden=x, inputs_embeds=x0, key_bias, pool).embedding [1,768] fp32"],
-            "calls": "20 * ceil(n/1024) + 4",
-            "host_side_work": "token lookup and scale (same as buckets), halo padding / slicing, bias construction (per "
-                              "document; reuse across the 20 sliding layers). No host math on activations: the final "
-                              "norm, pooling, projection and L2 normalize run in long{S}_head."},
+        "window": {
+            "block": host.BLOCK, "halo": host.HALO, "band_columns": host.BAND, "sliding_window": host.WINDOW,
+            "packing": [{"function": host.function_name(S), "tokens": S, "slots": host.k_for(S)} for S in host.WINDOW_PACK],
+            "long": [{"function": host.function_name(S, long=True), "tokens": S} for S in host.WINDOW_LONG],
+            "band_bias": "[1,1,S,1536] fp16: row r, column c = query row r against key row k = (r // 512) * 512 - 512 + c; "
+                         "0 if (rows r and k belong to the same sequence and |r - k| <= 512) or k == r, else -10000. "
+                         "Columns with k outside [0, S) are never read (any value)",
+            "packing_use": "packed calls of up to 2048 rows (aneembed uses them for 1281..2048 rows): "
+                           "inputs_embeds, global_bias, pool and embedding exactly as for the buckets, band_bias "
+                           "instead of local_bias",
+            "long_use": "one text of 2049..8192 rows per call: S = smallest long size >= n; inputs_embeds rows >= n "
+                        "zero; key_bias [1,1,1,S] fp16 0 for k < n else -10000; pool [1,S] fp16 2^-10 (0.0009765625) "
+                        "for rows < n, else 0 (not 1/n: 1/n underflows fp16 in the in-graph pooling at large n; the "
+                        "scale cancels in the L2 normalization); band_bias with one sequence of n rows; "
+                        "embedding [1,768] fp32",
+            "why": "the sliding layers (20 of 24) attend block by block over [512 x 1536] key windows instead of "
+                   "S x S, so one fixed-shape call covers up to 8192 rows; the 4 global layers attend to all rows. "
+                   "Masks are inputs: a graph-constant band miscompiles on the ANE and padding inside the graph is "
+                   "about 3x slower"},
         "vision": {
             "package": "EmbeddingGemma2Vision", "functions": {f"vision_{b}": {"max_tokens": b, "patches": 9 * b} for b in (70, 140, 280)},
             "preprocessing": "HF Gemma4ImageProcessor: RGB, aspect-preserving resize to the largest H x W (multiples of 48 px) "

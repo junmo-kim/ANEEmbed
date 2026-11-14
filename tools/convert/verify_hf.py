@@ -7,7 +7,7 @@ Usage: verify_hf.py anchor <dist> <corpus.json> --hf-dir <snapshot>   eg2.Refere
 corpus.json and the image folder come from corpus.py / images.py, the snapshot from fetch.py models.
 
 Image path under test (host contract): HF processor pixels (Swift ports Gemma4ImageProcessor) -> vision_B on
-CPU+ANE -> <bos><|image> tokens <image|><eos> -> embed_S on CPU+ANE (single, and packed with other images/texts).
+CPU+ANE -> <bos><|image> tokens <image|><eos> -> embed_S / winp on CPU+ANE (single, and packed with other images/texts).
 Reference: HF EmbeddingGemma2Model fp32 forward on the same processor outputs, mean pool over all tokens, L2."""
 import argparse
 import glob
@@ -90,7 +90,8 @@ if mode == "images":
 
     def bucket(S):
         if S not in tfn:
-            tfn[S] = ct.models.CompiledMLModel(f"{dist}/EmbeddingGemma2Text.mlmodelc", compute_units=CU, function_name=f"embed_{S}")
+            tfn[S] = ct.models.CompiledMLModel(f"{dist}/EmbeddingGemma2Text.mlmodelc", compute_units=CU,
+                                               function_name=host.function_name(S))
         return tfn[S]
 
     paths = sorted(glob.glob(f"{args.data}/*"))
@@ -110,11 +111,11 @@ if mode == "images":
             add(f"vision_tokens_{b}", cv)
             rows = host.image_sequence(tab, t_ane)
             S = host.bucket_for(len(rows))
-            e = bucket(S).predict(host.pack_bucket([rows], S))["embedding"][0]
+            e = bucket(S).predict(host.pack([rows], S))["embedding"][0]
             c = host.cos(e, ref)
             add(f"image_single_{b}", c)
             # text half only: HF fp32 vision tokens through the ANE text bucket
-            e2 = bucket(S).predict(host.pack_bucket([host.image_sequence(tab, f_hf)], S))["embedding"][0]
+            e2 = bucket(S).predict(host.pack([host.image_sequence(tab, f_hf)], S))["embedding"][0]
             add(f"image_textpart_{b}", host.cos(e2, ref))
             seqs[(name, b)], refs[(name, b)] = rows, ref
             print(f"{name} {img.size} budget={b} tokens={ntok} S={S} cos(vision tokens)={cv:.6f} "
@@ -127,7 +128,7 @@ if mode == "images":
         a, b2, c3 = names[j], names[(j + 1) % len(names)], names[(j + 2) % len(names)]
         for S, items in ((1024, [(a, 280), (b2, 140), (c3, 70)]), (2048, [(a, 280), (b2, 280), (c3, 280), (a, 70)])):
             rows = [seqs[k] for k in items] + [trow]
-            out = bucket(S).predict(host.pack_bucket(rows, S))["embedding"]
+            out = bucket(S).predict(host.pack(rows, S))["embedding"]
             cs = [host.cos(out[k], refs[it]) for k, it in enumerate(items)]
             for c in cs:
                 add(f"image_packed_S{S}", c)
