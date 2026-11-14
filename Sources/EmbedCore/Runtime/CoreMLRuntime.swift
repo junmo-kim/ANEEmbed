@@ -1,7 +1,9 @@
 // Core ML backends: the embed_S text functions and the vision encoder, on the Neural Engine
 // (MLComputeUnits.cpuAndNeuralEngine; the GPU is never used, so a local LLM keeps it to itself).
 //
-// Inputs are MLMultiArrays over the BucketBuffers memory (no copy on our side).
+// Inputs are MLMultiArrays over the BucketBuffers memory (no copy on our side). IOSurface-backed inputs
+// and MLPredictionOptions.outputBackings were measured against this on an M4 and changed nothing
+// (within 1%): the Neural Engine's own time is over 98% of a call.
 @preconcurrency import CoreML
 import Foundation
 
@@ -115,25 +117,30 @@ public final class CoreMLBucketRunner: BucketFunctionRunner, @unchecked Sendable
     }
 
     public func run(_ buffers: BucketBuffers) async throws -> [[Float]] {
+        let (model, input) = try features(buffers)
+        let output = try await model.prediction(from: input)
+        return try embeddings(output, buffers)
+    }
+
+    /// The function for the buffers' length and its inputs: MLMultiArrays over the buffer memory.
+    func features(_ buffers: BucketBuffers) throws -> (MLModel, MLFeatureProvider) {
         guard let model = models[buffers.length] else {
             throw RuntimeError.model("embed_\(buffers.length) is not loaded")
         }
         let length = buffers.length, hidden = BucketContract.hidden
-        func array(_ pointer: UnsafeMutablePointer<Float16>, _ shape: [Int]) throws -> MLMultiArray {
-            var strides = [Int](repeating: 1, count: shape.count)
-            for index in stride(from: shape.count - 2, through: 0, by: -1) { strides[index] = strides[index + 1] * shape[index + 1] }
-            return try MLMultiArray(dataPointer: pointer, shape: shape.map(NSNumber.init(value:)), dataType: .float16,
-                                    strides: strides.map(NSNumber.init(value:)), deallocator: nil)
-        }
         let input = try MLDictionaryFeatureProvider(dictionary: [
-            BucketContract.inputsEmbeds: MLFeatureValue(multiArray: try array(buffers.inputsEmbeds, [1, length, hidden])),
-            BucketContract.globalBias: MLFeatureValue(multiArray: try array(buffers.globalBias, [1, 1, length, length])),
-            BucketContract.localBias: MLFeatureValue(multiArray: try array(buffers.localBias, [1, 1, length, length])),
-            BucketContract.pool: MLFeatureValue(multiArray: try array(buffers.pool, [buffers.slots, length])),
+            BucketContract.inputsEmbeds: MLFeatureValue(multiArray: try halfArray(buffers.inputsEmbeds, [1, length, hidden])),
+            BucketContract.globalBias: MLFeatureValue(multiArray: try halfArray(buffers.globalBias, [1, 1, length, length])),
+            BucketContract.localBias: MLFeatureValue(multiArray: try halfArray(buffers.localBias, [1, 1, length, length])),
+            BucketContract.pool: MLFeatureValue(multiArray: try halfArray(buffers.pool, [buffers.slots, length])),
         ])
-        let output = try await model.prediction(from: input)
+        return (model, input)
+    }
+
+    /// Every slot's row of the output (rows of unused slots are 0).
+    func embeddings(_ output: MLFeatureProvider, _ buffers: BucketBuffers) throws -> [[Float]] {
         guard let embedding = output.featureValue(for: BucketContract.embedding)?.multiArrayValue else {
-            throw RuntimeError.model("embed_\(length) returned no \(BucketContract.embedding)")
+            throw RuntimeError.model("embed_\(buffers.length) returned no \(BucketContract.embedding)")
         }
         return try rows(of: embedding, count: buffers.slots, width: BucketContract.dimension)
     }
@@ -204,13 +211,24 @@ public final class CoreMLVisionEncoder: VisionEncoder, @unchecked Sendable {
             throw RuntimeError.unsupported("\(tokens) image tokens do not fit")
         }
         let output = try await model.prediction(from: try inputs(image, budget: budget))
+        return try softTokens(output, count: tokens, budget: budget)
+    }
+
+    /// The vision function for `image` (nil when it does not fit).
+    func model(for image: PreparedImage) -> (MLModel, Int)? {
+        guard let budget = budgets.first(where: { $0 >= image.tokens }), let model = models[budget] else { return nil }
+        return (model, budget)
+    }
+
+    /// The first `count` rows of image_tokens.
+    func softTokens(_ output: MLFeatureProvider, count: Int, budget: Int) throws -> [Float16] {
         guard let soft = output.featureValue(for: "image_tokens")?.multiArrayValue else {
             throw RuntimeError.model("vision_\(budget) returned no image_tokens")
         }
-        return try rows(of: soft, count: tokens, width: BucketContract.hidden).flatMap { $0.map(Float16.init) }
+        return try rows(of: soft, count: count, width: BucketContract.hidden).flatMap { $0.map(Float16.init) }
     }
 
-    private func inputs(_ image: PreparedImage, budget: Int) throws -> MLDictionaryFeatureProvider {
+    func inputs(_ image: PreparedImage, budget: Int) throws -> MLDictionaryFeatureProvider {
         let total = budget * 9
         let width = image.width, columns = width / Self.patch, rows = image.height / Self.patch
         precondition(columns * rows <= total && width % 48 == 0 && image.height % 48 == 0)

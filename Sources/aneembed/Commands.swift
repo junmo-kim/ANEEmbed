@@ -13,6 +13,8 @@ enum CLI {
           aneembed tokenize [TEXT ...] [--stdin] [--prompt query|document] [--show-tokens] [--format yaml|json]
           aneembed doctor [--verify] [--format yaml|json]
           aneembed models path | verify | warm | install [--from DIR | --repo R --revision REV]
+          aneembed bench [--sizes 32,128,...] [--repeat N] [--image PATH] [--concurrency N] [--buckets]
+                         [--breakdown] [--settle SECONDS] [--format yaml|json]
           aneembed serve        HTTP: OpenAI /v1/embeddings, /v1/models, /health, POST /mcp, QUERY /{tool}
           aneembed mcp          MCP over stdio (newline-delimited JSON-RPC 2.0)
           aneembed --version | --help | <command> --print-config
@@ -47,6 +49,7 @@ enum CLI {
             case "models": handler = ModelsCommand()
             case "serve": handler = ServeCommand()
             case "mcp": handler = MCPCommand()
+            case "bench": handler = BenchCommand()
             default:
                 throw ServiceError.badRequest("unknown_command", "unknown command \(command); see aneembed --help")
             }
@@ -395,6 +398,38 @@ struct ModelsCommand: Command {
             "seconds": ["fetch_and_verify": round(fetched), "compile": round(compiled)],
             "compiled_matches_manifest": .bool(differing.isEmpty), "warm": warm,
         ], format: format)
+        return .success
+    }
+}
+
+// MARK: - bench
+
+struct BenchCommand: Command {
+    let spec = ArgumentSpec(values: ["format", "sizes", "repeat", "image", "concurrency", "settle"], flags: ["buckets", "breakdown"])
+
+    func run(_ arguments: ParsedArguments, config: Config, format: OutputFormat) async throws(ServiceError) -> ExitCode {
+        var options = Bench.Options()
+        if let sizes = arguments.value("sizes") {
+            let parsed = sizes.split(separator: ",").compactMap { Int($0) }
+            guard !parsed.isEmpty, parsed.allSatisfy({ $0 >= 3 && $0 <= 8192 }) else {
+                throw .badRequest("invalid_sizes", "--sizes takes token counts in 3...8192, comma separated", param: "sizes")
+            }
+            options.sizes = parsed
+        }
+        func integer(_ name: String, _ range: ClosedRange<Int>) throws(ServiceError) -> Int? {
+            guard let value = arguments.value(name) else { return nil }
+            guard let number = Int(value), range.contains(number) else {
+                throw .badRequest("invalid_\(name)", "--\(name) must be in \(range.lowerBound)...\(range.upperBound)", param: name)
+            }
+            return number
+        }
+        options.repeats = try integer("repeat", 1...1000) ?? options.repeats
+        options.concurrency = try integer("concurrency", 1...256) ?? 0
+        options.settleSeconds = Double(try integer("settle", 0...3600) ?? 0)
+        if let path = arguments.value("image") { options.image = try readFile(path) }
+        options.buckets = arguments.has("buckets")
+        options.breakdown = arguments.has("breakdown")
+        Output.data(try await Bench.run(config, options: options, log: Log.info), format: format)
         return .success
     }
 }
