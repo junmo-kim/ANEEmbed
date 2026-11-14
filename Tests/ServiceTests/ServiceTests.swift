@@ -39,6 +39,19 @@ struct ServiceTests {
         }
     }
 
+    /// A tokenizer without <bos>/<eos> framing (post_processor null) turns "" into no ids: a 400, not a trap.
+    @Test func anEmptyTokenSequenceIsRejected() async throws {
+        struct Unframed: TextTokenizer { func encode(_ text: String) -> [Int32] { text.utf8.map { Int32($0) + 3 } } }
+        let service = EmbeddingService(tokenizer: Unframed(), runtime: FakeRuntime.make())
+        do {
+            _ = try await service.embedTexts(["ok", ""])
+            Issue.record("an empty token sequence was embedded")
+        } catch {
+            #expect(error.httpStatus == 400)
+        }
+        await #expect(throws: RuntimeError.self) { _ = try await FakeRuntime.make().embed(tokenized: [[2, 1], []]) }
+    }
+
     @Test func rejectsEmptyAndOversizedBatches() async {
         var limits = ServiceLimits()
         limits.maxInputs = 3
