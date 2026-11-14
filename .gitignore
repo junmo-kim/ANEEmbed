@@ -6,3 +6,4 @@ Package.resolved
 /dist/
 __pycache__/
 .venv/
+.cache/

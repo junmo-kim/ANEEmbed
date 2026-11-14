@@ -1,0 +1,53 @@
+{
+ "format": "aneembed-sources/1",
+ "note": "Every input of the conversion and the evaluation, pinned. fetch.py downloads them and checks sha256.",
+ "models": [
+  {
+   "id": "google/embeddinggemma-2",
+   "revision": "f9972ac22e696a105c482202646979e33e4b5a1e",
+   "license": "Apache-2.0 (Gemma Prohibited Use Policy applies)",
+   "dir": "embeddinggemma-2",
+   "allow_patterns": null,
+   "sha256": {
+    "model.safetensors": "197a32965d4b1105faf060417baa899e193fb73cd401f42ec9295234d5553d79",
+    "tokenizer.json": "4d777ef5bdc1aa36227abdfb77c3e49e7b9c892d16e1b6bda41c393504828be4"
+   }
+  },
+  {
+   "id": "FluidInference/embeddinggemma-2-coreml",
+   "revision": "3f978ddf92cac9aa07eb2dcf6eb36cf450f3dba4",
+   "license": "Apache-2.0",
+   "dir": "embeddinggemma-2-coreml",
+   "allow_patterns": ["EmbeddingGemma2Vision.mlpackage/*", "position_embeddings.f16"],
+   "sha256": {
+    "EmbeddingGemma2Vision.mlpackage/Data/com.apple.CoreML/weights/weight.bin": "5b5b6dd8d80aa438bf91ba143fbe90d56a2e25bfcf685a56b990aad71cf75232",
+    "EmbeddingGemma2Vision.mlpackage/Data/com.apple.CoreML/model.mlmodel": "0085b5e04a13d000fe5969adeaa13d897f5a3cb7be60c76c8685c023747f89ef",
+    "position_embeddings.f16": "17de9480acc23638c0634a97ed89e51ed664433256d7d6f109587dcd91c79124"
+   }
+  }
+ ],
+ "files": [
+  {"file": "omlx-README.md", "repo": "https://github.com/jundot/omlx", "commit": "8b7e7018cb6f824c55f666aab817db4613e86bd7", "path": "README.md", "license": "Apache-2.0", "sha256": "f69e5df49a5f2f864bd44aa649d79f714aa3b6aefc9ad42fa696eb6f80b5b0d4"},
+  {"file": "omlx-README.ko.md", "repo": "https://github.com/jundot/omlx", "commit": "8b7e7018cb6f824c55f666aab817db4613e86bd7", "path": "README.ko.md", "license": "Apache-2.0", "sha256": "e3ec0845df0a3e586a0feb286c03f16e3faf84ad3c169bc4dd45d7545ab51e9c"},
+  {"file": "omlx-README.ja.md", "repo": "https://github.com/jundot/omlx", "commit": "8b7e7018cb6f824c55f666aab817db4613e86bd7", "path": "README.ja.md", "license": "Apache-2.0", "sha256": "3cbf7c6acd501eabbb0ef042f7806cba4e838f187616cff33666720cdb9ed346"},
+  {"file": "omlx-README.zh.md", "repo": "https://github.com/jundot/omlx", "commit": "8b7e7018cb6f824c55f666aab817db4613e86bd7", "path": "README.zh.md", "license": "Apache-2.0", "sha256": "35bb016e602aeb8e8aa41d6b551ee9cc9521a5b933f1d5fed7a95900ec24b3a6"},
+  {"file": "omlx-README.fr.md", "repo": "https://github.com/jundot/omlx", "commit": "8b7e7018cb6f824c55f666aab817db4613e86bd7", "path": "README.fr.md", "license": "Apache-2.0", "sha256": "12cee2fb8a46e87bf145391c98a3db224ed6bb3d19ba3d149958b9d4790be60c"},
+  {"file": "ko_constitution.wiki", "url": "https://ko.wikisource.org/w/index.php?oldid=407850&action=raw", "page": "ko.wikisource.org 대한민국헌법 (제10호)", "revision": 407850, "license": "public domain (statute text; Wikisource markup CC BY-SA 4.0)", "sha256": "cc564afc5abbb401a7027951f83631ca5ed40c727d9d3849103eca0ff7e677cd"},
+  {"file": "ja_constitution.wiki", "url": "https://ja.wikisource.org/w/index.php?oldid=235821&action=raw", "page": "ja.wikisource.org 日本國憲法", "revision": 235821, "license": "public domain (statute text; Wikisource markup CC BY-SA 4.0)", "sha256": "433ea3f2db4d0f655a55668349dad11a65dff7608c92bf9ee1f0145178269a6a"},
+  {"file": "sdcpp-server-api.md", "repo": "https://github.com/leejet/stable-diffusion.cpp", "commit": "0678d04ae72bc13a0b8fb1392fb8f161bbcb6488", "path": "examples/server/api.md", "license": "MIT", "sha256": "4d99663b3bdfe0c07cdcace56fea3e6bc464925312e9cb26c9d14f9ae0dd8b8b"},
+  {"file": "ggml-gguf.md", "repo": "https://github.com/leejet/ggml", "commit": "d803c238f67915fb825a9aa4df27b99356d51597", "path": "docs/gguf.md", "license": "MIT", "note": "the ggml submodule of stable-diffusion.cpp at the commit above; same bytes in ggml-org/ggml at this commit", "sha256": "1dead27b6a522709f0127d194e58c21dbbbf00ba1c64fe37c54d1a9048b05020"},
+  {"file": "llamacpp-server-README.md", "repo": "https://github.com/ggml-org/llama.cpp", "commit": "171e8846b4af9766c354064cb776cb34a50f053f", "path": "tools/server/README.md", "license": "MIT", "sha256": "b45beb0842fcc98709b7df26d22da93db5f73f88386f0a6a9d6c18eac522b024"},
+  {"file": "llamacpp-build.md", "repo": "https://github.com/ggml-org/llama.cpp", "commit": "171e8846b4af9766c354064cb776cb34a50f053f", "path": "docs/build.md", "license": "MIT", "sha256": "b405f2afa67b3d3659f9c3f0b340e4298a25bd9048a3a8a085ad7e0e20f24100"},
+  {"file": "test-1.jpeg", "repo": "https://github.com/ggml-org/llama.cpp", "commit": "171e8846b4af9766c354064cb776cb34a50f053f", "path": "tools/mtmd/test-1.jpeg", "license": "MIT", "sha256": "2dff664c0c8aaea18aff8cbe7e868845b775e90cdd7a0bac98df709b131deaa3"},
+  {"file": "llama1-banner.png", "repo": "https://github.com/ggml-org/llama.cpp", "commit": "171e8846b4af9766c354064cb776cb34a50f053f", "path": "media/llama1-banner.png", "license": "MIT", "sha256": "0c93eabed78e3691b0555c3a2f3686e9bf2f9436b6aefda111309aa9ed33e7bb"},
+  {"file": "matmul.png", "repo": "https://github.com/ggml-org/llama.cpp", "commit": "171e8846b4af9766c354064cb776cb34a50f053f", "path": "media/matmul.png", "license": "MIT", "sha256": "0d6484cc146bbfcc1e8eae12ed0290057bfabeb7944d24d15d5d78995364bde4"},
+  {"file": "cat_with_sd_cpp_20184.png", "repo": "https://github.com/leejet/stable-diffusion.cpp", "commit": "0678d04ae72bc13a0b8fb1392fb8f161bbcb6488", "path": "assets/cat_with_sd_cpp_20184.png", "license": "MIT", "sha256": "e9793983097533c1e67e4bedc5afd159d98922d40d9ec653a8b77f06c0366467"},
+  {"file": "newton_0.jpg", "repo": "https://github.com/leejet/stable-diffusion.cpp", "commit": "0678d04ae72bc13a0b8fb1392fb8f161bbcb6488", "path": "assets/photomaker_examples/newton_man/newton_0.jpg", "license": "MIT", "sha256": "312532bd8fa2222662aa6807569c710df63640ff00d8984639c358af1128c2ff"}
+ ],
+ "packaged": [
+  {"file": "modeling_embedding_gemma2.py", "package": "transformers", "version": "5.22.2", "path": "transformers/models/embedding_gemma2/modeling_embedding_gemma2.py", "license": "Apache-2.0", "sha256": "f0376b13fb5230b349ce269c4fb40906931744a84df57c1d208f46032941eda7"},
+  {"file": "china.jpg", "package": "scikit-learn", "version": "1.9.1", "path": "sklearn/datasets/images/china.jpg", "license": "CC BY 2.0 (see sklearn/datasets/images/README.txt)", "sha256": "8378025ad2519d649d02e32bd98990db4ab572357d9f09841c2fbfbb4fefad29"},
+  {"file": "flower.jpg", "package": "scikit-learn", "version": "1.9.1", "path": "sklearn/datasets/images/flower.jpg", "license": "CC BY 2.0 (see sklearn/datasets/images/README.txt)", "sha256": "a77f6ec41e353afdf8bdff2ea981b2955535d8d83294f8cfa49cf4e423dd5638"},
+  {"file": "test_house_with_colors.png", "package": "networkx", "version": "3.7", "path": "networkx/drawing/tests/baseline/test_house_with_colors.png", "license": "BSD-3-Clause", "sha256": "1508bda48445c23ab882f801f1c0dd0472f97ae414245c3ab1094005fda4455a"}
+ ]
+}
