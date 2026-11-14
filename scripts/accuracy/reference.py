@@ -7,10 +7,12 @@ reports the cosine similarity per group.
 Cases (texts carry the document prompt "title: none | text: " in the string itself, so both sides
 tokenize the same characters; each text is cut by characters to the largest prefix whose token count,
 <bos>/<eos> included, is at most the target):
-  single_S        one text per request, S in 64...2048: targets S and S/2 + 5 on six documents
+  single_S        one text per request, S in 64...2048 (every packing size of the model package): targets S
+                  and S/2 + 5 on six documents
+  boundary        one text per request just over a packing size: 513, 769, 1025, 1281, 1537 tokens
   packed          requests of 10...40 short texts (6...200 tokens) from every document
-  long_2049_4096  one text per request at 2049, 2600, 3300 and 4096 tokens
-  long_4097_8192  one text per request at 4097, 5000, 6100, 7000 and 8192 tokens
+  long_2049_4096  one text per request at 2049, 2600, 3072, 3073, 3300 and 4096 tokens
+  long_4097_8192  one text per request at 4097, 5000, 6100, 6144, 6145, 7000 and 8192 tokens
   image_single    every image alone (official 280-token budget)
   image_batch     all images in requests of up to 8
 
@@ -90,11 +92,14 @@ def main():
         print(f"{group} tokens={counts if len(counts) < 6 else f'{len(counts)} texts'}", flush=True)
 
     started = time.time()
-    for S in (64, 128, 256, 512, 1024, 2048):
+    for S in (64, 128, 256, 512, 768, 1024, 1280, 1536, 2048):
         for d in DOCS:
             for target in (S, S // 2 + 5):
                 text, _ = cut(d, target, start=53 * d + target)
                 text_case(f"single_{S}", [text])
+    for target in (513, 769, 1025, 1281, 1537):
+        for d in DOCS[:2]:
+            text_case("boundary", [cut(d, target, start=31 * d)[0]])
     rng = np.random.default_rng(2048)
     for request in range(8):
         count = int(rng.integers(10, 41))
@@ -105,8 +110,8 @@ def main():
         text_case("packed", texts)
     long_docs = [i for i, doc in enumerate(docs) if len(ids_of(PROMPT + doc["text"])) >= 8192]
     j = 0
-    for group, targets in (("long_2049_4096", (2049, 2600, 3300, 4096)),
-                           ("long_4097_8192", (4097, 5000, 6100, 7000, 8192))):
+    for group, targets in (("long_2049_4096", (2049, 2600, 3072, 3073, 3300, 4096)),
+                           ("long_4097_8192", (4097, 5000, 6100, 6144, 6145, 7000, 8192))):
         for target in targets:
             for r in range(2):
                 d = long_docs[(j + 3 * r) % len(long_docs)]

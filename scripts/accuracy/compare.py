@@ -51,7 +51,8 @@ def main():
             items = []
             for name in case["images"]:
                 data = base64.b64encode(open(f"{args.images}/{name}", "rb").read()).decode()
-                mime = "image/png" if name.endswith(".png") else "image/jpeg"
+                ext = name.rsplit(".", 1)[-1].lower()
+                mime = "image/" + {"jpg": "jpeg", "tif": "tiff"}.get(ext, ext)
                 items.append({"content": [{"type": "image_url", "image_url": {"url": f"data:{mime};base64,{data}"}}]})
             body = {"input": items}
         response = post(endpoint, body)
