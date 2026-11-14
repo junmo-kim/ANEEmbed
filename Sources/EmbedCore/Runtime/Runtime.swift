@@ -5,8 +5,9 @@
 //   └─ BucketTextRuntime    packing planner + reusable buffers + a BucketFunctionRunner
 //        ├─ CoreMLBucketRunner   embed_S functions of the model package (Neural Engine)
 //        └─ PoolingFakeRunner    deterministic stand-in that honours the bias/pool contract
-//   LongTextRunner          2049...8192 tokens, per-layer functions (contract pending)
+//   LongTextRunner          2049...8192 tokens: LongTextEngine over CoreMLLongFunctions (LongText.swift)
 //   VisionEncoder           prepared image -> soft-token rows for the text functions
+//   SelfTestSuite           golden inputs from the package; a function that fails is not served
 import Foundation
 
 /// Static facts a runtime reports to the API (`/v1/models`, doctor).
@@ -16,12 +17,15 @@ public struct RuntimeInfo: Sendable, Equatable {
     public var maxImageTokens: Int
     public var bucketLengths: [Int]
     public var backend: String
+    /// Model functions in use (empty for runtimes without named functions).
+    public var functions: [String]
 
-    public init(maxTokens: Int, maxImageTokens: Int, bucketLengths: [Int], backend: String) {
+    public init(maxTokens: Int, maxImageTokens: Int, bucketLengths: [Int], backend: String, functions: [String] = []) {
         self.maxTokens = maxTokens
         self.maxImageTokens = maxImageTokens
         self.bucketLengths = bucketLengths
         self.backend = backend
+        self.functions = functions
     }
 }
 
@@ -60,7 +64,6 @@ public protocol BucketFunctionRunner: Sendable {
 }
 
 /// Texts longer than the largest bucket (2049...8192 tokens).
-/// TODO(model): the per-layer host contract comes with the final model package.
 public protocol LongTextRunner: Sendable {
     var maxTokens: Int { get }
     func embed(ids: [Int32]) async throws -> [Float]
