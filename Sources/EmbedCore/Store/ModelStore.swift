@@ -31,9 +31,50 @@ public struct ModelSource: Sendable, Equatable {
 
     public var isPublished: Bool { revision != "UNPUBLISHED" && !revision.isEmpty }
 
-    /// Hugging Face "resolve" URL of a file at the pinned revision.
-    public func url(for path: String) -> URL {
-        URL(string: "https://huggingface.co/\(repository)/resolve/\(revision)/\(path)")!
+    /// Whether `revision` can name a directory under models/: one plain path component of letters, digits, `.`, `_`
+    /// and `-`, starting with a letter or digit (so never `.`, `..` or a hidden name), at most 64 characters.
+    public static func isValidRevision(_ revision: String) -> Bool {
+        isName(revision, maxLength: 64)
+    }
+
+    /// Whether `repository` is a Hugging Face repository id, `owner/name`, each part a plain name.
+    public static func isValidRepository(_ repository: String) -> Bool {
+        let parts = repository.split(separator: "/", omittingEmptySubsequences: false)
+        return parts.count == 2 && parts.allSatisfy { isName(String($0), maxLength: 96) && !$0.contains("..") }
+    }
+
+    static func isName(_ name: String, maxLength: Int) -> Bool {
+        guard let first = name.unicodeScalars.first, name.unicodeScalars.count <= maxLength,
+            first.isASCII, first.properties.isAlphabetic || ("0"..."9").contains(first)
+        else { return false }
+        return name.unicodeScalars.allSatisfy {
+            $0.isASCII && ($0.properties.isAlphabetic || ("0"..."9").contains($0) || ".-_".unicodeScalars.contains($0))
+        }
+    }
+
+    /// Fails for a repository or revision that `--repo` / `--revision` must not take.
+    public func validate() throws(ServiceError) {
+        guard Self.isValidRepository(repository) else {
+            throw .badRequest("invalid_repo", "--repo \(repository): expected a Hugging Face repository id, owner/name", param: "repo")
+        }
+        guard Self.isValidRevision(revision) else {
+            throw .badRequest("invalid_revision",
+                              "--revision \(revision): expected a commit hash or a name of letters, digits, '.', '_' and '-'",
+                              param: "revision")
+        }
+    }
+
+    /// Hugging Face "resolve" URL of a file (a manifest path) at the revision; every part is percent-encoded.
+    public func url(for path: String) throws(ServiceError) -> URL {
+        try validate()
+        var components = URLComponents()
+        components.scheme = "https"
+        components.host = "huggingface.co"
+        components.path = "/\(repository)/resolve/\(revision)/\(path)"
+        guard Manifest.isValidPath(path), let url = components.url else {
+            throw ServiceError(.invalidInput, "invalid_manifest", "cannot build a download URL for \(path)")
+        }
+        return url
     }
 }
 
@@ -106,9 +147,8 @@ public struct Manifest: Sendable, Equatable {
         }
         var entries: [ManifestEntry] = []
         for file in files {
-            guard let path = file["path"]?.stringValue, let size = file["size"]?.intValue,
-                let sha = file["sha256"]?.stringValue, sha.count == 64,
-                !path.hasPrefix("/"), !path.split(separator: "/").contains("..")
+            guard let path = file["path"]?.stringValue, let size = file["size"]?.intValue, size >= 0,
+                let sha = file["sha256"]?.stringValue, sha.count == 64, sha.allSatisfy(\.isHexDigit), isValidPath(path)
             else { throw ServiceError(.unavailable, "invalid_manifest", "manifest.json has an invalid file entry") }
             entries.append(ManifestEntry(path: path, size: size, sha256: sha.lowercased()))
         }
@@ -124,6 +164,13 @@ public struct Manifest: Sendable, Equatable {
         return Manifest(model: root["name"]?.stringValue ?? root["model"]?.stringValue ?? "",
                         revision: root["revision"]?.stringValue ?? "", created: root["created"]?.stringValue ?? "",
                         files: entries, sha256: SHA256Hasher.hex(data), buckets: buckets, longPath: longPath)
+    }
+
+    /// A relative path inside the package: non-empty components, none `.` or `..`, no control characters.
+    public static func isValidPath(_ path: String) -> Bool {
+        let components = path.split(separator: "/", omittingEmptySubsequences: false)
+        return !path.hasPrefix("/") && components.allSatisfy { !$0.isEmpty && $0 != "." && $0 != ".." }
+            && !path.unicodeScalars.contains { $0.properties.generalCategory == .control }
     }
 
     public static func load(from directory: URL) throws(ServiceError) -> Manifest {
@@ -157,7 +204,13 @@ public struct Manifest: Sendable, Equatable {
 
     public struct Problem: Sendable, Equatable {
         public var path: String
-        public var issue: String  // missing | size_mismatch | sha256_mismatch
+        public var issue: String  // missing | not_regular_file | size_mismatch | sha256_mismatch
+    }
+
+    /// A regular file itself, not a symlink, FIFO, socket or device (those could hang the hash or point elsewhere).
+    public static func isRegularFile(_ url: URL) -> Bool {
+        var info = stat()
+        return lstat(url.path, &info) == 0 && (info.st_mode & S_IFMT) == S_IFREG
     }
 
     /// Checks every file; `hash: false` only checks presence and size (fast, for doctor).
@@ -186,7 +239,9 @@ public struct Manifest: Sendable, Equatable {
             if let attributes = try? FileManager.default.attributesOfItem(atPath: url.path),
                 let size = (attributes[.size] as? NSNumber)?.intValue
             {
-                if size != file.size {
+                if !Self.isRegularFile(url) {
+                    problem = Problem(path: file.path, issue: "not_regular_file")
+                } else if size != file.size {
                     problem = Problem(path: file.path, issue: "size_mismatch")
                 } else if hash {
                     progress?(file.path)
@@ -264,22 +319,41 @@ public struct ModelStore: Sendable {
     public var modelsDirectory: URL { dataDirectory.appendingPathComponent("models", isDirectory: true) }
     var currentPointer: URL { modelsDirectory.appendingPathComponent("current") }
 
-    /// The active revision directory (may not exist yet).
+    /// The active revision directory (may not exist yet). A `current` that is not a valid revision name is ignored.
     public var currentDirectory: URL {
         if let name = try? String(contentsOf: currentPointer, encoding: .utf8)
-            .trimmingCharacters(in: .whitespacesAndNewlines), !name.isEmpty, !name.contains("/")
+            .trimmingCharacters(in: .whitespacesAndNewlines), ModelSource.isValidRevision(name)
         {
             return modelsDirectory.appendingPathComponent(name, isDirectory: true)
         }
         return modelsDirectory.appendingPathComponent(ModelSource.pinned.revision, isDirectory: true)
     }
 
-    public func directory(for revision: String) -> URL {
-        modelsDirectory.appendingPathComponent(revision, isDirectory: true)
+    /// The directory of `revision`, which must be a valid revision name (it is removed and replaced on install).
+    public func directory(for revision: String) throws(ServiceError) -> URL {
+        guard ModelSource.isValidRevision(revision) else {
+            throw .badRequest("invalid_revision", "\(revision) is not a valid revision name", param: "revision")
+        }
+        let url = modelsDirectory.appendingPathComponent(revision, isDirectory: true)
+        try checkInside(url)
+        return url
+    }
+
+    /// Fails unless `url` is a direct child of the models directory once symlinks and `..` are resolved: the
+    /// installer removes and moves such paths.
+    public func checkInside(_ url: URL) throws(ServiceError) {
+        let parent = url.deletingLastPathComponent().standardizedFileURL.resolvingSymlinksInPath().path
+        let models = modelsDirectory.standardizedFileURL.resolvingSymlinksInPath().path
+        guard parent == models, ModelSource.isName(String(url.lastPathComponent.drop { $0 == "." }), maxLength: 160) else {
+            throw ServiceError(.internal, "outside_models_directory", "refusing to replace \(url.path): not inside \(models)")
+        }
     }
 
     /// Points `current` at `revision` (write to a temporary file, then rename: atomic).
     public func activate(revision: String) throws {
+        guard ModelSource.isValidRevision(revision) else {
+            throw ServiceError.badRequest("invalid_revision", "\(revision) is not a valid revision name", param: "revision")
+        }
         try FileManager.default.createDirectory(at: modelsDirectory, withIntermediateDirectories: true)
         let temporary = modelsDirectory.appendingPathComponent(".current.\(ProcessInfo.processInfo.processIdentifier)")
         try (revision + "\n").write(to: temporary, atomically: false, encoding: .utf8)

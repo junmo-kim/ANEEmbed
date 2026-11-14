@@ -12,7 +12,7 @@ enum CLI {
                          [--prompt-a ...] [--prompt-b ...] [--dimensions N] [--format yaml|json]
           aneembed tokenize [TEXT ...] [--stdin] [--prompt query|document] [--show-tokens] [--format yaml|json]
           aneembed doctor [--verify] [--format yaml|json]
-          aneembed models path | verify | warm | install [--repo R] [--revision REV]
+          aneembed models path | verify | warm | install [--from DIR | --repo R --revision REV]
           aneembed serve        HTTP: OpenAI /v1/embeddings, /v1/models, /health, POST /mcp, QUERY /{tool}
           aneembed mcp          MCP over stdio (newline-delimited JSON-RPC 2.0)
           aneembed --version | --help | <command> --print-config
@@ -252,7 +252,7 @@ struct DoctorCommand: Command {
 // MARK: - models
 
 struct ModelsCommand: Command {
-    let spec = ArgumentSpec(values: ["format", "repo", "revision"], flags: [])
+    let spec = ArgumentSpec(values: ["format", "repo", "revision", "from"], flags: [])
 
     func run(_ arguments: ParsedArguments, config: Config, format: OutputFormat) async throws(ServiceError) -> ExitCode {
         guard let action = arguments.positionals.first, arguments.positionals.count == 1 else {
@@ -268,12 +268,24 @@ struct ModelsCommand: Command {
             Output.data(try await Self.warm(config), format: format)
             return .success
         case "install":
+            guard !config.useFakeRuntime else {
+                throw .badRequest("fake_runtime", "models install compiles, warms and self-tests the model on the Neural "
+                                  + "Engine; it does not run with --runtime fake", param: "runtime")
+            }
+            if let from = arguments.value("from") {
+                guard arguments.value("repo") == nil && arguments.value("revision") == nil else {
+                    throw .badRequest("conflicting_options", "--from installs a local package; it takes no --repo or --revision")
+                }
+                return try await installLocal(URL(fileURLWithPath: (from as NSString).expandingTildeInPath), config: config,
+                                              format: format)
+            }
             var source = ModelSource.pinned
             if let repo = arguments.value("repo") { source.repository = repo }
             if let revision = arguments.value("revision") {
                 source.revision = revision
                 source.manifestSHA256 = nil  // an explicit revision is trusted by its commit hash only
             }
+            try source.validate()
             return try await install(source, config: config, format: format)
         default:
             throw .badRequest("unknown_action", "unknown models action \(action); use path, verify, warm or install")
@@ -320,19 +332,69 @@ struct ModelsCommand: Command {
         guard source.isPublished else {
             throw ServiceError(.unavailable, "model_not_published",
                                "no published model revision is pinned in this build",
-                               hint: "pass --repo and --revision, or point --model-dir at a local model package")
+                               hint: "pass --from with a local package directory, or --repo and --revision")
         }
         let store = ModelStore(dataDirectory: config.dataDirectory)
-        let target = store.directory(for: source.revision)
-        try await ModelDownloader(source: source).install(into: target)
+        let target = try store.directory(for: source.revision)
+        let lock = try Self.lock(store)
+        defer { lock.release() }
+        ModelInstaller.removeStaleStaging(for: target)
+        let started = Date()
+        try await ModelDownloader(source: source).install(into: target, store: store)
+        return try await finishInstall(store: store, revision: source.revision, fetched: Date().timeIntervalSince(started),
+                                       config: config, format: format)
+    }
+
+    func installLocal(_ source: URL, config: Config, format: OutputFormat) async throws(ServiceError) -> ExitCode {
+        let manifest = try Manifest.load(from: source)
+        let store = ModelStore(dataDirectory: config.dataDirectory)
+        let revision = ModelInstaller.localRevision(manifest)
+        let target = try store.directory(for: revision)
+        let lock = try Self.lock(store)
+        defer { lock.release() }
+        ModelInstaller.removeStaleStaging(for: target)
+        let started = Date()
+        if ModelInstaller.isInstalled(at: target, manifestSHA256: manifest.sha256) {
+            Log.info("\(revision) is already installed and verified")
+        } else {
+            Log.info("installing \(source.path) as \(revision) (manifest sha256 \(manifest.sha256))")
+            _ = try ModelInstaller.copy(from: source, into: target, store: store, log: { Log.info($0) })
+        }
+        return try await finishInstall(store: store, revision: revision, fetched: Date().timeIntervalSince(started),
+                                       config: config, format: format)
+    }
+
+    /// The install lock: a second `models install` waits for the first one (download, compile, warm, switch).
+    static func lock(_ store: ModelStore) throws(ServiceError) -> InstallLock {
+        try InstallLock.acquire(in: store) { Log.info("another `aneembed models install` is running; waiting for it") }
+    }
+
+    /// Compile, warm (with the self-test) and switch `current` to the new revision.
+    func finishInstall(store: ModelStore, revision: String, fetched: Double, config: Config, format: OutputFormat)
+        async throws(ServiceError) -> ExitCode
+    {
+        let target = try store.directory(for: revision)
+        let compileStarted = Date()
+        let differing = try await ModelInstaller.compile(in: target, log: { Log.info($0) })
+        let compiled = Date().timeIntervalSince(compileStarted)
+        if !differing.isEmpty {
+            Log.info("note: \(differing.count) compiled files differ from the packager's compile (another Core ML compiler); "
+                + "the self-test checks the result")
+        }
         var warmConfigFlags = config.values.filter { config.sources[$0.key] != .default }
         warmConfigFlags["model-dir"] = target.path
         let warmConfig = try Config(flags: warmConfigFlags, environment: [:])
         let warm = try await Self.warm(warmConfig)
-        do { try store.activate(revision: source.revision) } catch {
-            throw ServiceError(.internal, "activate_failed", "cannot switch to \(source.revision): \(error.localizedDescription)")
+        do { try store.activate(revision: revision) } catch {
+            throw ServiceError(.internal, "activate_failed", "cannot switch to \(revision): \(error.localizedDescription)")
         }
-        Output.data(["model_dir": .string(target.path), "revision": .string(source.revision), "warm": warm], format: format)
+        func round(_ seconds: Double) -> JSONValue { .number((seconds * 10).rounded() / 10) }
+        Output.data([
+            "model_dir": .string(target.path), "revision": .string(revision),
+            "manifest_sha256": .string((try? Manifest.load(from: target))?.sha256 ?? ""),
+            "seconds": ["fetch_and_verify": round(fetched), "compile": round(compiled)],
+            "compiled_matches_manifest": .bool(differing.isEmpty), "warm": warm,
+        ], format: format)
         return .success
     }
 }

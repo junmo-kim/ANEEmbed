@@ -49,6 +49,18 @@ set +e
 set -e
 [ "$code" -eq 65 ] && grep -q 'context_length_exceeded' "$tmpdir/err" || fail "over-long text: exit $code"
 
+# models install never runs on the fake runtime, and a revision must be one plain name (checked before any network use).
+set +e
+"$binary" models install >/dev/null 2>"$tmpdir/err"; code=$?
+set -e
+[ "$code" -eq 64 ] && grep -q 'fake_runtime' "$tmpdir/err" || fail "models install with the fake runtime: exit $code"
+for revision in .. ../x a/b; do
+  set +e
+  "$binary" models install --runtime coreml --revision "$revision" >/dev/null 2>"$tmpdir/err"; code=$?
+  set -e
+  [ "$code" -eq 64 ] && grep -q 'invalid_revision' "$tmpdir/err" || fail "models install --revision $revision: exit $code"
+done
+
 printf '%s\n' \
   '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}' \
   '{"jsonrpc":"2.0","method":"notifications/initialized"}' \
