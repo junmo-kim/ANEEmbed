@@ -119,9 +119,9 @@ public final class CoreMLBucketRunner: BucketFunctionRunner, @unchecked Sendable
         lengths = models.keys.sorted()
     }
 
-    /// The same runner without the functions named in `failed`.
-    public func excluding(_ failed: Set<String>) -> CoreMLBucketRunner {
-        CoreMLBucketRunner(models: models.filter { !failed.contains(BucketContract.functionName(forLength: $0.key)) })
+    /// The same runner with only the functions named in `allowed`.
+    public func keeping(_ allowed: Set<String>) -> CoreMLBucketRunner {
+        CoreMLBucketRunner(models: models.filter { allowed.contains(BucketContract.functionName(forLength: $0.key)) })
     }
 
     public var functionNames: [String] { lengths.map(BucketContract.functionName(forLength:)) }
@@ -221,9 +221,9 @@ public final class CoreMLVisionEncoder: VisionEncoder, @unchecked Sendable {
         budgets = models.keys.sorted()
     }
 
-    /// The same encoder without the functions named in `failed`.
-    public func excluding(_ failed: Set<String>) -> CoreMLVisionEncoder {
-        CoreMLVisionEncoder(models: models.filter { !failed.contains("vision_\($0.key)") }, positionTable: positionTable)
+    /// The same encoder with only the functions named in `allowed`.
+    public func keeping(_ allowed: Set<String>) -> CoreMLVisionEncoder {
+        CoreMLVisionEncoder(models: models.filter { allowed.contains("vision_\($0.key)") }, positionTable: positionTable)
     }
 
     public var functionNames: [String] { budgets.map { "vision_\($0)" } }

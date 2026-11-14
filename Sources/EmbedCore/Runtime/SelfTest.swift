@@ -44,6 +44,12 @@ public struct SelfTestReport: Sendable, Equatable {
 
     public var failed: [SelfTestResult] { results.filter { !$0.passed } }
 
+    /// The functions that may serve: every one of their results passed (an allowlist; a function without a
+    /// result is not in it).
+    public var servable: Set<String> {
+        Set(results.map(\.function)).subtracting(failed.map(\.function))
+    }
+
     public init(osBuild: String, ranAt: Date, seconds: Double, results: [SelfTestResult], available: Bool = true) {
         self.osBuild = osBuild
         self.ranAt = ranAt
@@ -122,13 +128,23 @@ public struct SelfTestSuite: Sendable {
     let digest: [Float]  // [512, 8]
     static let digestWidth = 8
 
-    public static func load(from directory: URL) throws -> SelfTestSuite? {
+    /// The package's suite. Without one nothing can be checked, so loading stops (`--selftest skip` is the
+    /// explicit, unsafe way around it).
+    public static func require(from directory: URL) throws(ServiceError) -> SelfTestSuite {
         let jsonURL = directory.appendingPathComponent(ModelLayout.selfTest)
         let binURL = directory.appendingPathComponent(ModelLayout.selfTestData)
         guard FileManager.default.fileExists(atPath: jsonURL.path), FileManager.default.fileExists(atPath: binURL.path) else {
-            return nil
+            throw ServiceError(.unavailable, "selftest_missing",
+                               "the package in \(directory.path) has no self-test data (\(ModelLayout.selfTest), "
+                               + "\(ModelLayout.selfTestData)): its functions cannot be checked on this Mac",
+                               hint: "reinstall with `aneembed models install`; --selftest skip serves unchecked (unsafe)")
         }
-        return try SelfTestSuite(json: try Data(contentsOf: jsonURL), blob: try Data(contentsOf: binURL, options: .alwaysMapped))
+        do {
+            return try SelfTestSuite(json: try Data(contentsOf: jsonURL), blob: try Data(contentsOf: binURL, options: .alwaysMapped))
+        } catch {
+            throw ServiceError(.unavailable, "invalid_selftest", "cannot read the package's self-test: \(error)",
+                               hint: "check the package with `aneembed models verify`, or reinstall it")
+        }
     }
 
     public init(json: Data, blob: Data) throws {
@@ -212,7 +228,8 @@ public struct SelfTestSuite: Sendable {
         return PreparedImage(rgb: rgb, width: width, height: height)
     }
 
-    /// Runs the case of every function that is loaded. Functions without a case are not reported.
+    /// Runs the case of every function that is loaded. A loaded function without a case gets a failed result
+    /// (it is not served), so the report covers every loaded function.
     public func run(buckets: (any BucketFunctionRunner)?, long: (any LongFunctionRunner)?, vision: (any VisionEncoder)?,
                     visionBudgets: [Int] = [], rows: any TokenRowSource) async -> [SelfTestResult]
     {
@@ -249,6 +266,14 @@ public struct SelfTestSuite: Sendable {
                 result.error = "\(error)"
             }
             results.append(result)
+        }
+        let loaded = (buckets?.lengths.map { (BucketContract.functionName(forLength: $0), BucketContract.isWindowed($0) ? "winp" : "bucket") } ?? [])
+            + (long?.lengths.map { (WindowContract.longName($0), "winl") } ?? [])
+            + (vision == nil ? [] : visionBudgets.map { ("vision_\($0)", "vision") })
+        let tested = Set(results.map(\.function))
+        for (function, kind) in loaded where !tested.contains(function) {
+            results.append(SelfTestResult(function: function, kind: kind, passed: false, cosine: 0,
+                                          error: "no self-test case in the package"))
         }
         return results
     }

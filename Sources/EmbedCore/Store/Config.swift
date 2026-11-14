@@ -43,6 +43,9 @@ public struct Config: Sendable, Equatable {
                validate: integer(1...64)),
         Option(name: "runtime", help: "coreml (Neural Engine) or fake (no model, for testing integrations)",
                defaultValue: { "coreml" }, validate: { ["coreml", "fake"].contains($0) ? nil : "must be coreml or fake" }),
+        Option(name: "selftest",
+               help: "require: serve only functions that pass the package's self-test; skip: serve every function unchecked (unsafe)",
+               defaultValue: { "require" }, validate: { ["require", "skip"].contains($0) ? nil : "must be require or skip" }),
     ]
 
     public static func option(named name: String) -> Option? { options.first { $0.name == name } }
@@ -98,6 +101,8 @@ public struct Config: Sendable, Equatable {
     public var modelName: String { string("model-name") }
     public var maxBodyBytes: Int { int("max-body") << 20 }
     public var useFakeRuntime: Bool { string("runtime") == "fake" }
+    /// `--selftest skip`: load without the package's self-test and serve every function unchecked (unsafe).
+    public var skipSelfTest: Bool { string("selftest") == "skip" }
 
     /// The configured model directory, or the data directory's current revision.
     public var modelDirectory: URL {

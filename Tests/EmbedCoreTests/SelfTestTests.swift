@@ -114,6 +114,41 @@ struct SelfTestTests {
         #expect(infinite.map(\.passed) == [false])
     }
 
+    /// Serving is an allowlist: a loaded function the suite has no case for is reported as failed, not skipped.
+    @Test func loadedFunctionsWithoutACaseAreNotServable() async throws {
+        let suite = try bucketSuite(sequences: [[2, 10, 1]], reference: [Self.unit])
+        let zero = [Float](repeating: 0, count: 768)
+        let runner = StubBucketRunner(lengths: [64, 128]) { [Self.unit] + [[Float]](repeating: zero, count: 7) }
+        let results = await suite.run(buckets: runner, long: nil, vision: nil, rows: HashedTokenRows())
+        #expect(results.map(\.function) == ["embed_64", "embed_128"])
+        #expect(results.map(\.passed) == [true, false])
+        #expect(results[1].error?.contains("no self-test case") == true)
+        let report = SelfTestReport(osBuild: "b", ranAt: Date(), seconds: 0, results: results)
+        #expect(report.servable == ["embed_64"])
+        #expect(report.summary == "1/2 passed; not served: embed_128")
+        // A function with two cases is servable only when both pass.
+        let twice = SelfTestReport(osBuild: "b", ranAt: Date(), seconds: 0, results: [
+            SelfTestResult(function: "embed_64", kind: "bucket", passed: true, cosine: 1),
+            SelfTestResult(function: "embed_64", kind: "bucket", passed: false, cosine: 0.5),
+        ])
+        #expect(twice.servable.isEmpty)
+    }
+
+    /// No self-test data, or data that cannot be read, refuses to serve (unless --selftest skip).
+    @Test func missingOrUnreadableSelfTestDataIsAnError() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("aneembed-selftest-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        #expect(throws: ServiceError.self) { try SelfTestSuite.require(from: directory) }
+        do { _ = try SelfTestSuite.require(from: directory) } catch { #expect(error.reason == "selftest_missing") }
+        try Data("{bad".utf8).write(to: directory.appendingPathComponent(ModelLayout.selfTest))
+        try Data(count: 16).write(to: directory.appendingPathComponent(ModelLayout.selfTestData))
+        do { _ = try SelfTestSuite.require(from: directory) } catch { #expect(error.reason == "invalid_selftest") }
+        #expect(try Config(environment: [:]).skipSelfTest == false)
+        #expect(try Config(flags: ["selftest": "skip"], environment: [:]).skipSelfTest)
+        #expect(throws: ServiceError.self) { try Config(flags: ["selftest": "maybe"], environment: [:]) }
+    }
+
     @Test func reportRoundTripsAndSummarizes() throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("aneembed-selftest-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)

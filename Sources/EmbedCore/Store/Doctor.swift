@@ -36,7 +36,19 @@ public enum Doctor {
                 if !issues.isEmpty { problems.append(.string("\(issues.count) model files fail the manifest check")) }
                 do { try manifest.checkContract() } catch { problems.append(.string(error.message)) }
             } catch {
-                model["manifest"] = .string("missing")
+                model["manifest"] = .string(error.reason == "manifest_missing" ? "missing" : "invalid")
+                problems.append(.string(error.message))
+            }
+            if config.skipSelfTest {
+                model["selftest_data"] = "not used (--selftest skip: every function is served unchecked)"
+            } else if !config.useFakeRuntime {
+                do {
+                    let suite = try SelfTestSuite.require(from: directory)
+                    model["selftest_data"] = .string("\(suite.cases.count) tests")
+                } catch {
+                    model["selftest_data"] = .string(error.reason)
+                    problems.append(.string(error.message))
+                }
             }
         } else if !config.useFakeRuntime {
             problems.append(.string("no model: run `aneembed models install` or pass --model-dir"))

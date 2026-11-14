@@ -194,7 +194,8 @@ public struct Manifest: Sendable, Equatable {
         return try parse(data)
     }
 
-    /// Fails when the package declares a different contract than this build implements.
+    /// Fails unless the package declares exactly the contract this build implements: every packing bucket and
+    /// windowed function the runtime may load, with their slots and window sizes.
     public func checkContract() throws(ServiceError) {
         if legacyLongPath {
             throw ServiceError(.unavailable, "unsupported_model",
@@ -203,24 +204,28 @@ public struct Manifest: Sendable, Equatable {
                                hint: "install the model package this build pins (`aneembed models install`)")
         }
         let full = BucketContract.fullAttentionLengths
-        for (length, slots) in buckets where !full.contains(length) || BucketContract.slots(forLength: length) != slots {
+        let expectedBuckets = Dictionary(uniqueKeysWithValues: full.map { ($0, BucketContract.slots(forLength: $0)) })
+        guard buckets == expectedBuckets else {
             throw ServiceError(.unavailable, "unsupported_model",
-                               "the package declares bucket \(length) with \(slots) slots; this build expects \(full) with max(8, S/32) slots",
-                               hint: "update aneembed")
+                               "the package declares buckets \(buckets.keys.sorted()) (slots \(buckets.keys.sorted().map { buckets[$0]! })); "
+                               + "this build loads \(full) with max(8, S/32) slots",
+                               hint: "install the model package this build pins (`aneembed models install`), or update aneembed")
         }
-        if let window {
-            let packingOK = window.packing.allSatisfy {
-                WindowContract.packingLengths.contains($0.key) && BucketContract.slots(forLength: $0.key) == $0.value
-            }
-            guard window.block == WindowContract.block, window.halo == WindowContract.halo,
-                window.bandColumns == WindowContract.bandColumns, packingOK,
-                window.long.allSatisfy(WindowContract.longLengths.contains)
-            else {
-                throw ServiceError(.unavailable, "unsupported_model",
-                                   "the package's windowed functions (block \(window.block), halo \(window.halo), packing "
-                                   + "\(window.packing.keys.sorted()), long \(window.long)) differ from this build's",
-                                   hint: "update aneembed")
-            }
+        let expectedPacking = Dictionary(uniqueKeysWithValues: WindowContract.packingLengths.map {
+            ($0, BucketContract.slots(forLength: $0))
+        })
+        guard let window, window.block == WindowContract.block, window.halo == WindowContract.halo,
+            window.bandColumns == WindowContract.bandColumns, window.packing == expectedPacking,
+            window.long.sorted() == WindowContract.longLengths
+        else {
+            let declared = window.map {
+                "block \($0.block), halo \($0.halo), packing \($0.packing.keys.sorted()), long \($0.long)"
+            } ?? "none"
+            throw ServiceError(.unavailable, "unsupported_model",
+                               "the package's windowed functions (\(declared)) differ from this build's (block "
+                               + "\(WindowContract.block), halo \(WindowContract.halo), packing \(WindowContract.packingLengths), "
+                               + "long \(WindowContract.longLengths))",
+                               hint: "install the model package this build pins (`aneembed models install`), or update aneembed")
         }
     }
 

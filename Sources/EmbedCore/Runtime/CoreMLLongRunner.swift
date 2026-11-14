@@ -29,9 +29,9 @@ public final class CoreMLLongRunner: LongFunctionRunner, @unchecked Sendable {
         return CoreMLLongRunner(models: models)
     }
 
-    /// The same runner without the functions named in `failed`.
-    public func excluding(_ failed: Set<String>) -> CoreMLLongRunner {
-        CoreMLLongRunner(models: models.filter { !failed.contains(WindowContract.longName($0.key)) })
+    /// The same runner with only the functions named in `allowed`.
+    public func keeping(_ allowed: Set<String>) -> CoreMLLongRunner {
+        CoreMLLongRunner(models: models.filter { allowed.contains(WindowContract.longName($0.key)) })
     }
 
     public func run(_ buffers: LongBuffers) async throws -> [Float] {

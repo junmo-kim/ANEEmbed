@@ -255,6 +255,24 @@ struct ModelStoreTests {
         #expect(ModelInstaller.localRevision(parsed) == "local-" + parsed.sha256.prefix(12))
     }
 
+    /// The runtime loads every function of the contract, so the manifest must declare all of them.
+    @Test func contractRequiresEveryDeclaredFunction() throws {
+        let full = DoctorTests.contract(files: [])
+        #expect(throws: Never.self) { try Manifest.parse(JSONValue.object(full).jsonData()).checkContract() }
+        for key in ["buckets", "window"] {
+            var missing = full
+            missing[key] = nil
+            #expect(throws: ServiceError.self) { try Manifest.parse(JSONValue.object(missing).jsonData()).checkContract() }
+        }
+        var partial = full
+        partial["buckets"] = [["tokens": 64, "slots": 8]]
+        #expect(throws: ServiceError.self) { try Manifest.parse(JSONValue.object(partial).jsonData()).checkContract() }
+        var noLong = full
+        noLong["window"] = ["block": 512, "halo": 512, "band_columns": 1536,
+                            "packing": [["tokens": 1536, "slots": 48], ["tokens": 2048, "slots": 64]]]
+        #expect(throws: ServiceError.self) { try Manifest.parse(JSONValue.object(noLong).jsonData()).checkContract() }
+    }
+
     @Test func rejectsPathsOutsideTheModelDirectory() {
         let bad: JSONValue = ["files": [["path": "../x", "size": 1, "sha256": .string(String(repeating: "a", count: 64))]]]
         #expect(throws: ServiceError.self) { try Manifest.parse(bad.jsonData()) }

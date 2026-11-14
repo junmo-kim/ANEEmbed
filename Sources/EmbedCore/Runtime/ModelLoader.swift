@@ -49,7 +49,18 @@ public enum ModelLoader {
         guard let textModel = ModelLayout.model(ModelLayout.textModel, in: directory) else {
             throw ServiceError(.unavailable, "model_missing", "no \(ModelLayout.textModel) model in \(directory.path)")
         }
-        if let manifest = try? Manifest.load(from: directory) { try manifest.checkContract() }
+        // The manifest is required: it is what the contract and the file checks are read from.
+        let manifest = try Manifest.load(from: directory)
+        try manifest.checkContract()
+        // Before any function is loaded: without the package's self-test nothing is checked, so nothing is served.
+        let suite: SelfTestSuite?
+        if config.skipSelfTest {
+            log("warning: --selftest skip: every function is served without the self-test (unsafe: a miscompiled "
+                + "function returns wrong vectors without an error)")
+            suite = nil
+        } else {
+            suite = try SelfTestSuite.require(from: directory)
+        }
         do {
             let tokenizer = try GemmaTokenizer(contentsOf: tokenizerURL)
             let table = try TokenTable(contentsOf: directory.appendingPathComponent(ModelLayout.tokenTable))
@@ -70,13 +81,12 @@ public enum ModelLoader {
             }
 
             var report = LoadReport()
-            if let suite = try SelfTestSuite.load(from: directory) {
+            if let suite {
                 let testStarted = Date()
                 let results = await suite.run(buckets: buckets, long: long, vision: vision,
                                               visionBudgets: vision?.budgets ?? [], rows: table)
                 let selfTest = SelfTestReport(osBuild: operatingSystemBuild, ranAt: Date(),
                                               seconds: Date().timeIntervalSince(testStarted), results: results)
-                let failed = Set(selfTest.failed.map(\.function))
                 for result in selfTest.failed {
                     log("self-test failed, not serving \(result.function): cos \(result.cosine)"
                         + (result.relativeError.map { ", rel err \($0)" } ?? "") + (result.error.map { ", \($0)" } ?? ""))
@@ -84,19 +94,15 @@ public enum ModelLoader {
                 log(String(format: "self-test: %@ in %.1fs", selfTest.summary, selfTest.seconds))
                 try? selfTest.save(to: directory)
                 report.selfTest = selfTest
-                if !failed.isEmpty {
-                    buckets = buckets.excluding(failed)
-                    long = long?.excluding(failed)
-                    vision = vision?.excluding(failed)
-                }
+                // Allowlist: only functions with a passing result in this run serve.
+                let servable = selfTest.servable
+                buckets = buckets.keeping(servable)
+                long = long?.keeping(servable)
+                vision = vision?.keeping(servable)
                 guard !buckets.lengths.isEmpty else {
                     throw ServiceError(.unavailable, "selftest_failed", "every text function failed the self-test on this Mac",
                                        hint: "see `aneembed doctor`; please report the macOS build")
                 }
-            } else {
-                log("the package has no self-test data: functions are not checked")
-                report.selfTest = SelfTestReport(osBuild: operatingSystemBuild, ranAt: Date(), seconds: 0, results: [],
-                                                 available: false)
             }
             if let long, long.lengths.last != longLengths.last {
                 let limit = long.lengths.last ?? buckets.lengths.last!
@@ -109,7 +115,7 @@ public enum ModelLoader {
             report.functions = buckets.functionNames + (long?.functionNames ?? []) + (visionEncoder?.functionNames ?? [])
             let runtime = BucketTextRuntime(runner: buckets, rows: table, long: longRunner, vision: visionEncoder,
                                             maxIdleBuffers: max(2, config.limits.queryConcurrency), backend: "coreml-ane",
-                                            functions: report.functions, warmed: report.selfTest?.available ?? false)
+                                            functions: report.functions, warmed: report.selfTest != nil)
             report.seconds = Date().timeIntervalSince(started)
             let service = EmbeddingService(tokenizer: tokenizer, runtime: runtime, limits: config.limits, modelName: config.modelName)
             return (service, report)
