@@ -55,11 +55,11 @@ public enum ModelLoader {
             let table = try TokenTable(contentsOf: directory.appendingPathComponent(ModelLayout.tokenTable))
             let compiledText = try await compiledModelURL(textModel)
             var buckets = try await CoreMLBucketRunner.load(from: compiledText, maxTokens: config.maxTokens)
-            var long: CoreMLLongFunctions?
-            let longLengths = CoreMLLongFunctions.lengths(forMaxTokens: config.maxTokens)
+            var long: CoreMLLongRunner?
+            let longLengths = WindowContract.longLengths(forMaxTokens: config.maxTokens)
             if !longLengths.isEmpty {
                 log("loading the long-text functions for up to \(longLengths.last!) tokens")
-                long = try await CoreMLLongFunctions.load(from: compiledText, lengths: longLengths)
+                long = try await CoreMLLongRunner.load(from: compiledText, lengths: longLengths)
             }
             var vision: CoreMLVisionEncoder?
             if let visionModel = ModelLayout.model(ModelLayout.visionModel, in: directory) {
@@ -98,13 +98,15 @@ public enum ModelLoader {
                 report.selfTest = SelfTestReport(osBuild: operatingSystemBuild, ranAt: Date(), seconds: 0, results: [],
                                                  available: false)
             }
-            if let long, long.lengths.isEmpty {
-                log("texts are limited to \(buckets.lengths.last!) tokens: the long-text functions failed the self-test")
+            if let long, long.lengths.last != longLengths.last {
+                let limit = long.lengths.last ?? buckets.lengths.last!
+                log("texts are limited to \(limit) tokens: long-text functions failed the self-test")
             }
-            let longRunner = long.flatMap { $0.lengths.isEmpty ? nil : LongTextEngine(functions: $0, rows: table) }
+            let longRunner = long.flatMap {
+                $0.lengths.isEmpty ? nil : LongTextEngine(runner: $0, rows: table, maxIdlePerLength: max(1, config.limits.longConcurrency))
+            }
             let visionEncoder = vision.flatMap { $0.budgets.isEmpty ? nil : $0 }
-            report.functions = buckets.functionNames
-                + CoreMLLongFunctions.functionNames(lengths: long?.lengths ?? []) + (visionEncoder?.functionNames ?? [])
+            report.functions = buckets.functionNames + (long?.functionNames ?? []) + (visionEncoder?.functionNames ?? [])
             let runtime = BucketTextRuntime(runner: buckets, rows: table, long: longRunner, vision: visionEncoder,
                                             maxIdleBuffers: max(2, config.limits.queryConcurrency), backend: "coreml-ane",
                                             functions: report.functions, warmed: report.selfTest?.available ?? false)

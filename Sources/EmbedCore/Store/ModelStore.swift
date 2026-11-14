@@ -26,8 +26,8 @@ public struct ModelSource: Sendable, Equatable {
     /// The package this build installs: junmo-k/embeddinggemma-2-ane at the commit of its 0.1.0 upload, checked
     /// against the manifest hash below.
     public static let pinned = ModelSource(
-        repository: "junmo-k/embeddinggemma-2-ane", revision: "3c9b6f2feeb640c5a359846659740cbf4d2debc7",
-        manifestSHA256: "4773e00cd3282ada9ba3d5a723fd806ce8607167b1b8db553f1b5f1caabca52b")
+        repository: "junmo-k/embeddinggemma-2-ane", revision: "f21079a26cd857807917d17fb4a8c30913cf2def",
+        manifestSHA256: "b21e57adf6931e3838d5a1e346befcf2e13adfb43906cb7bad1dff1274912d8a")
 
     public var isPublished: Bool { revision != "UNPUBLISHED" && !revision.isEmpty }
 
@@ -123,15 +123,21 @@ public struct Manifest: Sendable, Equatable {
     public var files: [ManifestEntry]
     /// SHA-256 of the manifest bytes: identifies a package exactly.
     public var sha256: String
-    /// The bucket functions the package declares (`buckets`): length -> pool slots.
+    /// The embed_S functions the package declares (`buckets`): length -> pool slots.
     public var buckets: [Int: Int]
-    /// The long-text path (`long_path`): chunk, halo and sequence buckets, when the package has one.
-    public var longPath: LongPathContract?
+    /// The windowed functions (`window`), when declared.
+    public var window: WindowFunctions?
+    /// The package has the per-layer long path of the first layout (`long_path`), which this build no longer runs.
+    public var legacyLongPath: Bool
 
-    public struct LongPathContract: Sendable, Equatable {
-        public var chunk: Int
+    public struct WindowFunctions: Sendable, Equatable {
+        public var block: Int
         public var halo: Int
-        public var buckets: [Int]
+        public var bandColumns: Int
+        /// winp: length -> pool slots.
+        public var packing: [Int: Int]
+        /// winl lengths.
+        public var long: [Int]
     }
 
     /// Files to download or copy; compiled models are built on this Mac instead.
@@ -156,14 +162,20 @@ public struct Manifest: Sendable, Equatable {
         for bucket in root["buckets"]?.arrayValue ?? [] {
             if let tokens = bucket["tokens"]?.intValue, let slots = bucket["slots"]?.intValue { buckets[tokens] = slots }
         }
-        var longPath: LongPathContract?
-        if let long = root["long_path"], let chunk = long["chunk"]?.intValue, let halo = long["halo"]?.intValue {
-            longPath = LongPathContract(chunk: chunk, halo: halo,
-                                        buckets: long["buckets"]?.arrayValue?.compactMap(\.intValue) ?? [])
+        var window: WindowFunctions?
+        if let declared = root["window"] {
+            var packing: [Int: Int] = [:]
+            for item in declared["packing"]?.arrayValue ?? [] {
+                if let tokens = item["tokens"]?.intValue, let slots = item["slots"]?.intValue { packing[tokens] = slots }
+            }
+            window = WindowFunctions(block: declared["block"]?.intValue ?? 0, halo: declared["halo"]?.intValue ?? 0,
+                                     bandColumns: declared["band_columns"]?.intValue ?? 0, packing: packing,
+                                     long: (declared["long"]?.arrayValue ?? []).compactMap { $0["tokens"]?.intValue })
         }
         return Manifest(model: root["name"]?.stringValue ?? root["model"]?.stringValue ?? "",
                         revision: root["revision"]?.stringValue ?? "", created: root["created"]?.stringValue ?? "",
-                        files: entries, sha256: SHA256Hasher.hex(data), buckets: buckets, longPath: longPath)
+                        files: entries, sha256: SHA256Hasher.hex(data), buckets: buckets, window: window,
+                        legacyLongPath: root["long_path"] != nil)
     }
 
     /// A relative path inside the package: non-empty components, none `.` or `..`, no control characters.
@@ -184,21 +196,31 @@ public struct Manifest: Sendable, Equatable {
 
     /// Fails when the package declares a different contract than this build implements.
     public func checkContract() throws(ServiceError) {
-        if !buckets.isEmpty {
-            for (length, slots) in buckets where BucketContract.lengths.contains(length) == false
-                || BucketContract.slots(forLength: length) != slots
-            {
+        if legacyLongPath {
+            throw ServiceError(.unavailable, "unsupported_model",
+                               "the package has the per-layer long path of the first model layout; this aneembed runs the "
+                               + "windowed layout (winp/winl functions)",
+                               hint: "install the model package this build pins (`aneembed models install`)")
+        }
+        let full = BucketContract.fullAttentionLengths
+        for (length, slots) in buckets where !full.contains(length) || BucketContract.slots(forLength: length) != slots {
+            throw ServiceError(.unavailable, "unsupported_model",
+                               "the package declares bucket \(length) with \(slots) slots; this build expects \(full) with max(8, S/32) slots",
+                               hint: "update aneembed")
+        }
+        if let window {
+            let packingOK = window.packing.allSatisfy {
+                WindowContract.packingLengths.contains($0.key) && BucketContract.slots(forLength: $0.key) == $0.value
+            }
+            guard window.block == WindowContract.block, window.halo == WindowContract.halo,
+                window.bandColumns == WindowContract.bandColumns, packingOK,
+                window.long.allSatisfy(WindowContract.longLengths.contains)
+            else {
                 throw ServiceError(.unavailable, "unsupported_model",
-                                   "the package declares bucket \(length) with \(slots) slots; this build expects \(BucketContract.lengths) with max(8, S/32) slots",
+                                   "the package's windowed functions (block \(window.block), halo \(window.halo), packing "
+                                   + "\(window.packing.keys.sorted()), long \(window.long)) differ from this build's",
                                    hint: "update aneembed")
             }
-        }
-        if let longPath, longPath.chunk != LongContract.chunk || longPath.halo != LongContract.halo
-            || !longPath.buckets.allSatisfy(LongContract.lengths.contains)
-        {
-            throw ServiceError(.unavailable, "unsupported_model",
-                               "the package's long path (chunk \(longPath.chunk), halo \(longPath.halo), \(longPath.buckets)) differs from this build's",
-                               hint: "update aneembed")
         }
     }
 

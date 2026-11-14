@@ -7,9 +7,8 @@
 //
 // Inputs are rebuilt from the package's own files as selftest.json's "procedure" field describes:
 //   bucket embed_S     the listed sequences packed into one call: cosine per row, unused rows ~0
-//   long_swa_l{i}      first 1800 document rows, chunk 1: residual update digest
-//   long{S}_glb_l{i}   first S - 300 rows, hidden = inputs_embeds: residual update digest
-//   long{S}_head       same plus pool: cosine of the embedding
+//   winp winp{S}_b512  the same through the band buffers
+//   winl winl{S}_b512  the first doc_rows document ids as one text: cosine of the embedding
 //   vision_{B}         a procedural image (integer formula): digest of the image tokens
 // A digest is D = rows @ R with R [512, 8] from selftest.bin; metrics are cosine and |Da - Dr| / |Dr|.
 import Accelerate
@@ -105,8 +104,6 @@ public struct SelfTestSuite: Sendable {
         public var kind: String
         public var sequences: [[Int32]]
         public var documentRows: Int
-        public var chunk: Int
-        public var validRows: Int
         public var grid: (columns: Int, rows: Int)
         public var expectedOffset: Int
         public var expectedShape: [Int]
@@ -165,8 +162,7 @@ public struct SelfTestSuite: Sendable {
             cases.append(Case(
                 function: function, kind: kind,
                 sequences: (test["sequences"]?.arrayValue ?? []).map { ($0.arrayValue ?? []).compactMap { $0.intValue.map(Int32.init) } },
-                documentRows: test["doc_rows"]?.intValue ?? 0, chunk: test["chunk"]?.intValue ?? 0,
-                validRows: test["valid_rows"]?.intValue ?? 0,
+                documentRows: test["doc_rows"]?.intValue ?? 0,
                 grid: grid.count == 2 ? (grid[0], grid[1]) : (0, 0), expectedOffset: offset, expectedShape: shape))
         }
         self.cases = cases
@@ -217,24 +213,24 @@ public struct SelfTestSuite: Sendable {
     }
 
     /// Runs the case of every function that is loaded. Functions without a case are not reported.
-    public func run(buckets: (any BucketFunctionRunner)?, long: (any LongFunctions)?, vision: (any VisionEncoder)?,
+    public func run(buckets: (any BucketFunctionRunner)?, long: (any LongFunctionRunner)?, vision: (any VisionEncoder)?,
                     visionBudgets: [Int] = [], rows: any TokenRowSource) async -> [SelfTestResult]
     {
         var results: [SelfTestResult] = []
-        let longNames = Set(CoreMLLongFunctions.functionNames(lengths: long?.lengths ?? []))
         for test in cases {
             let tolerance = self.tolerance[test.kind] ?? Tolerance(minCosine: 0.999, maxRelativeError: 0.05)
             var result = SelfTestResult(function: test.function, kind: test.kind, passed: false, cosine: 0)
             do {
                 switch test.kind {
-                case "bucket":
-                    guard let buckets, let length = Int(test.function.dropFirst("embed_".count)),
-                        buckets.lengths.contains(length)
-                    else { continue }
+                case "bucket", "winp":
+                    guard let buckets, let length = buckets.lengths.first(where: {
+                        BucketContract.functionName(forLength: $0) == test.function
+                    }) else { continue }
                     try await runBucket(test, length: length, runner: buckets, rows: rows, into: &result)
-                case "swa", "glb", "head":
-                    guard let long, longNames.contains(test.function) else { continue }
-                    try await runLong(test, functions: long, rows: rows, into: &result)
+                case "winl":
+                    guard let long, let length = long.lengths.first(where: { WindowContract.longName($0) == test.function })
+                    else { continue }
+                    try await runLong(test, length: length, runner: long, rows: rows, into: &result)
                 case "vision":
                     guard let vision, let budget = Int(test.function.dropFirst("vision_".count)),
                         visionBudgets.contains(budget)
@@ -305,48 +301,14 @@ public struct SelfTestSuite: Sendable {
         result.unusedRowsMaxAbs = Self.maxAbs(output.dropFirst(test.sequences.count))
     }
 
-    private func runLong(_ test: Case, functions: any LongFunctions, rows: any TokenRowSource,
+    private func runLong(_ test: Case, length: Int, runner: any LongFunctionRunner, rows: any TokenRowSource,
                          into result: inout SelfTestResult) async throws
     {
-        let hidden = BucketContract.hidden, n = test.documentRows
-        guard n > 0, n <= documentIDs.count else { throw SelfTestError.invalid("doc_rows \(n)") }
-        func allocate(_ count: Int) -> UnsafeMutablePointer<Float16> {
-            let pointer = UnsafeMutableRawPointer.allocate(byteCount: count * 2, alignment: BucketBuffers.alignment)
-                .bindMemory(to: Float16.self, capacity: count)
-            pointer.initialize(repeating: 0, count: count)
-            return pointer
-        }
-        let ids = Array(documentIDs.prefix(n))
-        if test.kind == "swa" {
-            let chunk = LongContract.chunk, halo = LongContract.halo, b = test.chunk
-            let padded = allocate((2 * chunk + 2 * halo) * hidden), output = allocate(chunk * hidden)
-            defer { padded.deallocate(); output.deallocate() }
-            rows.gather(ids, into: padded + halo * hidden)
-            let window = padded + b * chunk * hidden, query = padded + (halo + b * chunk) * hidden
-            let bias = ChunkBias(ChunkBiasKey(chunk: b, tokens: n))
-            let layer = Int(test.function.dropFirst("long_swa_l".count))!
-            try await functions.sliding(layer: layer, window: window, embeds: query, bias: bias.values, into: output)
-            let valid = min(chunk, n - b * chunk)
-            let update = (0..<(valid * hidden)).map { Float(output[$0]) - Float(query[$0]) }
-            (result.cosine, result.relativeError) = Self.metrics(digest(of: update, count: valid), expected(test))
-            return
-        }
-        let parts = test.function.split(separator: "_")  // long4096 glb l5 | long4096 head
-        guard let length = Int(parts[0].dropFirst("long".count)) else { throw SelfTestError.invalid(test.function) }
-        let x = allocate(length * hidden), keyBias = allocate(length), pool = allocate(length), output = allocate(length * hidden)
-        defer { x.deallocate(); keyBias.deallocate(); pool.deallocate(); output.deallocate() }
-        rows.gather(ids, into: x)
-        keyBias.update(repeating: 0, count: n)
-        (keyBias + n).update(repeating: LongContract.blocked, count: length - n)
-        pool.update(repeating: LongContract.poolWeight, count: n)
-        if test.kind == "head" {
-            let embedding = try await functions.head(length: length, hidden: x, embeds: x, keyBias: keyBias, pool: pool)
-            result.cosine = Self.metrics(embedding, expected(test)).cosine
-            return
-        }
-        guard let layer = Int(parts[2].dropFirst("l".count)) else { throw SelfTestError.invalid(test.function) }
-        try await functions.global(length: length, layer: layer, hidden: x, embeds: x, keyBias: keyBias, into: output)
-        let update = (0..<(n * hidden)).map { Float(output[$0]) - Float(x[$0]) }
-        (result.cosine, result.relativeError) = Self.metrics(digest(of: update, count: n), expected(test))
+        let n = test.documentRows
+        guard n > 0, n <= documentIDs.count, n <= length else { throw SelfTestError.invalid("doc_rows \(n)") }
+        let buffers = LongBuffers(length: length)
+        buffers.prepare(ids: Array(documentIDs.prefix(n)), rows: rows)
+        let embedding = try await runner.run(buffers)
+        result.cosine = Self.metrics(embedding, expected(test)).cosine
     }
 }

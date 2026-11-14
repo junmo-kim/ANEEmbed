@@ -33,8 +33,13 @@ struct PackingPlannerTests {
 
     @Test func longTextTakesTheBucketThatFits() {
         #expect(planner.plan([2048]).map(\.length) == [2048])
-        #expect(planner.plan([513]).map(\.length) == [1024])
+        #expect(planner.plan([1281]).map(\.length) == [1536])
+        #expect(planner.plan([1280]).map(\.length) == [1280])
+        #expect(planner.plan([769]).map(\.length) == [1024])
+        #expect(planner.plan([513]).map(\.length) == [768])
         #expect(planner.plan([65]).map(\.length) == [128])
+        #expect(BucketContract.functionName(forLength: 1536) == "winp1536_b512")
+        #expect(BucketContract.functionName(forLength: 1280) == "embed_1280")
     }
 
     @Test func packsShortQueriesAndRespectsSlots() {
@@ -63,7 +68,7 @@ struct PackingPlannerTests {
 
     @Test func followsTheCostModel() {
         // When big calls are cheap, short texts go into one large call.
-        let flat = PackingPlanner(costs: [64: 10, 128: 10, 256: 10, 512: 10, 1024: 10, 2048: 10])
+        let flat = PackingPlanner(costs: Dictionary(uniqueKeysWithValues: BucketContract.lengths.map { ($0, 10.0) }))
         let counts = [Int](repeating: 30, count: 40)
         #expect(flat.plan(counts).count == 1)
         #expect(planner.plan(counts).count > 1)

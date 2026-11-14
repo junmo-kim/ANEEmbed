@@ -3,9 +3,9 @@
 //
 //   EmbeddingRuntime        texts (token ids) and images -> L2-normalized 768-d vectors
 //   └─ BucketTextRuntime    packing planner + reusable buffers + a BucketFunctionRunner
-//        ├─ CoreMLBucketRunner   embed_S functions of the model package (Neural Engine)
+//        ├─ CoreMLBucketRunner   embed_S and winp functions of the model package (Neural Engine)
 //        └─ PoolingFakeRunner    deterministic stand-in that honours the bias/pool contract
-//   LongTextRunner          2049...8192 tokens: LongTextEngine over CoreMLLongFunctions (LongText.swift)
+//   LongTextRunner          2049...8192 tokens: LongTextEngine over CoreMLLongRunner, one winl call per text
 //   VisionEncoder           prepared image -> soft-token rows for the text functions
 //   SelfTestSuite           golden inputs from the package; a function that fails is not served
 import Foundation
@@ -63,7 +63,7 @@ public protocol BucketFunctionRunner: Sendable {
     func warm() async throws
 }
 
-/// Texts longer than the largest bucket (2049...8192 tokens).
+/// Texts longer than the largest packing function (2049...8192 tokens).
 public protocol LongTextRunner: Sendable {
     var maxTokens: Int { get }
     func embed(ids: [Int32]) async throws -> [Float]

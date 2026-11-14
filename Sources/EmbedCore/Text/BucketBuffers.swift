@@ -1,20 +1,31 @@
-// Reusable input buffers for one bucket length, and a pool of them.
+// Reusable input buffers for one packing length, and a pool of them.
 //
 // Building an S x S bias from scratch costs S^2 writes (4M fp16 values at 2048) per call. A buffer
 // instead remembers the layout it was last filled with and only rewrites the blocks that change:
 // resetting the old blocks to -1e4 and opening the new ones costs the sum of len^2 over the texts.
 // Steady state allocates nothing.
+//
+// The sliding-window mask is `local_bias` [S, S] for embed_S and `band_bias` [S, 1536] for the windowed
+// winp functions (WindowContract): the same open keys, stored at column key for the first and at column
+// key - (row / 512) * 512 + 512 for the second.
 import Foundation
 
 public final class BucketBuffers: @unchecked Sendable {
     public let length: Int
     public let slots: Int
+    /// Whether this is a winp (band) buffer.
+    public let windowed: Bool
     public let inputsEmbeds: UnsafeMutablePointer<Float16>
     public let globalBias: UnsafeMutablePointer<Float16>
-    /// Same memory as `globalBias` when every key is inside the window anyway (S <= window + 1).
-    public let localBias: UnsafeMutablePointer<Float16>
+    /// local_bias [length, length], or band_bias [length, 1536] when `windowed`. Same memory as `globalBias`
+    /// when every key is inside the window anyway (full attention and S <= window + 1).
+    public let slidingBias: UnsafeMutablePointer<Float16>
+    /// Values per row of `slidingBias`.
+    public let slidingColumns: Int
     public let pool: UnsafeMutablePointer<Float16>
-    public var localSharesGlobal: Bool { localBias == globalBias }
+    public var localSharesGlobal: Bool { slidingBias == globalBias }
+    /// Inputs for the model wrapped around this memory (set once by the runner; the memory never moves).
+    public var modelInput: AnyObject?
 
     /// Layout of the last fill.
     private var segments: [PackedSegment] = []
@@ -27,6 +38,8 @@ public final class BucketBuffers: @unchecked Sendable {
     public init(length: Int) {
         self.length = length
         slots = BucketContract.slots(forLength: length)
+        windowed = BucketContract.isWindowed(length)
+        slidingColumns = windowed ? WindowContract.bandColumns : length
         let hidden = BucketContract.hidden
         func allocate(_ count: Int, fill: Float16) -> UnsafeMutablePointer<Float16> {
             let raw = UnsafeMutableRawPointer.allocate(byteCount: count * 2, alignment: Self.alignment)
@@ -36,7 +49,8 @@ public final class BucketBuffers: @unchecked Sendable {
         }
         inputsEmbeds = allocate(length * hidden, fill: 0)
         globalBias = allocate(length * length, fill: BucketContract.blocked)
-        localBias = length <= BucketContract.window + 1 ? globalBias : allocate(length * length, fill: BucketContract.blocked)
+        slidingBias = !windowed && length <= BucketContract.window + 1
+            ? globalBias : allocate(length * slidingColumns, fill: BucketContract.blocked)
         pool = allocate(slots * length, fill: 0)
         used = length  // no padding diagonal is open yet
     }
@@ -44,7 +58,7 @@ public final class BucketBuffers: @unchecked Sendable {
     deinit {
         inputsEmbeds.deallocate()
         globalBias.deallocate()
-        if localBias != globalBias { localBias.deallocate() }
+        if slidingBias != globalBias { slidingBias.deallocate() }
         pool.deallocate()
     }
 
@@ -100,13 +114,13 @@ public final class BucketBuffers: @unchecked Sendable {
                 (globalBias + row * length + segment.offset).update(repeating: blocked, count: segment.length)
                 if !localSharesGlobal {
                     let (lower, upper) = band(row: row, segment: segment)
-                    (localBias + row * length + lower).update(repeating: blocked, count: upper - lower)
+                    (slidingBias + row * slidingColumns + lower).update(repeating: blocked, count: upper - lower)
                 }
             }
         }
         for row in used..<length {
             globalBias[row * length + row] = blocked
-            if !localSharesGlobal { localBias[row * length + row] = blocked }
+            if !localSharesGlobal { slidingBias[row * slidingColumns + diagonal(row)] = blocked }
         }
         for (slot, segment) in segments.enumerated() {
             (pool + slot * length + segment.offset).update(repeating: 0, count: segment.length)
@@ -118,7 +132,7 @@ public final class BucketBuffers: @unchecked Sendable {
                 (globalBias + row * length + segment.offset).update(repeating: 0, count: segment.length)
                 if !localSharesGlobal {
                     let (lower, upper) = band(row: row, segment: segment)
-                    (localBias + row * length + lower).update(repeating: 0, count: upper - lower)
+                    (slidingBias + row * slidingColumns + lower).update(repeating: 0, count: upper - lower)
                 }
             }
             let weight = Float16(1 / Float(segment.length))
@@ -126,7 +140,7 @@ public final class BucketBuffers: @unchecked Sendable {
         }
         for row in newUsed..<length {
             globalBias[row * length + row] = 0
-            if !localSharesGlobal { localBias[row * length + row] = 0 }
+            if !localSharesGlobal { slidingBias[row * slidingColumns + diagonal(row)] = 0 }
         }
 
         // 3. Padding rows must be finite; zero the ones that held tokens before.
@@ -138,13 +152,18 @@ public final class BucketBuffers: @unchecked Sendable {
         used = newUsed
     }
 
-    /// Columns [lower, upper) of `row` that are inside both the segment and the window.
+    /// Columns [lower, upper) of `slidingBias` row `row` whose keys are inside both the segment and the window.
     @inline(__always)
     private func band(row: Int, segment: PackedSegment) -> (Int, Int) {
         let lower = max(segment.offset, row - BucketContract.window)
         let upper = min(segment.offset + segment.length, row + BucketContract.window + 1)
-        return (lower, upper)
+        guard windowed else { return (lower, upper) }
+        return (WindowContract.column(row: row, key: lower), WindowContract.column(row: row, key: upper))
     }
+
+    /// Column of the diagonal (key == row) in `slidingBias`.
+    @inline(__always)
+    private func diagonal(_ row: Int) -> Int { windowed ? WindowContract.column(row: row, key: row) : row }
 }
 
 /// What one pooled sequence is made of: token ids (looked up and scaled) and/or raw model rows

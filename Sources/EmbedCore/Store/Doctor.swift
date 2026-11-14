@@ -80,6 +80,9 @@ public enum Doctor {
             "neural_engine": engine.available ? .string("available (\(engine.cores) cores)") : "unavailable",
             "runtime": .string(config.string("runtime")),
             "max_tokens": .int(config.maxTokens),
+            // What a load with this --max-tokens compiles and self-tests (long functions only above 2048).
+            "text_functions": .array((CoreMLBucketRunner.lengths(forMaxTokens: config.maxTokens).map(BucketContract.functionName)
+                + WindowContract.longLengths(forMaxTokens: config.maxTokens).map(WindowContract.longName)).map(JSONValue.string)),
             "model": .object(model),
             "compile_cache": .string(cache),
             "selftest": selfTest,

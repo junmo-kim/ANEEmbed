@@ -217,24 +217,41 @@ struct ModelStoreTests {
 
     @Test func readsThePackageManifest() throws {
         let manifest: JSONValue = [
-            "name": "embeddinggemma-2-ane", "manifest_version": 1, "created": "2026-11-14",
-            "buckets": .array(BucketContract.lengths.map { ["function": .string("embed_\($0)"), "tokens": .int($0),
-                                                            "slots": .int(BucketContract.slots(forLength: $0))] }),
-            "long_path": ["chunk": 1024, "halo": 512, "buckets": [4096, 8192]],
+            "name": "embeddinggemma-2-ane", "manifest_version": 2, "created": "2026-11-15",
+            "buckets": .array(BucketContract.fullAttentionLengths.map {
+                ["function": .string("embed_\($0)"), "tokens": .int($0), "slots": .int(BucketContract.slots(forLength: $0))]
+            }),
+            "window": ["block": 512, "halo": 512, "band_columns": 1536,
+                       "packing": [["function": "winp1536_b512", "tokens": 1536, "slots": 48],
+                                   ["function": "winp2048_b512", "tokens": 2048, "slots": 64]],
+                       "long": .array([3072, 4096, 6144, 8192].map { ["function": .string("winl\($0)_b512"), "tokens": .int($0)] })],
             "files": [["path": "tokenizer.json", "size": 1, "sha256": .string(String(repeating: "a", count: 64))]],
         ]
         let data = manifest.jsonData()
         let parsed = try Manifest.parse(data)
-        #expect(parsed.model == "embeddinggemma-2-ane" && parsed.created == "2026-11-14")
+        #expect(parsed.model == "embeddinggemma-2-ane" && parsed.created == "2026-11-15")
         #expect(parsed.sha256 == SHA256Hasher.hex(data))
-        #expect(parsed.buckets[2048] == 64 && parsed.longPath?.buckets == [4096, 8192])
+        #expect(parsed.buckets[1280] == 40 && parsed.window?.packing[2048] == 64 && parsed.window?.long == [3072, 4096, 6144, 8192])
+        #expect(!parsed.legacyLongPath)
         #expect(throws: Never.self) { try parsed.checkContract() }
         var other = parsed
-        other.longPath?.halo = 256
+        other.window?.halo = 256
+        #expect(throws: ServiceError.self) { try other.checkContract() }
+        other = parsed
+        other.window?.long.append(16384)
         #expect(throws: ServiceError.self) { try other.checkContract() }
         other = parsed
         other.buckets[512] = 8
         #expect(throws: ServiceError.self) { try other.checkContract() }
+        other = parsed
+        other.buckets[2048] = 64  // the first layout's largest bucket is a winp length now
+        #expect(throws: ServiceError.self) { try other.checkContract() }
+        // The first layout (per-layer long path) is rejected with a clear message.
+        var legacy = manifest.objectValue!
+        legacy["long_path"] = ["chunk": 1024, "halo": 512, "buckets": [4096, 8192]]
+        let old = try Manifest.parse(JSONValue.object(legacy).jsonData())
+        #expect(old.legacyLongPath)
+        #expect(throws: ServiceError.self) { try old.checkContract() }
         #expect(ModelInstaller.localRevision(parsed) == "local-" + parsed.sha256.prefix(12))
     }
 

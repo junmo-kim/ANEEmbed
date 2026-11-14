@@ -1,4 +1,4 @@
-// Core ML backends: the embed_S text functions and the vision encoder, on the Neural Engine
+// Core ML backends: the packing text functions (embed_S, winp) and the vision encoder, on the Neural Engine
 // (MLComputeUnits.cpuAndNeuralEngine; the GPU is never used, so a local LLM keeps it to itself).
 //
 // Inputs are MLMultiArrays over the BucketBuffers memory (no copy on our side). IOSurface-backed inputs
@@ -37,6 +37,54 @@ func loadFunction(_ url: URL, name: String, computeUnits: MLComputeUnits) async 
     } catch {
         throw RuntimeError.model("cannot load \(name) from \(url.lastPathComponent): \(error.localizedDescription)")
     }
+}
+
+/// An fp16 MLMultiArray over memory we own (no copy on our side).
+func halfArray(_ pointer: UnsafeMutablePointer<Float16>, _ shape: [Int]) throws -> MLMultiArray {
+    var strides = [Int](repeating: 1, count: shape.count)
+    for index in stride(from: shape.count - 2, through: 0, by: -1) { strides[index] = strides[index + 1] * shape[index + 1] }
+    return try MLMultiArray(dataPointer: pointer, shape: shape.map(NSNumber.init(value:)), dataType: .float16,
+                            strides: strides.map(NSNumber.init(value:)), deallocator: nil)
+}
+
+/// Checks that `model` has the named fp16 inputs with these shapes and the named output.
+func checkSignature(_ model: MLModel, name: String, inputs: [(String, [Int])], output: String,
+                    layout: String = "the windowed package layout") throws
+{
+    let available = model.modelDescription.inputDescriptionsByName
+    for (input, shape) in inputs {
+        guard let constraint = available[input]?.multiArrayConstraint else {
+            throw RuntimeError.model("\(name) has no \(input) input (this aneembed expects \(layout))")
+        }
+        guard constraint.shape.map(\.intValue) == shape else {
+            throw RuntimeError.model("\(name).\(input) is \(constraint.shape), want \(shape)")
+        }
+    }
+    guard model.modelDescription.outputDescriptionsByName[output] != nil else {
+        throw RuntimeError.model("\(name) has no \(output) output")
+    }
+}
+
+/// Loads several functions of one compiled model, `width` at a time. Loading a cached function is mostly CPU work
+/// that grows with the size of the whole program (every function of the package is parsed), so overlapping the
+/// loads shortens a start.
+func loadFunctions<Key: Hashable & Sendable>(_ url: URL, _ names: [(Key, String)], computeUnits: MLComputeUnits,
+                                             width: Int = 4) async throws -> [Key: MLModel]
+{
+    var models: [Key: MLModel] = [:]
+    try await withThrowingTaskGroup(of: (Key, MLModel).self) { group in
+        var pending = names[...]
+        func next() {
+            guard let (key, name) = pending.popFirst() else { return }
+            group.addTask { (key, try await loadFunction(url, name: name, computeUnits: computeUnits)) }
+        }
+        for _ in 0..<max(1, width) { next() }
+        while let (key, model) = try await group.next() {
+            models[key] = model
+            next()
+        }
+    }
+    return models
 }
 
 /// Copies rows of a 2-D (or batched) fp16/fp32 MLMultiArray into Float arrays.
@@ -78,42 +126,35 @@ public final class CoreMLBucketRunner: BucketFunctionRunner, @unchecked Sendable
 
     public var functionNames: [String] { lengths.map(BucketContract.functionName(forLength:)) }
 
-    /// Loads embed_S for every bucket needed up to `maxTokens` (at most the largest bucket).
+    /// Loads every packing function (embed_S, winp) up to the smallest one that holds `maxTokens` (at most 2048).
     public static func load(from url: URL, maxTokens: Int, computeUnits: MLComputeUnits = .cpuAndNeuralEngine)
         async throws -> CoreMLBucketRunner
     {
         let compiled = try await compiledModelURL(url)
-        let cap = BucketContract.lengths.first { $0 >= min(maxTokens, BucketContract.lengths.last!) }!
-        var models: [Int: MLModel] = [:]
-        for length in BucketContract.lengths where length <= cap {
-            let model = try await loadFunction(compiled, name: BucketContract.functionName(forLength: length),
-                                               computeUnits: computeUnits)
-            try check(model, length: length)
-            models[length] = model
-        }
+        let models = try await loadFunctions(
+            compiled, lengths(forMaxTokens: maxTokens).map { ($0, BucketContract.functionName(forLength: $0)) },
+            computeUnits: computeUnits)
+        for (length, model) in models { try check(model, length: length) }
         return CoreMLBucketRunner(models: models)
     }
 
-    /// Fails early with a readable message when the package does not follow the bucket contract.
+    /// The packing lengths a `maxTokens` limit loads.
+    public static func lengths(forMaxTokens maxTokens: Int) -> [Int] {
+        let all = BucketContract.lengths
+        let cap = all.first { $0 >= min(maxTokens, all.last!) }!
+        return all.filter { $0 <= cap }
+    }
+
+    /// Fails early with a readable message when the package does not follow the contract.
     static func check(_ model: MLModel, length: Int) throws {
-        let inputs = model.modelDescription.inputDescriptionsByName
-        let slots = BucketContract.slots(forLength: length)
-        let expected: [(String, [Int])] = [
+        let sliding = BucketContract.isWindowed(length)
+            ? (WindowContract.bandBias, [1, 1, length, WindowContract.bandColumns])
+            : (BucketContract.localBias, [1, 1, length, length])
+        try checkSignature(model, name: BucketContract.functionName(forLength: length), inputs: [
             (BucketContract.inputsEmbeds, [1, length, BucketContract.hidden]),
-            (BucketContract.globalBias, [1, 1, length, length]), (BucketContract.localBias, [1, 1, length, length]),
-            (BucketContract.pool, [slots, length]),
-        ]
-        for (name, shape) in expected {
-            guard let constraint = inputs[name]?.multiArrayConstraint else {
-                throw RuntimeError.model("embed_\(length) has no \(name) input (bucket contract)")
-            }
-            guard constraint.shape.map(\.intValue) == shape else {
-                throw RuntimeError.model("embed_\(length).\(name) is \(constraint.shape), want \(shape)")
-            }
-        }
-        guard model.modelDescription.outputDescriptionsByName[BucketContract.embedding] != nil else {
-            throw RuntimeError.model("embed_\(length) has no \(BucketContract.embedding) output")
-        }
+            (BucketContract.globalBias, [1, 1, length, length]), sliding,
+            (BucketContract.pool, [BucketContract.slots(forLength: length), length]),
+        ], output: BucketContract.embedding)
     }
 
     public func run(_ buffers: BucketBuffers) async throws -> [[Float]] {
@@ -122,25 +163,30 @@ public final class CoreMLBucketRunner: BucketFunctionRunner, @unchecked Sendable
         return try embeddings(output, buffers)
     }
 
-    /// The function for the buffers' length and its inputs: MLMultiArrays over the buffer memory.
+    /// The function for the buffers' length and its inputs: MLMultiArrays over the buffer memory, made once
+    /// per buffer (the memory never moves, the values are read at prediction time).
     func features(_ buffers: BucketBuffers) throws -> (MLModel, MLFeatureProvider) {
         guard let model = models[buffers.length] else {
-            throw RuntimeError.model("embed_\(buffers.length) is not loaded")
+            throw RuntimeError.model("\(BucketContract.functionName(forLength: buffers.length)) is not loaded")
         }
+        if let input = buffers.modelInput as? MLFeatureProvider { return (model, input) }
         let length = buffers.length, hidden = BucketContract.hidden
+        let slidingName = buffers.windowed ? WindowContract.bandBias : BucketContract.localBias
         let input = try MLDictionaryFeatureProvider(dictionary: [
             BucketContract.inputsEmbeds: MLFeatureValue(multiArray: try halfArray(buffers.inputsEmbeds, [1, length, hidden])),
             BucketContract.globalBias: MLFeatureValue(multiArray: try halfArray(buffers.globalBias, [1, 1, length, length])),
-            BucketContract.localBias: MLFeatureValue(multiArray: try halfArray(buffers.localBias, [1, 1, length, length])),
+            slidingName: MLFeatureValue(
+                multiArray: try halfArray(buffers.slidingBias, [1, 1, length, buffers.slidingColumns])),
             BucketContract.pool: MLFeatureValue(multiArray: try halfArray(buffers.pool, [buffers.slots, length])),
         ])
+        buffers.modelInput = input
         return (model, input)
     }
 
     /// Every slot's row of the output (rows of unused slots are 0).
     func embeddings(_ output: MLFeatureProvider, _ buffers: BucketBuffers) throws -> [[Float]] {
         guard let embedding = output.featureValue(for: BucketContract.embedding)?.multiArrayValue else {
-            throw RuntimeError.model("embed_\(buffers.length) returned no \(BucketContract.embedding)")
+            throw RuntimeError.model("\(BucketContract.functionName(forLength: buffers.length)) returned no \(BucketContract.embedding)")
         }
         return try rows(of: embedding, count: buffers.slots, width: BucketContract.dimension)
     }
@@ -189,11 +235,18 @@ public final class CoreMLVisionEncoder: VisionEncoder, @unchecked Sendable {
             table.count == 2 * tableRows * patchWidth * 2
         else { throw RuntimeError.model("missing or malformed \(positionTable.lastPathComponent)") }
         let compiled = try await compiledModelURL(url)
-        var models: [Int: MLModel] = [:]
-        for budget in allBudgets {
-            models[budget] = try await loadFunction(compiled, name: "vision_\(budget)", computeUnits: computeUnits)
-        }
+        let models = try await loadFunctions(compiled, allBudgets.map { ($0, "vision_\($0)") }, computeUnits: computeUnits)
+        for (budget, model) in models { try check(model, budget: budget) }
         return CoreMLVisionEncoder(models: models, positionTable: table)
+    }
+
+    /// Fails early with a readable message when a vision function does not take the inputs `inputs(_:budget:)` builds.
+    static func check(_ model: MLModel, budget: Int) throws {
+        let total = budget * 9
+        try checkSignature(model, name: "vision_\(budget)", inputs: [
+            ("patches", [1, total, patchWidth]), ("positions", [1, total, 2]), ("position_embeddings", [1, total, patchWidth]),
+            ("valid", [1, total]), ("pool", [budget, total]),
+        ], output: "image_tokens", layout: "the vision package of FluidInference/embeddinggemma-2-coreml")
     }
 
     public func warm() async throws {

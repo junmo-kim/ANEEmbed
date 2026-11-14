@@ -31,17 +31,17 @@ struct SelfTestTests {
         let expected = put([Float](repeating: 0.5, count: 16))
         let json: JSONValue = [
             "format": "aneembed-selftest/1", "digest": digest, "doc_ids": [2, 10, 11, 1],
-            "tolerance": ["swa": ["min_cos": 0.999, "max_rel_err": 0.05], "bucket": ["min_cos": 0.999, "zero_rows_max_abs": 0.001]],
-            "tests": [["function": "long_swa_l0", "kind": "swa", "doc_rows": 4, "chunk": 1, "valid_rows": 2, "expected": expected]],
+            "tolerance": ["vision": ["min_cos": 0.999, "max_rel_err": 0.05], "bucket": ["min_cos": 0.999, "zero_rows_max_abs": 0.001]],
+            "tests": [["function": "winl3072_b512", "kind": "winl", "doc_rows": 4, "expected": expected]],
         ]
         return try SelfTestSuite(json: json.jsonData(), blob: blob)
     }
 
     @Test func parsesCasesTolerancesAndBlocks() throws {
         let suite = try suite()
-        #expect(suite.cases.count == 1 && suite.cases[0].function == "long_swa_l0" && suite.cases[0].documentRows == 4)
+        #expect(suite.cases.count == 1 && suite.cases[0].function == "winl3072_b512" && suite.cases[0].documentRows == 4)
         #expect(suite.documentIDs == [2, 10, 11, 1])
-        #expect(suite.tolerance["swa"]?.maxRelativeError == 0.05 && suite.tolerance["bucket"]?.unusedRowsMaxAbs == 0.001)
+        #expect(suite.tolerance["vision"]?.maxRelativeError == 0.05 && suite.tolerance["bucket"]?.unusedRowsMaxAbs == 0.001)
         #expect(suite.expected(suite.cases[0]) == [Float](repeating: 0.5, count: 16))
         // digest: column 0 of R is all ones, so D[:, 0] is the row sum
         let rows = [Float](repeating: 2, count: 512) + [Float](repeating: 1, count: 512)
@@ -120,11 +120,11 @@ struct SelfTestTests {
         defer { try? FileManager.default.removeItem(at: directory) }
         let report = SelfTestReport(osBuild: "26A434", ranAt: Date(timeIntervalSince1970: 1_800_000_000), seconds: 1.25, results: [
             SelfTestResult(function: "embed_64", kind: "bucket", passed: true, cosine: 0.99997),
-            SelfTestResult(function: "long_swa_l3", kind: "swa", passed: false, cosine: 0.55, relativeError: 0.9),
+            SelfTestResult(function: "winl8192_b512", kind: "winl", passed: false, cosine: 0.55),
         ])
         try report.save(to: directory)
         let loaded = try #require(SelfTestReport.load(from: directory))
-        #expect(loaded.results.map(\.function) == ["embed_64", "long_swa_l3"] && loaded.failed.map(\.function) == ["long_swa_l3"])
-        #expect(loaded.summary == "1/2 passed; not served: long_swa_l3")
+        #expect(loaded.results.map(\.function) == ["embed_64", "winl8192_b512"] && loaded.failed.map(\.function) == ["winl8192_b512"])
+        #expect(loaded.summary == "1/2 passed; not served: winl8192_b512")
     }
 }

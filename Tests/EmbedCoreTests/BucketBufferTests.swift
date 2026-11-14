@@ -3,7 +3,7 @@ import Testing
 
 @testable import EmbedCore
 
-/// Straightforward reference: the full matrices for a layout.
+/// Straightforward reference: the full matrices for a layout (local is [S, S] here, also for windowed lengths).
 private func reference(length: Int, segments: [PackedSegment]) -> (global: [Float16], local: [Float16], pool: [Float16]) {
     let blocked = BucketContract.blocked
     var global = [Float16](repeating: blocked, count: length * length)
@@ -44,11 +44,29 @@ struct BucketBufferTests {
         let length = buffers.length
         let expected = reference(length: length, segments: segments)
         let global = Array(UnsafeBufferPointer(start: buffers.globalBias, count: length * length))
-        let local = Array(UnsafeBufferPointer(start: buffers.localBias, count: length * length))
         let pool = Array(UnsafeBufferPointer(start: buffers.pool, count: buffers.slots * length))
         #expect(global == expected.global)
-        #expect(local == expected.local)
         #expect(pool == expected.pool)
+        if buffers.windowed {
+            // band column c of row r is key (r / 512) * 512 - 512 + c; keys outside [0, S) must stay blocked
+            var mismatches = 0
+            let columns = WindowContract.bandColumns
+            for row in 0..<length {
+                for column in 0..<columns {
+                    let key = WindowContract.key(row: row, column: column)
+                    let want = key >= 0 && key < length ? expected.local[row * length + key] : BucketContract.blocked
+                    if buffers.slidingBias[row * columns + column] != want { mismatches += 1 }
+                }
+            }
+            #expect(mismatches == 0)
+            // the band holds every open key of the local mask
+            let open = expected.local.reduce(0) { $0 + ($1 == 0 ? 1 : 0) }
+            let bandOpen = (0..<(length * columns)).reduce(0) { $0 + (buffers.slidingBias[$1] == 0 ? 1 : 0) }
+            #expect(open == bandOpen)
+        } else {
+            let local = Array(UnsafeBufferPointer(start: buffers.slidingBias, count: length * length))
+            #expect(local == expected.local)
+        }
         // no fully masked row
         for row in 0..<length {
             #expect((0..<length).contains { global[row * length + $0] == 0 })
@@ -72,6 +90,16 @@ struct BucketBufferTests {
     @Test func slidingWindowBandMatchesTheReference() {
         let buffers = BucketBuffers(length: 1024)
         for lengths in [[1000], [600, 300], [1024], [2, 700]] {
+            let segments = layout(lengths)
+            buffers.setLayout(segments)
+            expectMatches(buffers, segments)
+        }
+    }
+
+    @Test func windowedBandMatchesTheReference() {
+        let buffers = BucketBuffers(length: 1536)
+        #expect(buffers.windowed && buffers.slidingColumns == 1536 && !buffers.localSharesGlobal)
+        for lengths in [[1300, 37, 150], [1536], [2, 700, 513, 1], [10], [600, 600, 300], []] {
             let segments = layout(lengths)
             buffers.setLayout(segments)
             expectMatches(buffers, segments)

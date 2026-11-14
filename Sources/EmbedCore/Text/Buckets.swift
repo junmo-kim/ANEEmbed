@@ -1,30 +1,38 @@
-// The uniform text-function contract and the packing planner.
+// The text functions of the model package (layout "layoutR") and the packing planner.
 //
-// Every text function has the same signature, so single texts, packed batches, long texts and (later)
-// images share one code path:
+// Packing functions: one call embeds up to K texts packed back to back, all with the same outputs:
 //
-//   embed_S, S in {64, 128, 256, 512, 1024, 2048}
+//   embed_S, S in {64, 128, 256, 512, 768, 1024, 1280}: full attention
 //     inputs_embeds [1, S, 512] fp16   token rows (table row * sqrt(512)); padding rows are finite
 //     global_bias   [1, 1, S, S] fp16  0 where query i and key j belong to the same text, else -1e4
 //     local_bias    [1, 1, S, S] fp16  global_bias AND |i - j| <= 512 (Gemma's sliding window)
 //     pool          [K, S] fp16        K = max(8, S / 32); row k = 1/len over text k's tokens, other rows 0
 //     -> embedding  [K, 768] fp32      already L2-normalized
 //
+//   winp{S}_b512, S in {1536, 2048}: windowed attention (WindowContract), same inputs and output except
+//     band_bias     [1, 1, S, 1536] fp16 instead of local_bias: row r, column c = key row (r/512)*512 - 512 + c
+//
 // Padding rows attend only to themselves, so no row is fully masked. Positions are not an input: RoPE
 // is relative, and attention never crosses texts, so a packed text sees the same scores as alone.
-// The band is an input rather than a graph constant because a constant band miscompiles on the ANE.
+// Masks are inputs rather than graph constants because a constant band miscompiles on the ANE.
 //
-// Names may change with the final model package; everything here is behind `BucketContract`.
+// Texts above 2048 tokens use one winl{S}_b512 call each (WindowLong.swift).
 
 public enum BucketContract {
-    public static let lengths = [64, 128, 256, 512, 1024, 2048]
+    /// Every packing length: embed_S (full attention) then winp (windowed), ascending.
+    public static let lengths = fullAttentionLengths + WindowContract.packingLengths
+    /// embed_S functions.
+    public static let fullAttentionLengths = [64, 128, 256, 512, 768, 1024, 1280]
     public static let hidden = TokenTable.width
     public static let dimension = 768
     public static let window = 512
     public static let blocked: Float16 = -10_000
 
     public static func slots(forLength length: Int) -> Int { max(8, length / 32) }
-    public static func functionName(forLength length: Int) -> String { "embed_\(length)" }
+    public static func isWindowed(_ length: Int) -> Bool { WindowContract.packingLengths.contains(length) }
+    public static func functionName(forLength length: Int) -> String {
+        isWindowed(length) ? WindowContract.packingName(length) : "embed_\(length)"
+    }
 
     /// Input and output feature names.
     public static let inputsEmbeds = "inputs_embeds"
@@ -32,6 +40,46 @@ public enum BucketContract {
     public static let localBias = "local_bias"
     public static let pool = "pool"
     public static let embedding = "embedding"
+}
+
+/// The windowed functions: sliding layers attend block by block (512 query rows against the 1536 key rows
+/// around them) instead of over S x S, so one fixed-shape call reaches 8192 rows; the global layers
+/// (5, 11, 17, 23) attend to every row.
+///
+///   band_bias [1, 1, S, 1536] fp16: row r, column c is query r against key k = (r / 512) * 512 - 512 + c;
+///     0 if r and k are in the same text and |r - k| <= 512, or k == r; else -1e4. Columns whose key is
+///     outside [0, S) are never read by the graph.
+///   winp{S}_b512 (packing, 1536 / 2048): inputs_embeds, band_bias, global_bias, pool [K, S] -> [K, 768]
+///   winl{S}_b512 (one text, 3072 / 4096 / 6144 / 8192): inputs_embeds (rows >= n zero), band_bias,
+///     key_bias [1, 1, 1, S] (0 for k < n), pool [1, S] (2^-10 on the n rows, not 1/n: fp16 underflow)
+///     -> [1, 768]
+public enum WindowContract {
+    public static let block = 512
+    public static let halo = 512
+    public static let bandColumns = block + 2 * halo
+    public static let packingLengths = [1536, 2048]
+    public static let longLengths = [3072, 4096, 6144, 8192]
+    public static let poolWeight: Float16 = 0.000_976_562_5  // 2^-10
+    public static let bandBias = "band_bias"
+    public static let keyBias = "key_bias"
+
+    public static func packingName(_ length: Int) -> String { "winp\(length)_b\(block)" }
+    public static func longName(_ length: Int) -> String { "winl\(length)_b\(block)" }
+
+    /// The smallest long length that holds `tokens`.
+    public static func longLength(forTokens tokens: Int) -> Int? { longLengths.first { $0 >= tokens } }
+
+    /// The long lengths a `maxTokens` limit loads: none up to 2048, else every one up to the smallest
+    /// that holds `maxTokens`.
+    public static func longLengths(forMaxTokens maxTokens: Int) -> [Int] {
+        guard maxTokens > BucketContract.lengths.last!, let top = longLength(forTokens: maxTokens) else { return [] }
+        return longLengths.filter { $0 <= top }
+    }
+
+    /// Key row of band column `column` for query `row`.
+    @inline(__always) public static func key(row: Int, column: Int) -> Int { (row / block) * block - halo + column }
+    /// Band column of key `key` for query `row` (valid when |row - key| <= halo).
+    @inline(__always) public static func column(row: Int, key: Int) -> Int { key - (row / block) * block + halo }
 }
 
 /// One text placed in a packed call: rows offset..<offset+length, pool row = its index in the call.
@@ -74,9 +122,12 @@ public struct PackingPlanner: Sendable {
     /// Estimated cost of one call per bucket length (any unit).
     public let costs: [Int: Double]
 
-    /// Per-call latency in ms of each bucket, one text filling it (`aneembed bench --buckets`, Apple M4,
-    /// macOS 27). Only the ratios matter to the planner; other chips scale them roughly together.
-    public static let defaultCosts: [Int: Double] = [64: 5.0, 128: 6.5, 256: 12.0, 512: 30.6, 1024: 80.7, 2048: 247.3]
+    /// Per-call latency in ms of each packing function, one text filling it (`aneembed bench --buckets`,
+    /// Apple M5 Ultra, macOS 27). Only the ratios matter to the planner; other chips scale them roughly
+    /// together.
+    public static let defaultCosts: [Int: Double] = [
+        64: 3.16, 128: 5.19, 256: 10.71, 512: 26.47, 768: 44.97, 1024: 68.93, 1280: 93.47, 1536: 114.53, 2048: 170.34,
+    ]
 
     public init(lengths: [Int] = BucketContract.lengths, costs: [Int: Double] = PackingPlanner.defaultCosts) {
         precondition(!lengths.isEmpty)

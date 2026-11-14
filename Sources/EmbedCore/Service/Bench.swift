@@ -163,7 +163,8 @@ public enum Bench {
         return result
     }
 
-    /// Median latency of one call per bucket (one text filling it): the planner's cost table.
+    /// Median latency of one call per packing function (one text filling it): the planner's cost table; plus
+    /// one call per loaded long function.
     static func bucketCosts(_ runtime: BucketTextRuntime, repeats: Int, log: @Sendable (String) -> Void)
         async throws(ServiceError) -> JSONValue
     {
@@ -181,7 +182,23 @@ public enum Bench {
             }
             samples.sort()
             costs[String(length)] = .number(round(samples[samples.count / 2], 2))
-            log("embed_\(length): \(round(samples[samples.count / 2], 2)) ms per call")
+            log("\(BucketContract.functionName(forLength: length)): \(round(samples[samples.count / 2], 2)) ms per call")
+        }
+        if let engine = runtime.long as? LongTextEngine {
+            for length in engine.lengths {
+                let buffers = LongBuffers(length: length)
+                buffers.prepare(ids: [SpecialTokens.bos] + [Int32](repeating: 1000, count: length - 2) + [SpecialTokens.eos],
+                                rows: runtime.rows)
+                var samples: [Double] = []
+                for index in 0...max(3, repeats / 4) {
+                    let started = DispatchTime.now().uptimeNanoseconds
+                    do { _ = try await engine.runner.run(buffers) } catch { throw ServiceError(.internal, "bench_failed", "\(error)") }
+                    if index > 0 { samples.append(Double(DispatchTime.now().uptimeNanoseconds - started) / 1e6) }
+                }
+                samples.sort()
+                costs[String(length)] = .number(round(samples[samples.count / 2], 2))
+                log("\(WindowContract.longName(length)): \(round(samples[samples.count / 2], 2)) ms per call")
+            }
         }
         return .object(costs)
     }

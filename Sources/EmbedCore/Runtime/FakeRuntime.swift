@@ -9,9 +9,10 @@ public enum FakeRuntime {
     public static func make(maxTokens: Int = 2048, images: Bool = true, callDelay: Duration = .zero)
         -> BucketTextRuntime
     {
-        let lengths = BucketContract.lengths.filter { $0 <= maxTokens }
+        // The same functions the Core ML runtime loads for this limit.
+        let lengths = CoreMLBucketRunner.lengths(forMaxTokens: maxTokens)
         return BucketTextRuntime(
-            runner: PoolingFakeRunner(lengths: lengths.isEmpty ? [BucketContract.lengths[0]] : lengths, delay: callDelay),
+            runner: PoolingFakeRunner(lengths: lengths, delay: callDelay),
             rows: HashedTokenRows(), vision: images ? FakeVisionEncoder() : nil, backend: "fake")
     }
 }

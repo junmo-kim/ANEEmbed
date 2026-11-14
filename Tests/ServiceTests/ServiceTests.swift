@@ -52,6 +52,19 @@ struct ServiceTests {
         await #expect(throws: RuntimeError.self) { _ = try await FakeRuntime.make().embed(tokenized: [[2, 1], []]) }
     }
 
+    /// The fake runtime loads the same functions as the Core ML one: every bucket up to the smallest that holds
+    /// --max-tokens, so a limit between bucket sizes accepts texts up to the limit itself.
+    @Test func fakeRuntimeLoadsTheBucketsCoreMLWould() async throws {
+        for maxTokens in [2, 64, 65, 100, 1300, 2048, 8192] {
+            #expect(FakeRuntime.make(maxTokens: maxTokens).info.bucketLengths
+                    == CoreMLBucketRunner.lengths(forMaxTokens: maxTokens))
+        }
+        let service = TestSupport.service(maxTokens: 100)
+        #expect(service.maxTokens == 100)
+        let result = try await service.embedTexts([String(repeating: "a", count: 90)])
+        #expect(result.tokenCounts == [92])
+    }
+
     @Test func rejectsEmptyAndOversizedBatches() async {
         var limits = ServiceLimits()
         limits.maxInputs = 3
