@@ -100,8 +100,11 @@ struct ModelStoreTests {
         #expect(!operatingSystemBuild.isEmpty)
     }
 
-    @Test func pinnedSourceIsAPlaceholderUntilPublished() {
-        #expect(!ModelSource.pinned.isPublished)
+    @Test func pinnedSourceIsAPublishedCommit() {
+        #expect(ModelSource.pinned.isPublished)
+        #expect(ModelSource.pinned.revision.count == 40 && ModelSource.pinned.revision.allSatisfy(\.isHexDigit))
+        #expect(!ModelSource(repository: "a/b", revision: "UNPUBLISHED").isPublished)
+        #expect(ModelSource.pinned.manifestSHA256?.count == 64)
         #expect(ModelSource(repository: "a/b", revision: "0123abc").url(for: "manifest.json").absoluteString
                 == "https://huggingface.co/a/b/resolve/0123abc/manifest.json")
     }

@@ -21,6 +21,9 @@ struct ModelDownloader {
             throw ServiceError(.internal, "staging_failed", "cannot create \(staging.path): \(error.localizedDescription)")
         }
         let manifestData = try await fetch(ModelLayout.manifest, to: staging)
+        if let pinned = source.manifestSHA256, SHA256Hasher.hex(manifestData) != pinned {
+            throw ServiceError(.invalidInput, "checksum_mismatch", "manifest.json does not match the hash pinned in this build")
+        }
         let manifest = try Manifest.parse(manifestData)
         for (index, file) in manifest.files.enumerated() {
             Log.info("downloading \(index + 1)/\(manifest.files.count) \(file.path) (\(file.size / (1 << 20)) MiB)")

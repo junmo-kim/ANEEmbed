@@ -270,7 +270,10 @@ struct ModelsCommand: Command {
         case "install":
             var source = ModelSource.pinned
             if let repo = arguments.value("repo") { source.repository = repo }
-            if let revision = arguments.value("revision") { source.revision = revision }
+            if let revision = arguments.value("revision") {
+                source.revision = revision
+                source.manifestSHA256 = nil  // an explicit revision is trusted by its commit hash only
+            }
             return try await install(source, config: config, format: format)
         default:
             throw .badRequest("unknown_action", "unknown models action \(action); use path, verify, warm or install")

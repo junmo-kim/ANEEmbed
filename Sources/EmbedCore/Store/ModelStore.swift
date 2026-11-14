@@ -9,13 +9,25 @@
 import Foundation
 
 /// Where the published model package comes from.
-/// TODO(model): fill in once the package is published; until then `models install` reports
-/// `model_not_published` and `--model-dir` points at a local package.
 public struct ModelSource: Sendable, Equatable {
     public var repository: String
+    /// A commit hash, so the files behind it cannot change.
     public var revision: String
+    /// SHA-256 of manifest.json at that revision. With it, everything downloaded is checked against a
+    /// hash compiled into the binary rather than one fetched alongside the files.
+    public var manifestSHA256: String?
 
-    public static let pinned = ModelSource(repository: "junmo-kim/embeddinggemma-2-ane", revision: "UNPUBLISHED")
+    public init(repository: String, revision: String, manifestSHA256: String? = nil) {
+        self.repository = repository
+        self.revision = revision
+        self.manifestSHA256 = manifestSHA256
+    }
+
+    /// The package this build installs: junmo-k/embeddinggemma-2-ane at the commit of its 0.1.0 upload, checked
+    /// against the manifest hash below.
+    public static let pinned = ModelSource(
+        repository: "junmo-k/embeddinggemma-2-ane", revision: "3c9b6f2feeb640c5a359846659740cbf4d2debc7",
+        manifestSHA256: "4773e00cd3282ada9ba3d5a723fd806ce8607167b1b8db553f1b5f1caabca52b")
 
     public var isPublished: Bool { revision != "UNPUBLISHED" && !revision.isEmpty }
 
