@@ -66,10 +66,36 @@ struct ModelStoreTests {
         try manifest.jsonData().write(to: directory.appendingPathComponent("manifest.json"))
         let loaded = try Manifest.load(from: directory)
         #expect(loaded.revision == "r1" && loaded.files.count == 3)
+        #expect(loaded.sourceFiles.map(\.path) == ["a.bin", "missing.bin"])
         #expect(loaded.verify(in: directory, hash: false) == [.init(path: "missing.bin", issue: "missing")])
-        #expect(loaded.verify(in: directory, hash: true) == [
-            .init(path: "m.mlmodelc/model.mil", issue: "sha256_mismatch"), .init(path: "missing.bin", issue: "missing"),
-        ])
+        // Compiled files are built on this Mac: reported apart, and only when the compiled model exists.
+        let checked = loaded.verifyAll(in: directory, hash: true)
+        #expect(checked.source == [.init(path: "missing.bin", issue: "missing")])
+        #expect(checked.compiled == [.init(path: "m.mlmodelc/model.mil", issue: "sha256_mismatch")])
+        try FileManager.default.removeItem(at: directory.appendingPathComponent("m.mlmodelc"))
+        #expect(loaded.verifyAll(in: directory, hash: true).compiled.isEmpty)
+    }
+
+    @Test func readsThePackageManifest() throws {
+        let manifest: JSONValue = [
+            "name": "embeddinggemma-2-ane", "manifest_version": 1, "created": "2026-11-14",
+            "buckets": .array(BucketContract.lengths.map { ["function": .string("embed_\($0)"), "tokens": .int($0),
+                                                            "slots": .int(BucketContract.slots(forLength: $0))] }),
+            "long_path": ["chunk": 1024, "halo": 512, "buckets": [4096, 8192]],
+            "files": [["path": "tokenizer.json", "size": 1, "sha256": .string(String(repeating: "a", count: 64))]],
+        ]
+        let data = manifest.jsonData()
+        let parsed = try Manifest.parse(data)
+        #expect(parsed.model == "embeddinggemma-2-ane" && parsed.created == "2026-11-14")
+        #expect(parsed.sha256 == SHA256Hasher.hex(data))
+        #expect(parsed.buckets[2048] == 64 && parsed.longPath?.buckets == [4096, 8192])
+        #expect(throws: Never.self) { try parsed.checkContract() }
+        var other = parsed
+        other.longPath?.halo = 256
+        #expect(throws: ServiceError.self) { try other.checkContract() }
+        other = parsed
+        other.buckets[512] = 8
+        #expect(throws: ServiceError.self) { try other.checkContract() }
     }
 
     @Test func rejectsPathsOutsideTheModelDirectory() {

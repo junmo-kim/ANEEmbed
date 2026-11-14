@@ -37,8 +37,7 @@ public struct ModelSource: Sendable, Equatable {
     }
 }
 
-/// File names inside a model directory.
-/// TODO(model): final names come with the package; keep every lookup going through here.
+/// File names inside a model directory (the layout of the published package, see its manifest.json).
 public enum ModelLayout {
     public static let manifest = "manifest.json"
     public static let tokenizer = "tokenizer.json"
@@ -46,7 +45,11 @@ public enum ModelLayout {
     public static let textModel = "EmbeddingGemma2Text"
     public static let visionModel = "EmbeddingGemma2Vision"
     public static let positionTable = "position_embeddings.f16"
+    public static let selfTest = "selftest.json"
+    public static let selfTestData = "selftest.bin"
     public static let warmState = ".aneembed-warm.json"
+    public static let selfTestState = ".aneembed-selftest.json"
+    public static let packages = [textModel, visionModel]
 
     /// Compiled model when present, else the package (compiled at install/warm time).
     public static func model(_ name: String, in directory: URL) -> URL? {
@@ -55,6 +58,12 @@ public enum ModelLayout {
             if FileManager.default.fileExists(atPath: url.path) { return url }
         }
         return nil
+    }
+
+    /// Whether `path` (relative to the model directory) lies inside a compiled model (`*.mlmodelc/...`).
+    /// Those files are produced on this Mac from the `.mlpackage`, not downloaded.
+    public static func isCompiled(_ path: String) -> Bool {
+        path.split(separator: "/").first?.hasSuffix(".mlmodelc") ?? false
     }
 }
 
@@ -65,9 +74,27 @@ public struct ManifestEntry: Sendable, Equatable {
 }
 
 public struct Manifest: Sendable, Equatable {
+    /// Package name (`name`; older drafts used `model`).
     public var model: String
+    /// Revision recorded in the manifest, if any (the published one is pinned by commit, not by this field).
     public var revision: String
+    public var created: String
     public var files: [ManifestEntry]
+    /// SHA-256 of the manifest bytes: identifies a package exactly.
+    public var sha256: String
+    /// The bucket functions the package declares (`buckets`): length -> pool slots.
+    public var buckets: [Int: Int]
+    /// The long-text path (`long_path`): chunk, halo and sequence buckets, when the package has one.
+    public var longPath: LongPathContract?
+
+    public struct LongPathContract: Sendable, Equatable {
+        public var chunk: Int
+        public var halo: Int
+        public var buckets: [Int]
+    }
+
+    /// Files to download or copy; compiled models are built on this Mac instead.
+    public var sourceFiles: [ManifestEntry] { files.filter { !ModelLayout.isCompiled($0.path) } }
 
     public static func parse(_ data: Data) throws(ServiceError) -> Manifest {
         let root: JSONValue
@@ -85,7 +112,18 @@ public struct Manifest: Sendable, Equatable {
             else { throw ServiceError(.unavailable, "invalid_manifest", "manifest.json has an invalid file entry") }
             entries.append(ManifestEntry(path: path, size: size, sha256: sha.lowercased()))
         }
-        return Manifest(model: root["model"]?.stringValue ?? "", revision: root["revision"]?.stringValue ?? "", files: entries)
+        var buckets: [Int: Int] = [:]
+        for bucket in root["buckets"]?.arrayValue ?? [] {
+            if let tokens = bucket["tokens"]?.intValue, let slots = bucket["slots"]?.intValue { buckets[tokens] = slots }
+        }
+        var longPath: LongPathContract?
+        if let long = root["long_path"], let chunk = long["chunk"]?.intValue, let halo = long["halo"]?.intValue {
+            longPath = LongPathContract(chunk: chunk, halo: halo,
+                                        buckets: long["buckets"]?.arrayValue?.compactMap(\.intValue) ?? [])
+        }
+        return Manifest(model: root["name"]?.stringValue ?? root["model"]?.stringValue ?? "",
+                        revision: root["revision"]?.stringValue ?? "", created: root["created"]?.stringValue ?? "",
+                        files: entries, sha256: SHA256Hasher.hex(data), buckets: buckets, longPath: longPath)
     }
 
     public static func load(from directory: URL) throws(ServiceError) -> Manifest {
@@ -97,34 +135,73 @@ public struct Manifest: Sendable, Equatable {
         return try parse(data)
     }
 
+    /// Fails when the package declares a different contract than this build implements.
+    public func checkContract() throws(ServiceError) {
+        if !buckets.isEmpty {
+            for (length, slots) in buckets where BucketContract.lengths.contains(length) == false
+                || BucketContract.slots(forLength: length) != slots
+            {
+                throw ServiceError(.unavailable, "unsupported_model",
+                                   "the package declares bucket \(length) with \(slots) slots; this build expects \(BucketContract.lengths) with max(8, S/32) slots",
+                                   hint: "update aneembed")
+            }
+        }
+        if let longPath, longPath.chunk != LongContract.chunk || longPath.halo != LongContract.halo
+            || !longPath.buckets.allSatisfy(LongContract.lengths.contains)
+        {
+            throw ServiceError(.unavailable, "unsupported_model",
+                               "the package's long path (chunk \(longPath.chunk), halo \(longPath.halo), \(longPath.buckets)) differs from this build's",
+                               hint: "update aneembed")
+        }
+    }
+
     public struct Problem: Sendable, Equatable {
         public var path: String
         public var issue: String  // missing | size_mismatch | sha256_mismatch
     }
 
     /// Checks every file; `hash: false` only checks presence and size (fast, for doctor).
+    ///
+    /// Files of a compiled model (`X.mlmodelc/...`) are checked only when that compiled model exists:
+    /// they are built on this Mac from `X.mlpackage`, and the Core ML compiler of another macOS release
+    /// may produce different bytes (the load-time self-test is what decides whether they compute correctly).
+    /// Their problems come back separately in `compiled`.
     public func verify(in directory: URL, hash: Bool, progress: ((String) -> Void)? = nil) -> [Problem] {
-        var problems: [Problem] = []
+        verifyAll(in: directory, hash: hash, progress: progress).source
+    }
+
+    public func verifyAll(in directory: URL, hash: Bool, progress: ((String) -> Void)? = nil)
+        -> (source: [Problem], compiled: [Problem])
+    {
+        var source: [Problem] = []
+        var compiled: [Problem] = []
         for file in files {
+            let isCompiled = ModelLayout.isCompiled(file.path)
+            if isCompiled {
+                let root = String(file.path.split(separator: "/")[0])
+                guard FileManager.default.fileExists(atPath: directory.appendingPathComponent(root).path) else { continue }
+            }
             let url = directory.appendingPathComponent(file.path)
-            guard let attributes = try? FileManager.default.attributesOfItem(atPath: url.path),
+            var problem: Problem?
+            if let attributes = try? FileManager.default.attributesOfItem(atPath: url.path),
                 let size = (attributes[.size] as? NSNumber)?.intValue
-            else {
-                problems.append(Problem(path: file.path, issue: "missing"))
-                continue
-            }
-            guard size == file.size else {
-                problems.append(Problem(path: file.path, issue: "size_mismatch"))
-                continue
-            }
-            if hash {
-                progress?(file.path)
-                if (try? SHA256Hasher.hex(fileAt: url)) != file.sha256 {
-                    problems.append(Problem(path: file.path, issue: "sha256_mismatch"))
+            {
+                if size != file.size {
+                    problem = Problem(path: file.path, issue: "size_mismatch")
+                } else if hash {
+                    progress?(file.path)
+                    if (try? SHA256Hasher.hex(fileAt: url)) != file.sha256 {
+                        problem = Problem(path: file.path, issue: "sha256_mismatch")
+                    }
                 }
+            } else {
+                problem = Problem(path: file.path, issue: "missing")
+            }
+            if let problem {
+                if isCompiled { compiled.append(problem) } else { source.append(problem) }
             }
         }
-        return problems
+        return (source, compiled)
     }
 }
 
