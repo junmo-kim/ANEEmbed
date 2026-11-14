@@ -1,0 +1,8 @@
+.build/
+.swiftpm/
+*.xcodeproj
+.DS_Store
+Package.resolved
+/dist/
+__pycache__/
+.venv/
