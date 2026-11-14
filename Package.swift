@@ -27,5 +27,7 @@ let package = Package(
         .testTarget(name: "EmbedCoreTests", dependencies: ["EmbedCore"]),
         // HTTP/OpenAI/MCP contracts end to end through the fake runtime (no model needed).
         .testTarget(name: "ServiceTests", dependencies: ["EmbedCore"]),
+        // Real model on the Neural Engine. Skipped when CI is set or no model directory exists.
+        .testTarget(name: "ModelTests", dependencies: ["EmbedCore"]),
     ]
 )
