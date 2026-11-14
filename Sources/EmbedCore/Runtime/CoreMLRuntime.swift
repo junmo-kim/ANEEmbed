@@ -2,8 +2,6 @@
 // (MLComputeUnits.cpuAndNeuralEngine; the GPU is never used, so a local LLM keeps it to itself).
 //
 // Inputs are MLMultiArrays over the BucketBuffers memory (no copy on our side).
-// TODO(perf): IOSurface-backed inputs and MLPredictionOptions.outputBackings, measured against this.
-// TODO(model): names and shapes follow BucketContract; re-check against the final package.
 @preconcurrency import CoreML
 import Foundation
 
@@ -70,6 +68,13 @@ public final class CoreMLBucketRunner: BucketFunctionRunner, @unchecked Sendable
         self.models = models
         lengths = models.keys.sorted()
     }
+
+    /// The same runner without the functions named in `failed`.
+    public func excluding(_ failed: Set<String>) -> CoreMLBucketRunner {
+        CoreMLBucketRunner(models: models.filter { !failed.contains(BucketContract.functionName(forLength: $0.key)) })
+    }
+
+    public var functionNames: [String] { lengths.map(BucketContract.functionName(forLength:)) }
 
     /// Loads embed_S for every bucket needed up to `maxTokens` (at most the largest bucket).
     public static func load(from url: URL, maxTokens: Int, computeUnits: MLComputeUnits = .cpuAndNeuralEngine)
@@ -147,18 +152,28 @@ public final class CoreMLBucketRunner: BucketFunctionRunner, @unchecked Sendable
 /// 16 px patches scaled to [0, 1], 2-D position embeddings from position_embeddings.f16 (x row + y row),
 /// and a 3 x 3 average pool of the patch grid into soft tokens.
 public final class CoreMLVisionEncoder: VisionEncoder, @unchecked Sendable {
-    public static let budgets = [70, 140, 280]
+    public static let allBudgets = [70, 140, 280]
     static let patch = 16
     static let patchWidth = 768  // 16 * 16 * 3
     static let tableRows = 1024
-    public let maxTokens = 280
+    /// Loaded budgets (soft tokens per function), ascending.
+    public let budgets: [Int]
+    public var maxTokens: Int { budgets.last ?? 0 }
     private let models: [Int: MLModel]
     private let positionTable: Data
 
     private init(models: [Int: MLModel], positionTable: Data) {
         self.models = models
         self.positionTable = positionTable
+        budgets = models.keys.sorted()
     }
+
+    /// The same encoder without the functions named in `failed`.
+    public func excluding(_ failed: Set<String>) -> CoreMLVisionEncoder {
+        CoreMLVisionEncoder(models: models.filter { !failed.contains("vision_\($0.key)") }, positionTable: positionTable)
+    }
+
+    public var functionNames: [String] { budgets.map { "vision_\($0)" } }
 
     public static func load(model url: URL, positionTable: URL, computeUnits: MLComputeUnits = .cpuAndNeuralEngine)
         async throws -> CoreMLVisionEncoder
@@ -168,14 +183,14 @@ public final class CoreMLVisionEncoder: VisionEncoder, @unchecked Sendable {
         else { throw RuntimeError.model("missing or malformed \(positionTable.lastPathComponent)") }
         let compiled = try await compiledModelURL(url)
         var models: [Int: MLModel] = [:]
-        for budget in budgets {
+        for budget in allBudgets {
             models[budget] = try await loadFunction(compiled, name: "vision_\(budget)", computeUnits: computeUnits)
         }
         return CoreMLVisionEncoder(models: models, positionTable: table)
     }
 
     public func warm() async throws {
-        for (budget, (columns, rows)) in zip(Self.budgets, [(10, 7), (14, 10), (20, 14)]) {
+        for (budget, (columns, rows)) in zip(Self.allBudgets, [(10, 7), (14, 10), (20, 14)]) where models[budget] != nil {
             let image = PreparedImage(rgb: [UInt8](repeating: 0, count: columns * rows * 48 * 48 * 3),
                                       width: columns * 48, height: rows * 48)
             precondition(image.tokens <= budget)
@@ -185,7 +200,7 @@ public final class CoreMLVisionEncoder: VisionEncoder, @unchecked Sendable {
 
     public func encode(_ image: PreparedImage) async throws -> [Float16] {
         let tokens = image.tokens
-        guard let budget = Self.budgets.first(where: { $0 >= tokens }), let model = models[budget] else {
+        guard let budget = budgets.first(where: { $0 >= tokens }), let model = models[budget] else {
             throw RuntimeError.unsupported("\(tokens) image tokens do not fit")
         }
         let output = try await model.prediction(from: try inputs(image, budget: budget))

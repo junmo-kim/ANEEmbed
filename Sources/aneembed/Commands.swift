@@ -291,26 +291,29 @@ struct ModelsCommand: Command {
         return problems.isEmpty ? .success : .dataError
     }
 
-    /// Loads (compiling on first use) and runs every function once; records the warm state.
+    /// Loads (compiling on first use) and self-tests every function; records the warm state.
     static func warm(_ config: Config) async throws(ServiceError) -> JSONValue {
         let started = Date()
         Log.info("loading \(config.modelDirectory.path) (the first time compiles for the Neural Engine; this can take minutes)")
-        let service = try await ModelLoader.makeService(config, log: Log.info)
+        let (service, report) = try await ModelLoader.load(config, log: Log.info)
         do { try await service.runtime.warm() } catch {
             throw ServiceError(.unavailable, "warm_failed", "\(error)")
         }
-        let info = service.runtime.info
-        var functions = info.bucketLengths.map { BucketContract.functionName(forLength: $0) }
-        if info.maxImageTokens > 0 { functions += CoreMLVisionEncoder.budgets.map { "vision_\($0)" } }
         let seconds = Date().timeIntervalSince(started)
         let state = WarmState(osBuild: operatingSystemBuild, binaryVersion: aneembedVersion, maxTokens: service.maxTokens,
-                              functions: functions, warmedAt: Date(), seconds: (seconds * 10).rounded() / 10)
+                              functions: service.runtime.info.functions, warmedAt: Date(), seconds: (seconds * 10).rounded() / 10)
         if !config.useFakeRuntime {
             do { try state.save(to: config.modelDirectory) } catch {
                 Log.info("could not record the warm state: \(error.localizedDescription)")
             }
         }
-        return state.json
+        var output = state.json
+        if case .object(var object) = output {
+            object["functions"] = .int(state.functions.count)
+            if let selfTest = report.selfTest { object["selftest"] = .string(selfTest.summary) }
+            output = .object(object)
+        }
+        return output
     }
 
     func install(_ source: ModelSource, config: Config, format: OutputFormat) async throws(ServiceError) -> ExitCode {
@@ -371,9 +374,8 @@ func load(into state: ServerState, config: Config) async {
         if !config.useFakeRuntime,
             !(WarmState.load(from: directory)?.covers(osBuild: operatingSystemBuild, maxTokens: service.maxTokens) ?? false)
         {
-            let info = service.runtime.info
             let warm = WarmState(osBuild: operatingSystemBuild, binaryVersion: aneembedVersion, maxTokens: service.maxTokens,
-                                 functions: info.bucketLengths.map { BucketContract.functionName(forLength: $0) },
+                                 functions: service.runtime.info.functions,
                                  warmedAt: Date(), seconds: (Date().timeIntervalSince(started) * 10).rounded() / 10)
             try? warm.save(to: directory)
         }

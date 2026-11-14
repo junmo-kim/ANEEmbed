@@ -22,13 +22,19 @@ public enum Doctor {
             for (name, present) in files.prefix(3) where !present { problems.append(.string("model file missing: \(name)")) }
             do {
                 let manifest = try Manifest.load(from: directory)
-                let issues = manifest.verify(in: directory, hash: verify)
-                model["revision"] = .string(manifest.revision)
+                let (issues, compiled) = manifest.verifyAll(in: directory, hash: verify)
+                model["name"] = .string(manifest.model)
+                model["manifest_sha256"] = .string(manifest.sha256)
                 model["manifest"] = [
-                    "files": .int(manifest.files.count), "checked": .string(verify ? "sha256" : "size"),
+                    "files": .int(manifest.sourceFiles.count), "checked": .string(verify ? "sha256" : "size"),
                     "problems": .array(issues.map { .string("\($0.path): \($0.issue)") }),
                 ]
+                if verify {
+                    // Informational: another Core ML compiler stamps its version into model.mil.
+                    model["compiled_differs_from_packager"] = .array(compiled.map { .string("\($0.path): \($0.issue)") })
+                }
                 if !issues.isEmpty { problems.append(.string("\(issues.count) model files fail the manifest check")) }
+                do { try manifest.checkContract() } catch { problems.append(.string(error.message)) }
             } catch {
                 model["manifest"] = .string("missing")
             }
@@ -49,6 +55,20 @@ public enum Doctor {
             cache = "cold: never warmed (the first start compiles for the Neural Engine)"
         }
         if cache != "warm" && exists { problems.append(.string("run `aneembed models warm` (compile cache \(cache.prefix { $0 != ":" }))")) }
+
+        // The self-test of the last load (serve, mcp, models warm/install): functions that failed are not served.
+        var selfTest: JSONValue = "not run yet"
+        if let report = SelfTestReport.load(from: directory) {
+            var object: JSONObject = ["summary": .string(report.summary), "os_build": .string(report.osBuild),
+                                      "ran_at": .string(ISO8601DateFormatter().string(from: report.ranAt))]
+            if !report.failed.isEmpty {
+                object["failed"] = .array(report.failed.map(\.json))
+                problems.append(.string("self-test failed for \(report.failed.map(\.function).joined(separator: ", ")); "
+                    + "those functions are not served (please report the macOS build)"))
+            }
+            if report.osBuild != operatingSystemBuild { object["note"] = "ran on another macOS build; the next load runs it again" }
+            selfTest = .object(object)
+        }
         if !engine.available && !config.useFakeRuntime { problems.append(.string("no Neural Engine")) }
 
         return [
@@ -60,6 +80,7 @@ public enum Doctor {
             "max_tokens": .int(config.maxTokens),
             "model": .object(model),
             "compile_cache": .string(cache),
+            "selftest": selfTest,
             "ready": .bool(problems.isEmpty),
             "problems": .array(problems),
         ]

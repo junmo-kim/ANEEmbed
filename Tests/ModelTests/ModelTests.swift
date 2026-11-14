@@ -29,6 +29,33 @@ enum ModelGate {
 
 @Suite("Model on the Neural Engine", .serialized, .enabled(if: ModelGate.enabled, "needs a model package and no CI"))
 struct ModelTests {
+    @Test func everyLoadedFunctionPassesTheSelfTest() async throws {
+        let config = try Config(flags: ["model-dir": ModelGate.directory!.path], environment: [:])
+        let (service, report) = try await ModelLoader.load(config)
+        let selfTest = try #require(report.selfTest)
+        #expect(selfTest.available && selfTest.failed.isEmpty, "\(selfTest.summary)")
+        #expect(Set(selfTest.results.map(\.function)) == Set(service.runtime.info.functions))
+        #expect(service.runtime.info.functions.count == 9)  // six buckets, three vision budgets
+    }
+
+    @Test func longTextsRunThroughTheLongPath() async throws {
+        let service = try await ModelGate.service(maxTokens: 8192)
+        #expect(service.maxTokens == 8192 && service.runtime.info.functions.count == 37)
+        let sentence = "The Neural Engine runs fixed-shape graphs, so long documents are split into chunks. "
+        let texts = [String(repeating: sentence, count: 130), String(repeating: sentence, count: 330)]
+        let result = try await service.embedTexts(texts)
+        #expect(result.tokenCounts[0] > 2048 && result.tokenCounts[0] <= 4096)
+        #expect(result.tokenCounts[1] > 4096 && result.tokenCounts[1] <= 8192)
+        for vector in result.vectors { #expect(abs(vector.reduce(0) { $0 + $1 * $1 }.squareRoot() - 1) < 1e-3) }
+        // Same text again (reused buffers and cached biases) gives the same vector.
+        let again = try await service.embedTexts([texts[1]])
+        #expect(Vectors.cosine(again.vectors[0], result.vectors[1]) > 0.99999)
+        // Without --max-tokens above 2048 the long functions are not loaded and such texts are rejected.
+        await #expect(throws: ServiceError.self) {
+            _ = try await ModelGate.service(maxTokens: 2048).embedTexts([texts[0]])
+        }
+    }
+
     @Test func embedsUnitVectors() async throws {
         let service = try await ModelGate.service()
         let result = try await service.embedTexts(["hello world", "task: search result | query: 서울 날씨"])
