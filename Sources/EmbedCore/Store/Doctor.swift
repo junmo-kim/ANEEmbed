@@ -46,6 +46,8 @@ public enum Doctor {
         if let warm = WarmState.load(from: directory) {
             if warm.osBuild != operatingSystemBuild {
                 cache = "stale: warmed on macOS build \(warm.osBuild), now \(operatingSystemBuild)"
+            } else if warm.binary != Executable.identity {
+                cache = "stale: warmed by another aneembed binary (\(warm.binaryVersion)); the first start compiles again"
             } else if warm.maxTokens < config.maxTokens {
                 cache = "partial: warmed up to \(warm.maxTokens) tokens, configured \(config.maxTokens)"
             } else {
