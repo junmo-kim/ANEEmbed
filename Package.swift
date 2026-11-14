@@ -25,5 +25,7 @@ let package = Package(
         .executableTarget(name: "aneembed", dependencies: ["EmbedCore"]),
         // Pure logic: runs anywhere, including CI runners without a Neural Engine.
         .testTarget(name: "EmbedCoreTests", dependencies: ["EmbedCore"]),
+        // HTTP/OpenAI/MCP contracts end to end through the fake runtime (no model needed).
+        .testTarget(name: "ServiceTests", dependencies: ["EmbedCore"]),
     ]
 )
