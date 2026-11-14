@@ -1,0 +1,107 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+# One release run per tag at a time; a second push of the same tag waits instead of racing the publish.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: build release candidate (macOS 26)
+    runs-on: macos-26
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+
+      - name: Versions
+        run: swift --version && xcodebuild -version
+
+      - name: Test
+        run: swift test
+
+      - name: Release workflow contract
+        run: ruby Tests/Integration/release-workflow-contract.rb
+
+      - name: Build (release, stripped) + package
+        run: |
+          swift build -c release -Xlinker -s
+          BIN=.build/release/aneembed
+          codesign --verify --strict "$BIN"
+          Tests/Integration/release-binary-launch-smoke.sh "$BIN"
+          EXPECTED_VERSION="aneembed ${GITHUB_REF_NAME#v}"
+          ACTUAL_VERSION="$("$BIN" --version)"
+          if [ "$ACTUAL_VERSION" != "$EXPECTED_VERSION" ]; then
+            echo "::error::tag/binary version mismatch: expected '$EXPECTED_VERSION', got '$ACTUAL_VERSION'"
+            exit 1
+          fi
+          TARBALL="aneembed-${GITHUB_REF_NAME}-macos-arm64.tar.gz"
+          mkdir -p dist
+          tar -C "$(dirname "$BIN")" -czf "dist/${TARBALL}" "$(basename "$BIN")"
+          ( cd dist && shasum -a 256 "${TARBALL}" > "${TARBALL}.sha256" )
+
+      - name: Generate release notes
+        run: scripts/gen-release-notes.sh "${GITHUB_REF_NAME}" > dist/RELEASE_NOTES.md
+
+      - name: Upload release candidate
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: aneembed-release-candidate
+          path: dist/
+          if-no-files-found: error
+          retention-days: 1
+
+  verify-macos-15:
+    name: verify packaged release (macOS 15)
+    needs: build
+    runs-on: macos-15
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Download release candidate
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: aneembed-release-candidate
+          path: dist
+
+      - name: Verify checksum, package, signature, and launch
+        run: |
+          TARBALL="aneembed-${GITHUB_REF_NAME}-macos-arm64.tar.gz"
+          ( cd dist && shasum -a 256 -c "${TARBALL}.sha256" )
+          test "$(tar -tzf "dist/${TARBALL}")" = aneembed
+          mkdir verify
+          tar -xzf "dist/${TARBALL}" -C verify
+          codesign --verify --strict verify/aneembed
+          test "$(verify/aneembed --version)" = "aneembed ${GITHUB_REF_NAME#v}"
+          Tests/Integration/release-binary-launch-smoke.sh verify/aneembed
+
+  publish:
+    name: publish verified release
+    needs: [build, verify-macos-15]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download verified release candidate
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: aneembed-release-candidate
+          path: dist
+
+      - name: Publish release
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          files: |
+            dist/*.tar.gz
+            dist/*.tar.gz.sha256
+          fail_on_unmatched_files: true
+          body_path: dist/RELEASE_NOTES.md
