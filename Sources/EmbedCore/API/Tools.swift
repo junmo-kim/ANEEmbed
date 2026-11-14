@@ -174,9 +174,14 @@ public enum Tools {
     public struct OutputOptions: Sendable {
         public var dimensions = 768
         public var encoding = EncodingFormat.float
+
+        public init(dimensions: Int = 768, encoding: EncodingFormat = .float) {
+            self.dimensions = dimensions
+            self.encoding = encoding
+        }
     }
 
-    static func outputOptions(_ arguments: JSONObject) throws(ServiceError) -> OutputOptions {
+    public static func outputOptions(_ arguments: JSONObject) throws(ServiceError) -> OutputOptions {
         var options = OutputOptions()
         if let value = arguments["dimensions"], !value.isNull {
             guard let dimensions = value.intValue ?? value.stringValue.flatMap({ Int($0) }),
