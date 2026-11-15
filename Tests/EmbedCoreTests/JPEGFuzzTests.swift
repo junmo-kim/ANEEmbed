@@ -1,6 +1,8 @@
 import Foundation
 import Testing
 
+@testable import EmbedCore
+
 /// Runs the jpeg-fuzz tool (Sources/jpeg-fuzz) as a child process over the fixture JPEGs: a decoder trap kills
 /// only the child, and its exit status fails the test. ANEEMBED_FUZZ_ITERATIONS overrides the iteration count.
 @Suite("JPEG decoder fuzzing")
@@ -59,5 +61,20 @@ struct JPEGFuzzTests {
         try FileManager.default.createDirectory(at: empty, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: empty) }
         #expect(try run([empty.path]).0 == 64)
+    }
+
+    /// The memory measurement CI runs at 40 MP (README "Memory"), here on a small image: a flat JPEG of any declared
+    /// size decodes, and --max-peak-mib fails a decode that adds more.
+    @Test func measuresThePeakOfADecode() throws {
+        let file = FileManager.default.temporaryDirectory.appendingPathComponent("jpeg-fuzz-flat-\(getpid()).jpg")
+        defer { try? FileManager.default.removeItem(at: file) }
+        #expect(try run(["--flat-jpeg", "640x480", "--sampling", "420", "--out", file.path]).0 == 0)
+        let data = try Data(contentsOf: file)
+        #expect(data.count < 200)
+        let (rgb, width, height) = try #require(JPEGDecoder.decode(data, maxPixels: 640 * 480))
+        #expect(width == 640 && height == 480 && Set(rgb).count == 1)
+        let (status, _, output) = try run(["--peak", file.path, "--max-peak-mib", "200"])
+        #expect(status == 0 && output.contains("canvas"), "\(output)")
+        #expect(try run(["--peak", file.path, "--max-peak-mib", "0"]).0 == 1)
     }
 }

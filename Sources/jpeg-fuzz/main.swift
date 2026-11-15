@@ -9,6 +9,9 @@
 //   jpeg-fuzz [--iterations N] [--seed S] [--start I] [--max-pixels P] [--max-seconds T] [--crash-file PATH] CORPUS...
 //   jpeg-fuzz --replay FILE [--max-pixels P]
 //   jpeg-fuzz --write-input I [--seed S] --out FILE CORPUS...
+//   jpeg-fuzz --flat-jpeg WIDTHxHEIGHT [--sampling 444|420] --out FILE   (a few hundred bytes, any pixel count)
+//   jpeg-fuzz --peak FILE [--max-peak-mib M]   (ImagePrep.prepare once; prints the peak physical footprint it
+//                                               added, and exits 1 above M)
 import Darwin
 import EmbedCore
 import Foundation
@@ -24,6 +27,10 @@ var crashPath: String?
 var replayPath: String?
 var writeInput: Int?
 var outPath: String?
+var flatSize: String?
+var sampling = "444"
+var peakPath: String?
+var maxPeakMiB: Int?
 var corpusPaths: [String] = []
 
 func usage(_ message: String) -> Never {
@@ -52,6 +59,10 @@ while let argument = argumentList.popFirst() {
     case "--replay": replayPath = value()
     case "--write-input": writeInput = number(Int.self)
     case "--out": outPath = value()
+    case "--flat-jpeg": flatSize = value()
+    case "--sampling": sampling = value()
+    case "--peak": peakPath = value()
+    case "--max-peak-mib": maxPeakMiB = number(Int.self)
     case "-h", "--help": usage("see the header of Sources/jpeg-fuzz/main.swift")
     default:
         if argument.hasPrefix("--") { usage("unknown option \(argument)") }
@@ -68,6 +79,63 @@ func problem(_ result: ([UInt8], Int, Int)?, maxPixels: Int) -> String? {
     if width * height > maxPixels { return "decoded \(width) x \(height) beyond --max-pixels \(maxPixels)" }
     if rgb.count != width * height * 3 { return "\(rgb.count) bytes for \(width) x \(height)" }
     return nil
+}
+
+// MARK: - memory measurement
+
+/// A baseline YCbCr JPEG of one flat colour: every block is "DC difference 0, end of block", which the decoder
+/// reads from the zero bits after the end of the (empty) scan data. Tiny, and as large as its header says.
+func flatJPEG(width: Int, height: Int, chromaSubsampled: Bool) -> Data {
+    var bytes: [UInt8] = [0xFF, 0xD8, 0xFF, 0xDB, 0x00, 0x43, 0x00] + [UInt8](repeating: 1, count: 64)
+    let luma: UInt8 = chromaSubsampled ? 0x22 : 0x11
+    bytes += [0xFF, 0xC0, 0x00, 0x11, 0x08, UInt8(height >> 8), UInt8(height & 255), UInt8(width >> 8), UInt8(width & 255),
+              0x03, 0x01, luma, 0x00, 0x02, 0x11, 0x00, 0x03, 0x11, 0x00]
+    let oneCode = [UInt8(1)] + [UInt8](repeating: 0, count: 15)
+    bytes += [0xFF, 0xC4, 0x00, 0x14, 0x00] + oneCode + [0x00]  // DC: code 0 -> size 0
+    bytes += [0xFF, 0xC4, 0x00, 0x14, 0x10] + oneCode + [0x00]  // AC: code 0 -> end of block
+    bytes += [0xFF, 0xDA, 0x00, 0x0C, 0x03, 0x01, 0x00, 0x02, 0x00, 0x03, 0x00, 0x00, 0x3F, 0x00]
+    bytes += [0xFF, 0xD9]
+    return Data(bytes)
+}
+
+func peakFootprint() -> UInt64 {
+    var info = rusage_info_v4()
+    let status = withUnsafeMutablePointer(to: &info) {
+        $0.withMemoryRebound(to: rusage_info_t?.self, capacity: 1) { proc_pid_rusage(getpid(), RUSAGE_INFO_V4, $0) }
+    }
+    return status == 0 ? info.ri_lifetime_max_phys_footprint : 0
+}
+
+if let flatSize {
+    let parts = flatSize.split(separator: "x").compactMap { Int($0) }
+    guard parts.count == 2, (1...65535).contains(parts[0]), (1...65535).contains(parts[1]), ["444", "420"].contains(sampling),
+        let outPath
+    else { usage("--flat-jpeg WIDTHxHEIGHT [--sampling 444|420] --out FILE") }
+    guard FileManager.default.createFile(atPath: outPath, contents: flatJPEG(width: parts[0], height: parts[1],
+                                                                               chromaSubsampled: sampling == "420"))
+    else { usage("cannot write \(outPath)") }
+    exit(0)
+}
+
+if let peakPath {
+    guard let data = FileManager.default.contents(atPath: peakPath) else { usage("cannot read \(peakPath)") }
+    let before = peakFootprint()
+    let started = Date()
+    do {
+        let image = try ImagePrep.prepare(data)
+        let after = peakFootprint()
+        let added = Int((after - before) >> 20)
+        print("peak \(peakPath): \(image.width) x \(image.height) canvas; footprint peak \(added) MiB above the "
+              + "\(before >> 20) MiB before (process peak \(after >> 20) MiB); \(Int(Date().timeIntervalSince(started) * 1000)) ms")
+        if let maxPeakMiB, added > maxPeakMiB {
+            print("peak \(peakPath): \(added) MiB is over --max-peak-mib \(maxPeakMiB)")
+            exit(1)
+        }
+        exit(0)
+    } catch {
+        print("peak \(peakPath): rejected (\(error)); process peak \(peakFootprint() >> 20) MiB")
+        exit(0)
+    }
 }
 
 if let replayPath {

@@ -52,6 +52,14 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
+      # Peak memory of one image decode at the 40 MP limit (README "Memory"): a flat 4:4:4 JPEG of a few hundred
+      # bytes that declares 8000 x 5000 pixels. 361 MiB on an M4; 475 MiB before decoding straight into the output.
+      - name: Image decode memory at the pixel limit
+        run: |
+          BIN="$(swift build -c release --show-bin-path)"
+          "$BIN/jpeg-fuzz" --flat-jpeg 8000x5000 --sampling 444 --out "$RUNNER_TEMP/flat-40mp.jpg"
+          "$BIN/jpeg-fuzz" --peak "$RUNNER_TEMP/flat-40mp.jpg" --max-peak-mib 400
+
       - name: Release workflow contract
         run: ruby Tests/Integration/release-workflow-contract.rb
 

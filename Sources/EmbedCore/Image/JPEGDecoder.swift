@@ -301,7 +301,7 @@ public enum JPEGDecoder {
         } else {
             rgbInput = false
         }
-        return (output(components: components, width: width, height: height, hmax: hmax, vmax: vmax, rgbInput: rgbInput),
+        return (output(components: &components, width: width, height: height, hmax: hmax, vmax: vmax, rgbInput: rgbInput),
                 width, height)
     }
 
@@ -549,8 +549,32 @@ public enum JPEGDecoder {
         }
     }
 
-    /// Component samples upsampled to width x height (jdsample.c with jdmainct.c's replicated edge rows).
-    static func upsampled(_ c: Component, width: Int, height: Int, hmax: Int, vmax: Int) -> [UInt8] {
+    /// Writes component `c`, upsampled to width x height (jdsample.c with jdmainct.c's replicated edge rows), into
+    /// channel `channel` of the interleaved output. A full-resolution component goes block by block straight into its
+    /// channel; a subsampled one through a plane of its own (a quarter of the image for 4:2:0 chroma).
+    static func write(_ c: Component, into rgb: UnsafeMutableBufferPointer<UInt8>, channel: Int, width: Int, height: Int,
+                      hmax: Int, vmax: Int)
+    {
+        let fh = hmax / c.h, fv = vmax / c.v
+        if fh == 1 && fv == 1 {
+            var block = [UInt8](repeating: 0, count: 64)
+            c.coefficients.withUnsafeBufferPointer { coef in
+                block.withUnsafeMutableBufferPointer { b in
+                    for row in 0..<min(c.blocksPerColumn, (height + 7) / 8) {
+                        let rows = min(8, height - row * 8)
+                        for column in 0..<min(c.blocksPerLine, (width + 7) / 8) {
+                            idctIslow(coef, (row * c.blocksPerLine + column) * 64, c.quant, b, 8, 0, 0)
+                            let columns = min(8, width - column * 8)
+                            for y in 0..<rows {
+                                let base = ((row * 8 + y) * width + column * 8) * 3 + channel
+                                for x in 0..<columns { rgb[base + x * 3] = b[y * 8 + x] }
+                            }
+                        }
+                    }
+                }
+            }
+            return
+        }
         let stride = c.blocksPerLine * 8
         var plane = [UInt8](repeating: 0, count: stride * c.blocksPerColumn * 8)
         c.coefficients.withUnsafeBufferPointer { coef in
@@ -562,77 +586,77 @@ public enum JPEGDecoder {
                 }
             }
         }
-        let fh = hmax / c.h, fv = vmax / c.v
-        if fh == 1 && fv == 1 {
-            if stride == width { return Array(plane[0..<(width * height)]) }
-            var out = [UInt8](repeating: 0, count: width * height)
-            for y in 0..<height { for x in 0..<width { out[y * width + x] = plane[y * stride + x] } }
-            return out
-        }
         let w = c.width, h = c.height
-        func at(_ x: Int, _ y: Int) -> Int { Int(plane[min(max(y, 0), h - 1) * stride + min(max(x, 0), w - 1)]) }
-        var out = [UInt8](repeating: 0, count: width * height)
-        if fh == 2 && fv == 1 && w > 2 {  // h2v1_fancy_upsample
-            for y in 0..<height {
-                for x in 0..<width {
-                    let cx = x >> 1, v3 = at(cx, y) * 3
-                    out[y * width + x] = UInt8(x & 1 == 0 ? (v3 + at(cx - 1, y) + 1) >> 2 : (v3 + at(cx + 1, y) + 2) >> 2)
-                }
-            }
-        } else if fh == 1 && fv == 2 {  // h1v2_fancy_upsample
-            for y in 0..<height {
-                let cy = y >> 1
-                for x in 0..<width {
-                    let v3 = at(x, cy) * 3
-                    out[y * width + x] = UInt8(y & 1 == 0 ? (v3 + at(x, cy - 1) + 1) >> 2 : (v3 + at(x, cy + 1) + 2) >> 2)
-                }
-            }
-        } else if fh == 2 && fv == 2 && w > 2 {  // h2v2_fancy_upsample
-            for y in 0..<height {
-                let cy = y >> 1, ny = y & 1 == 0 ? cy - 1 : cy + 1
-                for x in 0..<width {
-                    let cx = x >> 1
-                    let this = at(cx, cy) * 3 + at(cx, ny)
-                    if x & 1 == 0 {
-                        out[y * width + x] = UInt8((this * 3 + at(cx - 1, cy) * 3 + at(cx - 1, ny) + 8) >> 4)
-                    } else {
-                        out[y * width + x] = UInt8((this * 3 + at(cx + 1, cy) * 3 + at(cx + 1, ny) + 7) >> 4)
+        plane.withUnsafeBufferPointer { plane in
+            func at(_ x: Int, _ y: Int) -> Int { Int(plane[min(max(y, 0), h - 1) * stride + min(max(x, 0), w - 1)]) }
+            func put(_ x: Int, _ y: Int, _ value: Int) { rgb[(y * width + x) * 3 + channel] = UInt8(value) }
+            if fh == 2 && fv == 1 && w > 2 {  // h2v1_fancy_upsample
+                for y in 0..<height {
+                    for x in 0..<width {
+                        let cx = x >> 1, v3 = at(cx, y) * 3
+                        put(x, y, x & 1 == 0 ? (v3 + at(cx - 1, y) + 1) >> 2 : (v3 + at(cx + 1, y) + 2) >> 2)
                     }
                 }
+            } else if fh == 1 && fv == 2 {  // h1v2_fancy_upsample
+                for y in 0..<height {
+                    let cy = y >> 1
+                    for x in 0..<width {
+                        let v3 = at(x, cy) * 3
+                        put(x, y, y & 1 == 0 ? (v3 + at(x, cy - 1) + 1) >> 2 : (v3 + at(x, cy + 1) + 2) >> 2)
+                    }
+                }
+            } else if fh == 2 && fv == 2 && w > 2 {  // h2v2_fancy_upsample
+                for y in 0..<height {
+                    let cy = y >> 1, ny = y & 1 == 0 ? cy - 1 : cy + 1
+                    for x in 0..<width {
+                        let cx = x >> 1
+                        let this = at(cx, cy) * 3 + at(cx, ny)
+                        if x & 1 == 0 {
+                            put(x, y, (this * 3 + at(cx - 1, cy) * 3 + at(cx - 1, ny) + 8) >> 4)
+                        } else {
+                            put(x, y, (this * 3 + at(cx + 1, cy) * 3 + at(cx + 1, ny) + 7) >> 4)
+                        }
+                    }
+                }
+            } else {  // h2v1_upsample / h2v2_upsample / int_upsample: replication
+                for y in 0..<height { for x in 0..<width { put(x, y, Int(plane[(y / fv) * stride + x / fh])) } }
             }
-        } else {  // h2v1_upsample / h2v2_upsample / int_upsample: replication
-            for y in 0..<height { for x in 0..<width { out[y * width + x] = plane[(y / fv) * stride + x / fh] } }
         }
-        return out
     }
 
-    static func output(components: [Component], width: Int, height: Int, hmax: Int, vmax: Int, rgbInput: Bool) -> [UInt8] {
-        let planes = components.map { upsampled($0, width: width, height: height, hmax: hmax, vmax: vmax) }
-        var rgb = [UInt8](repeating: 0, count: width * height * 3)
-        if planes.count == 1 {
-            for i in 0..<(width * height) { rgb[i * 3] = planes[0][i]; rgb[i * 3 + 1] = planes[0][i]; rgb[i * 3 + 2] = planes[0][i] }
-            return rgb
-        }
-        if rgbInput {
-            for i in 0..<(width * height) { for c in 0..<3 { rgb[i * 3 + c] = planes[c][i] } }
-            return rgb
-        }
-        // jdcolor.c build_ycc_rgb_table, SCALEBITS 16
-        let half = 1 << 15
-        var crR = [Int](repeating: 0, count: 256), cbB = crR, crG = crR, cbG = crR
-        for i in 0..<256 {
-            let x = i - 128
-            crR[i] = (91881 * x + half) >> 16
-            cbB[i] = (116130 * x + half) >> 16
-            crG[i] = -46802 * x
-            cbG[i] = -22554 * x + half
-        }
-        func clamp(_ v: Int) -> UInt8 { UInt8(min(max(v, 0), 255)) }
-        for i in 0..<(width * height) {
-            let y = Int(planes[0][i]), cb = Int(planes[1][i]), cr = Int(planes[2][i])
-            rgb[i * 3] = clamp(y + crR[cr])
-            rgb[i * 3 + 1] = clamp(y + ((cbG[cb] + crG[cr]) >> 16))
-            rgb[i * 3 + 2] = clamp(y + cbB[cb])
+    /// The decoded image as interleaved RGB. Memory at the pixel limit: the coefficients (2 bytes per sample) and
+    /// the output (3 bytes per pixel), plus a subsampled component's own plane; each component's coefficients are
+    /// released once written, and colour conversion runs in place.
+    static func output(components: inout [Component], width: Int, height: Int, hmax: Int, vmax: Int, rgbInput: Bool) -> [UInt8] {
+        let pixels = width * height
+        var rgb = [UInt8](repeating: 0, count: pixels * 3)
+        rgb.withUnsafeMutableBufferPointer { out in
+            for i in components.indices {
+                write(components[i], into: out, channel: i, width: width, height: height, hmax: hmax, vmax: vmax)
+                components[i].coefficients = []
+            }
+            if components.count == 1 {
+                for p in 0..<pixels { (out[p * 3 + 1], out[p * 3 + 2]) = (out[p * 3], out[p * 3]) }
+                return
+            }
+            if rgbInput { return }
+            // jdcolor.c build_ycc_rgb_table, SCALEBITS 16
+            let half = 1 << 15
+            var crR = [Int](repeating: 0, count: 256), cbB = crR, crG = crR, cbG = crR
+            for i in 0..<256 {
+                let x = i - 128
+                crR[i] = (91881 * x + half) >> 16
+                cbB[i] = (116130 * x + half) >> 16
+                crG[i] = -46802 * x
+                cbG[i] = -22554 * x + half
+            }
+            func clamp(_ v: Int) -> UInt8 { UInt8(min(max(v, 0), 255)) }
+            for p in 0..<pixels {
+                let y = Int(out[p * 3]), cb = Int(out[p * 3 + 1]), cr = Int(out[p * 3 + 2])
+                out[p * 3] = clamp(y + crR[cr])
+                out[p * 3 + 1] = clamp(y + ((cbG[cb] + crG[cr]) >> 16))
+                out[p * 3 + 2] = clamp(y + cbB[cb])
+            }
         }
         return rgb
     }
