@@ -1,0 +1,322 @@
+// jpeg-fuzz: deterministic mutation fuzzing of JPEGDecoder (a development tool, not part of the release).
+//
+// Takes JPEG files (or directories of them), derives every iteration's input from (seed, iteration) alone,
+// applies byte flips, truncations and edits of segment lengths, Huffman symbols, frame and scan headers, and
+// decodes each input in process. A decode must return nil or a well-formed image; anything else exits 1. A trap
+// cannot be caught, so the harness is meant to run as a child process: a crash is a nonzero exit (signal), and
+// the input that crashed is written to --crash-file first so it can be replayed with --replay.
+//
+//   jpeg-fuzz [--iterations N] [--seed S] [--start I] [--max-pixels P] [--max-seconds T] [--crash-file PATH] CORPUS...
+//   jpeg-fuzz --replay FILE [--max-pixels P]
+//   jpeg-fuzz --write-input I [--seed S] --out FILE CORPUS...
+import Darwin
+import EmbedCore
+import Foundation
+
+// MARK: - arguments
+
+var iterations = 20_000
+var seed: UInt64 = 1
+var start = 0
+var maxPixels = 1_000_000
+var maxSeconds = 10.0
+var crashPath: String?
+var replayPath: String?
+var writeInput: Int?
+var outPath: String?
+var corpusPaths: [String] = []
+
+func usage(_ message: String) -> Never {
+    FileHandle.standardError.write(Data("jpeg-fuzz: \(message)\n".utf8))
+    exit(64)
+}
+
+var argumentList = CommandLine.arguments.dropFirst()
+while let argument = argumentList.popFirst() {
+    func value() -> String {
+        guard let next = argumentList.popFirst() else { usage("\(argument) needs a value") }
+        return next
+    }
+    func number<T: FixedWidthInteger>(_ type: T.Type) -> T {
+        let raw = value()
+        guard let parsed = T(raw), parsed >= 0 else { usage("\(argument): not a nonnegative integer: \(raw)") }
+        return parsed
+    }
+    switch argument {
+    case "--iterations": iterations = number(Int.self)
+    case "--seed": seed = number(UInt64.self)
+    case "--start": start = number(Int.self)
+    case "--max-pixels": maxPixels = number(Int.self)
+    case "--max-seconds": maxSeconds = Double(number(Int.self))
+    case "--crash-file": crashPath = value()
+    case "--replay": replayPath = value()
+    case "--write-input": writeInput = number(Int.self)
+    case "--out": outPath = value()
+    case "-h", "--help": usage("see the header of Sources/jpeg-fuzz/main.swift")
+    default:
+        if argument.hasPrefix("--") { usage("unknown option \(argument)") }
+        corpusPaths.append(argument)
+    }
+}
+
+// MARK: - expectations
+
+/// nil when the result is acceptable (rejected, or a well-formed image within the pixel limit).
+func problem(_ result: ([UInt8], Int, Int)?, maxPixels: Int) -> String? {
+    guard let (rgb, width, height) = result else { return nil }
+    if width <= 0 || height <= 0 { return "decoded to \(width) x \(height)" }
+    if width * height > maxPixels { return "decoded \(width) x \(height) beyond --max-pixels \(maxPixels)" }
+    if rgb.count != width * height * 3 { return "\(rgb.count) bytes for \(width) x \(height)" }
+    return nil
+}
+
+if let replayPath {
+    guard let data = FileManager.default.contents(atPath: replayPath) else { usage("cannot read \(replayPath)") }
+    let result = JPEGDecoder.decode(data, maxPixels: maxPixels)
+    if let failure = problem(result, maxPixels: maxPixels) {
+        print("replay \(replayPath): \(failure)")
+        exit(1)
+    }
+    print("replay \(replayPath): \(result.map { "\($0.1) x \($0.2)" } ?? "rejected")")
+    exit(0)
+}
+
+// MARK: - corpus
+
+var corpus: [[UInt8]] = []
+for path in corpusPaths {
+    var isDirectory: ObjCBool = false
+    guard FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory) else { usage("no such file \(path)") }
+    let files = isDirectory.boolValue
+        ? ((try? FileManager.default.contentsOfDirectory(atPath: path)) ?? []).sorted()
+            .filter { $0.lowercased().hasSuffix(".jpg") || $0.lowercased().hasSuffix(".jpeg") }
+            .map { (path as NSString).appendingPathComponent($0) }
+        : [path]
+    for file in files {
+        if let data = FileManager.default.contents(atPath: file) { corpus.append([UInt8](data)) }
+    }
+}
+guard !corpus.isEmpty else { usage("no JPEG files in the corpus") }
+
+// MARK: - deterministic mutations
+
+/// SplitMix64: tiny, fast and identical on every platform.
+struct Random {
+    var state: UInt64
+    mutating func next() -> UInt64 {
+        state &+= 0x9E37_79B9_7F4A_7C15
+        var z = state
+        z = (z ^ (z >> 30)) &* 0xBF58_476D_1CE4_E5B9
+        z = (z ^ (z >> 27)) &* 0x94D0_49BB_1331_11EB
+        return z ^ (z >> 31)
+    }
+    mutating func below(_ bound: Int) -> Int { bound <= 1 ? 0 : Int(next() % UInt64(bound)) }
+    mutating func byte() -> UInt8 { UInt8(truncatingIfNeeded: next()) }
+    mutating func chance(_ percent: Int) -> Bool { below(100) < percent }
+}
+
+/// Marker segments with a length field: offset of the 0xFF, marker, length (including the two length bytes).
+func segments(_ bytes: [UInt8]) -> [(offset: Int, marker: UInt8, length: Int)] {
+    var found: [(Int, UInt8, Int)] = []
+    var p = 2
+    while p + 3 < bytes.count {
+        guard bytes[p] == 0xFF else { p += 1; continue }
+        let marker = bytes[p + 1]
+        if marker == 0xFF || marker == 0x00 || marker == 0x01 || marker == 0xD8 || (0xD0...0xD7).contains(marker) {
+            p += marker == 0xFF ? 1 : 2
+            continue
+        }
+        if marker == 0xD9 { break }
+        let length = Int(bytes[p + 2]) << 8 | Int(bytes[p + 3])
+        found.append((p, marker, length))
+        p += 2 + max(length, 2)
+        if marker == 0xDA {  // entropy-coded data up to the next real marker
+            while p + 1 < bytes.count, !(bytes[p] == 0xFF && bytes[p + 1] != 0 && !(0xD0...0xD7).contains(bytes[p + 1])) {
+                p += 1
+            }
+        }
+    }
+    return found
+}
+
+let interesting: [UInt8] = [0x00, 0x01, 0x02, 0x07, 0x08, 0x0B, 0x0C, 0x0F, 0x10, 0x11, 0x3F, 0x40, 0x7F, 0x80, 0xC0,
+                            0xC2, 0xC4, 0xD0, 0xD9, 0xDA, 0xDD, 0xFE, 0xFF]
+
+func mutate(_ source: [UInt8], _ random: inout Random) -> [UInt8] {
+    var bytes = source
+    let edits = 1 + random.below(4)
+    for _ in 0..<edits {
+        guard bytes.count > 4 else { break }
+        let segs = segments(bytes)
+        func pick(_ markers: ClosedRange<UInt8>) -> (offset: Int, marker: UInt8, length: Int)? {
+            let matching = segs.filter { markers.contains($0.marker) && $0.offset + 4 <= bytes.count }
+            return matching.isEmpty ? nil : matching[random.below(matching.count)]
+        }
+        func set(_ offset: Int, _ value: UInt8) { if offset >= 0 && offset < bytes.count { bytes[offset] = value } }
+        func choice() -> UInt8 { random.chance(50) ? interesting[random.below(interesting.count)] : random.byte() }
+        switch random.below(13) {
+        case 0:  // flip bits
+            for _ in 0..<(1 + random.below(8)) { bytes[random.below(bytes.count)] ^= 1 << UInt8(random.below(8)) }
+        case 1:  // overwrite bytes
+            for _ in 0..<(1 + random.below(4)) { bytes[random.below(bytes.count)] = choice() }
+        case 2:  // truncate
+            bytes.removeSubrange((2 + random.below(bytes.count - 2))...)
+        case 3:  // segment length
+            if let seg = pick(0x00...0xFF) {
+                let deltas = [0, 1, 2, 3, seg.length - 1, seg.length + 1, seg.length - 17, seg.length + 64, 0xFFFF,
+                              random.below(0x10000)]
+                let length = max(0, min(0xFFFF, deltas[random.below(deltas.count)]))
+                set(seg.offset + 2, UInt8(length >> 8))
+                set(seg.offset + 3, UInt8(length & 0xFF))
+            }
+        case 4:  // Huffman table: class/id, counts or symbols
+            if let seg = pick(0xC4...0xC4), seg.length > 3 {
+                set(seg.offset + 4 + random.below(seg.length - 2), choice())
+            }
+        case 5:  // frame header: precision, size, components, sampling, quant tables
+            if let seg = pick(0xC0...0xC2) {
+                let fields = [4, 5, 6, 7, 8, 9, 11, 12, 14, 15, 17]
+                set(seg.offset + fields[random.below(fields.count)], choice())
+            }
+        case 6:  // scan header: components, tables, spectral selection, approximation
+            if let seg = pick(0xDA...0xDA), seg.length > 2 {
+                set(seg.offset + 4 + random.below(seg.length - 2), choice())
+            }
+        case 7:  // quantization tables, restart interval
+            if let seg = pick(0xDB...0xDD), seg.length > 2 {
+                set(seg.offset + 4 + random.below(min(seg.length - 2, 8)), choice())
+            }
+        case 8:  // insert bytes or a marker
+            let at = 2 + random.below(bytes.count - 1)
+            let insert = random.chance(50) ? [0xFF, choice()] : (0..<(1 + random.below(16))).map { _ in random.byte() }
+            bytes.insert(contentsOf: insert, at: min(at, bytes.count))
+        case 9:  // delete a range
+            let from = 2 + random.below(bytes.count - 2)
+            bytes.removeSubrange(from..<min(bytes.count, from + 1 + random.below(64)))
+        case 10:  // duplicate a segment (two frames, repeated tables, extra scans)
+            if let seg = pick(0x00...0xFF), seg.offset + 2 + seg.length <= bytes.count {
+                let copy = Array(bytes[seg.offset..<(seg.offset + 2 + seg.length)])
+                let at = segs[random.below(segs.count)].offset
+                bytes.insert(contentsOf: copy, at: at)
+            }
+        case 11:  // restart interval before a scan, RSTn markers inside the entropy-coded data
+            if let sos = pick(0xDA...0xDA) {
+                let from = sos.offset + 2 + sos.length
+                if random.chance(50), from < bytes.count - 2 {
+                    for _ in 0..<(1 + random.below(4)) {
+                        let at = from + random.below(bytes.count - 2 - from)
+                        bytes.insert(contentsOf: [0xFF, 0xD0 + UInt8(random.below(8))], at: at)
+                    }
+                }
+                let interval = [0, 1, 2, 3, 7, 64, 0xFFFF, random.below(0x10000)][random.below(8)]
+                bytes.insert(contentsOf: [0xFF, 0xDD, 0x00, 0x04, UInt8(interval >> 8), UInt8(interval & 0xFF)], at: sos.offset)
+            }
+        default:  // entropy-coded data
+            if let sos = pick(0xDA...0xDA) {
+                let from = sos.offset + 2 + sos.length
+                if from < bytes.count - 2 {
+                    for _ in 0..<(1 + random.below(16)) { set(from + random.below(bytes.count - 2 - from), random.byte()) }
+                }
+            }
+        }
+    }
+    return bytes
+}
+
+func input(_ iteration: Int, seed: UInt64, corpus: [[UInt8]]) -> [UInt8] {
+    var random = Random(state: seed &* 0x2545_F491_4F6C_DD1D &+ UInt64(iteration))
+    _ = random.next()
+    return mutate(corpus[random.below(corpus.count)], &random)
+}
+
+if let writeInput {
+    guard let outPath else { usage("--write-input needs --out") }
+    guard FileManager.default.createFile(atPath: outPath, contents: Data(input(writeInput, seed: seed, corpus: corpus))) else { usage("cannot write \(outPath)") }
+    exit(0)
+}
+
+// MARK: - crash capture
+
+/// The input being decoded, kept where a signal handler can reach it without allocating.
+nonisolated(unsafe) var currentInput = UnsafeMutablePointer<UInt8>.allocate(capacity: 1)
+nonisolated(unsafe) var currentCapacity = 1
+nonisolated(unsafe) var currentLength = 0
+nonisolated(unsafe) var currentIteration = 0
+nonisolated(unsafe) var crashDescriptor: Int32 = -1
+
+func writeRaw(_ descriptor: Int32, _ text: StaticString) {
+    _ = Darwin.write(descriptor, text.utf8Start, text.utf8CodeUnitCount)
+}
+
+/// Digits for the signal handler, allocated up front (a handler must not allocate).
+nonisolated(unsafe) let digitBuffer = UnsafeMutablePointer<UInt8>.allocate(capacity: 24)
+
+func writeNumber(_ descriptor: Int32, _ value: Int) {
+    var n = value, i = 24
+    repeat {
+        i -= 1
+        digitBuffer[i] = UInt8(48 + n % 10)
+        n /= 10
+    } while n > 0 && i > 0
+    _ = Darwin.write(descriptor, digitBuffer + i, 24 - i)
+}
+
+if let crashPath {
+    crashDescriptor = open(crashPath, O_WRONLY | O_CREAT | O_TRUNC, 0o644)
+    if crashDescriptor < 0 { usage("cannot open \(crashPath)") }
+}
+
+let handler: @convention(c) (Int32) -> Void = { signal in
+    writeRaw(2, "jpeg-fuzz: CRASH at iteration ")
+    writeNumber(2, currentIteration)
+    writeRaw(2, " (signal ")
+    writeNumber(2, Int(signal))
+    writeRaw(2, ")\n")
+    if crashDescriptor >= 0 {
+        _ = ftruncate(crashDescriptor, 0)
+        _ = pwrite(crashDescriptor, currentInput, currentLength, 0)
+        close(crashDescriptor)
+    }
+    Darwin.signal(signal, SIG_DFL)
+    raise(signal)  // keep the signal as the exit status
+}
+for sig in [SIGTRAP, SIGILL, SIGSEGV, SIGBUS, SIGABRT, SIGFPE] { signal(sig, handler) }
+
+// MARK: - run
+
+var decoded = 0, rejected = 0
+var slowest = 0.0, slowestIteration = 0
+let started = Date()
+let end = start + iterations
+for iteration in start..<end {
+    let bytes = input(iteration, seed: seed, corpus: corpus)
+    if bytes.count > currentCapacity {
+        currentInput.deallocate()
+        currentCapacity = bytes.count * 2
+        currentInput = .allocate(capacity: currentCapacity)
+    }
+    bytes.withUnsafeBufferPointer { currentInput.update(from: $0.baseAddress!, count: bytes.count) }
+    currentLength = bytes.count
+    currentIteration = iteration
+
+    let t0 = DispatchTime.now().uptimeNanoseconds
+    let result = JPEGDecoder.decode(Data(bytes), maxPixels: maxPixels)
+    let seconds = Double(DispatchTime.now().uptimeNanoseconds - t0) / 1e9
+    if seconds > slowest { (slowest, slowestIteration) = (seconds, iteration) }
+    if let failure = problem(result, maxPixels: maxPixels) {
+        FileHandle.standardError.write(Data("jpeg-fuzz: iteration \(iteration): \(failure)\n".utf8))
+        if let crashPath { FileManager.default.createFile(atPath: crashPath, contents: Data(bytes)) }
+        exit(1)
+    }
+    if seconds > maxSeconds {
+        FileHandle.standardError.write(Data("jpeg-fuzz: iteration \(iteration) took \(seconds) s (limit \(maxSeconds) s)\n".utf8))
+        if let crashPath { FileManager.default.createFile(atPath: crashPath, contents: Data(bytes)) }
+        exit(1)
+    }
+    if result == nil { rejected += 1 } else { decoded += 1 }
+}
+let summary = "jpeg-fuzz: \(iterations) iterations (\(start)..<\(end), seed \(seed), \(corpus.count) corpus files, "
+    + "max \(maxPixels) pixels): \(decoded) decoded, \(rejected) rejected, 0 failures; "
+    + String(format: "slowest %.1f ms (iteration \(slowestIteration)); %.1f s", slowest * 1000, Date().timeIntervalSince(started))
+print(summary)
+if let crashPath { try? FileManager.default.removeItem(atPath: crashPath) }  // nothing crashed

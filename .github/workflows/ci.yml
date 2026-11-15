@@ -36,6 +36,22 @@ jobs:
       - name: Test
         run: swift test
 
+      # Deterministic mutation fuzzing of the JPEG decoder (Sources/jpeg-fuzz, built above but not released).
+      # A decoder trap kills the tool, which fails the step; the crashing input is kept as an artifact.
+      - name: JPEG decoder fuzz (20k iterations)
+        run: |
+          "$(swift build -c release --show-bin-path)/jpeg-fuzz" --iterations 20000 --seed 1 \
+            --crash-file "$RUNNER_TEMP/jpeg-fuzz-crash.jpg" Tests/Fixtures/images
+
+      - name: Upload the JPEG fuzz crash input
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: jpeg-fuzz-crash
+          path: ${{ runner.temp }}/jpeg-fuzz-crash.jpg
+          if-no-files-found: ignore
+          retention-days: 7
+
       - name: Release workflow contract
         run: ruby Tests/Integration/release-workflow-contract.rb
 

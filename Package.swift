@@ -23,8 +23,11 @@ let package = Package(
         .target(name: "EmbedCore"),
         // CLI, HTTP listener (Network.framework) and stdio MCP loop.
         .executableTarget(name: "aneembed", dependencies: ["EmbedCore"]),
+        // Development tool, not a product: deterministic mutation fuzzing of the JPEG decoder. Tests run it as a
+        // child process, because a trap cannot be caught in process.
+        .executableTarget(name: "jpeg-fuzz", dependencies: ["EmbedCore"]),
         // Pure logic: runs anywhere, including CI runners without a Neural Engine.
-        .testTarget(name: "EmbedCoreTests", dependencies: ["EmbedCore"]),
+        .testTarget(name: "EmbedCoreTests", dependencies: ["EmbedCore", "jpeg-fuzz"]),
         // HTTP/OpenAI/MCP contracts end to end through the fake runtime (no model needed).
         .testTarget(name: "ServiceTests", dependencies: ["EmbedCore"]),
         // Real model on the Neural Engine. Skipped when CI is set or no model directory exists.
