@@ -56,105 +56,47 @@ final class HTTPServer: @unchecked Sendable {
 
     // MARK: Connections
 
-    private func receive(_ connection: NWConnection) async -> Data? {
-        await withCheckedContinuation { continuation in
-            connection.receive(minimumIncompleteLength: 1, maximumLength: 1 << 20) { data, _, isComplete, error in
-                if let data, !data.isEmpty {
-                    continuation.resume(returning: data)
-                } else if isComplete || error != nil {
-                    continuation.resume(returning: nil)
-                } else {
-                    continuation.resume(returning: Data())
+    private func serve(_ connection: NWConnection) async {
+        let limits = HTTPConnectionLimits(maxBody: maxBody, idleTimeout: Self.idleTimeout)
+        await HTTPConnection.serve(NetworkTransport(connection), limits: limits) { [router] request in
+            await router.handle(request)
+        }
+    }
+}
+
+/// An NWConnection as an HTTPTransport.
+struct NetworkTransport: HTTPTransport {
+    let connection: NWConnection
+
+    init(_ connection: NWConnection) {
+        self.connection = connection
+    }
+
+    func receive() async -> Data? {
+        while true {
+            let chunk: Data? = await withCheckedContinuation { continuation in
+                connection.receive(minimumIncompleteLength: 1, maximumLength: 1 << 20) { data, _, isComplete, error in
+                    if let data, !data.isEmpty {
+                        continuation.resume(returning: data)
+                    } else if isComplete || error != nil {
+                        continuation.resume(returning: nil)
+                    } else {
+                        continuation.resume(returning: Data())
+                    }
                 }
             }
+            guard let chunk else { return nil }
+            if !chunk.isEmpty { return chunk }
         }
     }
 
-    private func send(_ data: Data, on connection: NWConnection) async -> Bool {
+    func send(_ data: Data) async -> Bool {
         await withCheckedContinuation { continuation in
             connection.send(content: data, completion: .contentProcessed { error in continuation.resume(returning: error == nil) })
         }
     }
 
-    private func serve(_ connection: NWConnection) async {
-        var buffer = Data()
-        let idle = IdleTimer(connection: connection, timeout: Self.idleTimeout)
-        defer {
-            idle.stop()
-            connection.cancel()
-        }
-        while true {
-            // Head.
-            idle.reset()
-            var head: HTTPHead?
-            do {
-                while true {
-                    if let parsed = try HTTPParser.parseHead(buffer, maxBody: maxBody) {
-                        head = parsed
-                        break
-                    }
-                    guard let chunk = await receive(connection) else { return }
-                    buffer.append(chunk)
-                }
-            } catch {
-                let failure = ServiceError(error.status == 413 ? .payloadTooLarge : .badRequest, "bad_http", error.message)
-                _ = await send(HTTPResponse.openAIError(failure).with(status: error.status).serialized(keepAlive: false),
-                               on: connection)
-                return
-            }
-            guard var head else { return }
-            // Body.
-            buffer.removeSubrange(buffer.startIndex..<(buffer.startIndex + head.headLength))
-            while buffer.count < head.contentLength {
-                guard let chunk = await receive(connection) else { return }
-                buffer.append(chunk)
-            }
-            head.request.body = Data(buffer.prefix(head.contentLength))
-            buffer.removeSubrange(buffer.startIndex..<(buffer.startIndex + head.contentLength))
-            buffer = Data(buffer)  // rebase indices
-
-            idle.stop()
-            let response = await router.handle(head.request)
-            let keepAlive = head.request.keepAlive
-            guard await send(response.serialized(keepAlive: keepAlive), on: connection), keepAlive else { return }
-        }
-    }
-}
-
-extension HTTPResponse {
-    func with(status: Int) -> HTTPResponse {
-        var copy = self
-        copy.status = status
-        return copy
-    }
-}
-
-/// Cancels a connection that stays idle (between requests) longer than `timeout`.
-final class IdleTimer: @unchecked Sendable {
-    private let connection: NWConnection
-    private let timeout: Duration
-    private let lock = NSLock()
-    private var task: Task<Void, Never>?
-
-    init(connection: NWConnection, timeout: Duration) {
-        self.connection = connection
-        self.timeout = timeout
-    }
-
-    func reset() {
-        lock.withLock {
-            task?.cancel()
-            task = Task { [connection, timeout] in
-                try? await Task.sleep(for: timeout)
-                if !Task.isCancelled { connection.cancel() }
-            }
-        }
-    }
-
-    func stop() {
-        lock.withLock {
-            task?.cancel()
-            task = nil
-        }
+    func cancel() {
+        connection.cancel()
     }
 }
