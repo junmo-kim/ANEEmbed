@@ -10,6 +10,20 @@ buffers with `--max-tokens 8192` 21.5 → 13.3 GB. New `embed_768` and `embed_12
 functions four at a time. `doctor` lists the functions a `--max-tokens` value loads; `bench --buckets` also times
 the long functions. README: measured memory character, image input formats, design notes.
 
+Stricter self-test and store checks. Only functions that pass the self-test in this run serve (an allowlist):
+a function the package has no test for, or whose output has a NaN or an infinity, is not served; a package
+without readable self-test data or a complete `manifest.json` does not load, unless `--selftest skip`
+(`ANEEMBED_SELFTEST=skip`, unsafe) serves every function unchecked. Tolerances are per kind and a package can
+only tighten them; every `selftest.json` field is bounds-checked. `/health` stays 200 but reports `degraded`,
+with the functions not served and the remaining limits, and doctor keeps the records of functions a smaller
+`--max-tokens` did not load. Each load checks file sizes against the manifest and hashes `tokenizer.json` and
+the self-test files (0.01–0.03 s on an M4). `models install` validates `--revision` and `--repo`, takes a lock
+so a second install waits, swaps the revision directory in one rename, reuses an installed revision only when
+its manifest matches the expected hash, stops a download that exceeds its declared size, hashes only regular
+files, and refuses `--runtime fake`; `models verify` reports the compiled models. The warm state records the
+package's manifest hash. Workflow actions are pinned to commits. Empty token sequences, oversized vocabularies
+and negative token ids are errors instead of traps, and vectors of very small or large values normalize.
+
 ## v0.1.0
 
 First release. EmbeddingGemma 2 text and image embeddings on the Apple Neural Engine from one Swift binary

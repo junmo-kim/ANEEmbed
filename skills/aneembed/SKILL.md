@@ -52,7 +52,8 @@ curl -s -X QUERY 'localhost:18180/embed_image?format=json' -H 'Content-Type: ima
 ```
 
 `GET /health` is 503 while the model loads (the first start after install or a macOS update compiles for
-the Neural Engine, which can take minutes); wait for 200.
+the Neural Engine, which can take minutes); wait for 200. A 200 with `"status": "degraded"` serves, but some
+functions failed the self-test: `max_context_length` there is the text limit that remains.
 
 ## MCP
 

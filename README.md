@@ -62,7 +62,11 @@ For texts over 2048 tokens set the limit for every command, e.g. `export ANEEMBE
 [trade-offs](#--max-tokens-trade-offs)).
 
 `aneembed models install --from DIR` installs a local copy of the package instead (same checks, no
-network). `aneembed models warm` compiles again in place, which an upgraded `aneembed` needs once: the OS
+network; every file must be a regular file). Installs take a lock in the models directory, so a second
+`models install` waits for the first; the new revision replaces an old one in a single rename, and a revision
+already installed is reused only when its manifest matches the pinned hash (or, with `--revision`, the
+manifest the repository serves now). `--revision` takes one plain name (a commit hash, or letters, digits,
+`.`, `_`, `-`); `models install` does not run with `--runtime fake`. `aneembed models warm` compiles again in place, which an upgraded `aneembed` needs once: the OS
 keeps the compile per model path, macOS build and executable (`serve` does it by itself before it reports
 healthy, and `doctor` says when it is due).
 
@@ -102,7 +106,7 @@ Tools: `embed_text`, `embed_image`, `similarity`. The same tools are reachable o
 |---|---|
 | `POST /v1/embeddings` | OpenAI-compatible. `input`: string, list of strings, or list of llama-server image items `{"content": [{"type": "image_url", "image_url": {"url": "data:image/...;base64,..."}}]}` (texts and images are not mixed in one request) |
 | `GET /v1/models` | the model id, `max_context_length`, `max_image_tokens`, `dimensions`, `image_preprocessing` |
-| `GET /health` | `200` ready, `503` while loading (the first start compiles for the Neural Engine) or after a load failure |
+| `GET /health` | `200` ready: `{"status": "ok"}`, or `{"status": "degraded", "not_served": [...], "max_context_length", "max_image_tokens"}` when loaded functions failed the self-test (or `"selftest": "skipped"` under `--selftest skip`); `503` while loading (the first start compiles for the Neural Engine) or after a load failure |
 | `POST /mcp` | MCP JSON-RPC, one message per request |
 | `QUERY /{tool}` | `embed_text` (UTF-8 body), `embed_image` (image body), `similarity` (JSON body); YAML by default, `?format=json` |
 
@@ -136,6 +140,7 @@ Every option is a flag and an environment variable of the same name (flag > envi
 | `--max-inputs` / `--max-images` | `ANEEMBED_MAX_INPUTS` / `ANEEMBED_MAX_IMAGES` | `2048` / `8` | per request |
 | `--query-concurrency` / `--image-concurrency` / `--long-concurrency` | `ANEEMBED_*_CONCURRENCY` | `8` / `2` / `2` | separate lanes so long documents and images cannot hold short queries back |
 | `--runtime` | `ANEEMBED_RUNTIME` | `coreml` | `fake` runs without a model, for testing integrations |
+| `--selftest` | `ANEEMBED_SELFTEST` | `require` | `skip` serves every function without the [self-test](#self-test): **unsafe**, a miscompiled function returns wrong vectors without an error |
 
 ## Performance
 
@@ -331,11 +336,21 @@ The tokenizer is checked token for token against Hugging Face `tokenizers` on 12
 ## Self-test
 
 The model package ships one golden test per function (`selftest.json` / `selftest.bin`, 16 tests, expectations
-from the original model in fp32), and `aneembed` runs the test of every function it loads before serving. A
-function below the tolerance (cosine 0.999; images also relative error 0.05) is not used: a larger function, a
-shorter text limit or fewer image sizes take its place, the log says so, and `aneembed doctor` lists it. On an M5
-Ultra (macOS 27.0.1) every function scores cosine ≥ 0.99990; the same functions rebuilt with the usual attention
-layout score 0.89–0.96 on the Neural Engine and fail (see [Design](#design)).
+from the original model in fp32), and `aneembed` runs the test of every function it loads before serving. Only a
+function that passes in this run serves (an allowlist): one below the tolerance (cosine 0.999; packing functions
+also unused rows ≤ 0.001, images relative error 0.05; a package may tighten these, not loosen them), one with a
+NaN or infinite output, or one the package has no test for is not used. A larger function, a shorter text limit
+or fewer image sizes take its place, the log gives the limits that remain, `/health` reports `degraded`, and
+`aneembed doctor` lists it (records of functions a smaller `--max-tokens` did not load are kept). On an M5 Ultra
+(macOS 27.0.1) every function scores cosine ≥ 0.99990; the same functions rebuilt with the usual attention layout
+score 0.89–0.96 on the Neural Engine and fail (see [Design](#design)).
+
+A package without readable self-test data, or without a valid `manifest.json` declaring every function this build
+loads, does not load (`doctor` shows why). `--selftest skip` serves every function unchecked; it is meant for
+diagnosing a package, not for use. Each load also checks every file against the manifest's sizes and hashes
+`tokenizer.json`, `selftest.json` and `selftest.bin`, which the self-test cannot judge (it feeds token ids);
+`aneembed models verify` hashes everything and reports whether each compiled model is present and complete
+(a compile is not byte-for-byte reproducible, so its hash is informational).
 
 ## Known pitfalls
 
