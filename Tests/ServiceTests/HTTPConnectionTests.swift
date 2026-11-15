@@ -149,6 +149,20 @@ struct HTTPConnectionTests {
         #expect(transport.sent.isEmpty && transport.isCancelled)
     }
 
+    /// A HEAD response has the GET response's headers (Content-Length included) and no body, so the next
+    /// response on the connection starts where the client expects it.
+    @Test func headResponsesCarryNoBody() async throws {
+        let transport = try await connection { client in
+            client.write("HEAD /health HTTP/1.1\r\n\r\nHEAD /v1/embeddings HTTP/1.1\r\n\r\nHEAD /nope HTTP/1.1\r\n\r\n")
+            client.write("GET /health HTTP/1.1\r\nConnection: close\r\n\r\n")
+        }
+        let (responses, rest) = parseResponses(transport.sent, methods: ["HEAD", "HEAD", "HEAD", "GET"])
+        try #require(responses.map(\.status) == [200, 405, 404, 200])
+        #expect(rest.isEmpty, "bytes after the last response: \(String(decoding: rest, as: UTF8.self))")
+        #expect(responses[0].headers["content-length"] == "15" && responses[0].headers["content-type"] == "application/json")
+        #expect(try JSONValue.parse(responses[3].body) == ["status": "ok"])
+    }
+
     @Test func readerKeepsPipelinedBytes() throws {
         var reader = HTTPRequestReader(maxBody: 100)
         reader.append(Data("POST /a HTTP/1.1\r\nContent-Length: 3\r\n\r\nabcGET /b HTTP/1.1\r\n\r\nGET /c".utf8))

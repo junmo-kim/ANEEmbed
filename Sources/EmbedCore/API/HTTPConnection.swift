@@ -88,7 +88,8 @@ public enum HTTPConnection {
             timer.stop()
             let response = await handler(request)
             let keepAlive = request.keepAlive
-            guard await transport.send(response.serialized(keepAlive: keepAlive)), keepAlive else { return }
+            let bytes = response.serialized(keepAlive: keepAlive, includeBody: request.method != "HEAD")
+            guard await transport.send(bytes), keepAlive else { return }
         }
     }
 }

@@ -135,6 +135,20 @@ for _ in range(3):
     statuses.append(r.status)
 check("keep-alive: three requests on one connection", statuses == [200, 200, 200], statuses)
 
+try:
+    conn = http.client.HTTPConnection(BASE.split("//")[1], timeout=10)
+    conn.request("HEAD", "/health")
+    r = conn.getresponse()
+    head = (r.status, r.getheader("Content-Length"), r.read())
+    conn.request("GET", "/health")
+    r = conn.getresponse()
+    after = (r.status, r.read())
+    conn.close()
+    check("HEAD: GET's headers, no body; the next response on the connection parses",
+          head == (200, "15", b"") and after == (200, b'{"status":"ok"}'), (head, after))
+except (http.client.HTTPException, OSError) as e:
+    check("HEAD: GET's headers, no body; the next response on the connection parses", False, repr(e))
+
 with concurrent.futures.ThreadPoolExecutor(32) as pool:
     statuses = list(pool.map(lambda q: call("/v1/embeddings", {"input": q})[0], batch * 3 + batch[:4]))
 check("64 concurrent requests all 200", statuses.count(200) == 64, statuses.count(200))

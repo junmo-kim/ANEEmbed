@@ -53,5 +53,7 @@ struct HTTPParserTests {
         let response = HTTPResponse.json(200, ["status": "ok"])
         let text = String(decoding: response.serialized(keepAlive: false), as: UTF8.self)
         #expect(text == "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 15\r\nConnection: close\r\n\r\n{\"status\":\"ok\"}")
+        let head = String(decoding: response.serialized(keepAlive: true, includeBody: false), as: UTF8.self)
+        #expect(head == "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 15\r\nConnection: keep-alive\r\n\r\n")
     }
 }

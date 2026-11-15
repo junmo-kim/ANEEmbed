@@ -85,13 +85,16 @@ public struct HTTPResponse: Sendable {
         }
     }
 
-    public func serialized(keepAlive: Bool) -> Data {
+    /// The response on the wire. `includeBody: false` answers a HEAD request: the same headers, Content-Length of
+    /// the body a GET would get included, and no body (RFC 9110 section 9.3.2), so the next response on a kept-alive
+    /// connection starts where the client expects it.
+    public func serialized(keepAlive: Bool, includeBody: Bool = true) -> Data {
         var head = "HTTP/1.1 \(status) \(Self.reason(status))\r\n"
         for (name, value) in headers { head += "\(name): \(value)\r\n" }
         head += "Content-Length: \(body.count)\r\n"
         head += keepAlive ? "Connection: keep-alive\r\n\r\n" : "Connection: close\r\n\r\n"
         var data = Data(head.utf8)
-        data.append(body)
+        if includeBody { data.append(body) }
         return data
     }
 }
