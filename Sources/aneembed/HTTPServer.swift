@@ -9,7 +9,10 @@ final class HTTPServer: @unchecked Sendable {
     let port: Int
     let maxBody: Int
     let router: Router
-    static let idleTimeout: Duration = .seconds(60)
+    /// Waiting for a request and receiving its head (not extended by progress).
+    static let headTimeout: Duration = .seconds(60)
+    /// Longest pause while a body arrives (restarted by every received chunk).
+    static let bodyIdleTimeout: Duration = .seconds(60)
     private var listener: NWListener?
     private let stopped = AsyncStream<Int32>.makeStream()
 
@@ -57,7 +60,7 @@ final class HTTPServer: @unchecked Sendable {
     // MARK: Connections
 
     private func serve(_ connection: NWConnection) async {
-        let limits = HTTPConnectionLimits(maxBody: maxBody, idleTimeout: Self.idleTimeout)
+        let limits = HTTPConnectionLimits(maxBody: maxBody, headTimeout: Self.headTimeout, bodyIdleTimeout: Self.bodyIdleTimeout)
         await HTTPConnection.serve(NetworkTransport(connection), limits: limits) { [router] request in
             await router.handle(request)
         }
