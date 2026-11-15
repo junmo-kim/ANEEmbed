@@ -150,8 +150,11 @@ struct EmbedCommand: Command {
                 index += batch.count
                 batch.removeAll(keepingCapacity: true)
             }
-            for await line in standardInputLines() {
+            let input = LineReader(fileDescriptor: 0, maxLineBytes: config.maxBodyBytes, maxPending: 4)
+            for await item in input.lines {
+                input.release()
                 number += 1
+                let line = try stdinLine(item, number: number, limit: config.maxBodyBytes)
                 if line.allSatisfy({ $0 == 0x20 || $0 == 0x09 }) { continue }
                 batch.append(try parseInputLine(line, number: number))
                 if batch.count == Self.batchSize { try await flush() }
@@ -217,9 +220,11 @@ struct TokenizeCommand: Command {
         func encode(_ text: String) -> [Int32] { tokenizer.encode(type.map { $0.apply(text) } ?? text) }
         if arguments.has("stdin") {
             var number = 0
-            for await line in standardInputLines() {
+            let input = LineReader(fileDescriptor: 0, maxLineBytes: config.maxBodyBytes, maxPending: 4)
+            for await item in input.lines {
+                input.release()
                 number += 1
-                let (text, id) = try parseInputLine(line, number: number)
+                let (text, id) = try parseInputLine(try stdinLine(item, number: number, limit: config.maxBodyBytes), number: number)
                 let ids = encode(text)
                 var record: JSONObject = [:]
                 if let id { record["id"] = id }
@@ -495,18 +500,41 @@ func load(into state: ServerState, config: Config) async {
     }
 }
 
+/// A line of `--stdin` input, or the error for one over `--max-body`.
+func stdinLine(_ item: InputLine, number: Int, limit: Int) throws(ServiceError) -> Data {
+    switch item {
+    case .line(let line): return line
+    case .tooLong(let bytes):
+        throw ServiceError(.payloadTooLarge, "line_too_long", "line \(number) has \(bytes) bytes; the limit is \(limit) (--max-body)",
+                           param: "stdin")
+    }
+}
+
 struct MCPCommand: Command {
     let spec = ArgumentSpec()
+    /// Messages read ahead or being handled at once; stdin is not read further until one finishes.
+    static let maxInFlight = 16
 
     func run(_ arguments: ParsedArguments, config: Config, format: OutputFormat) async throws(ServiceError) -> ExitCode {
         let state = ServerState()
         let loader = Task { await load(into: state, config: config) }
         let handler = MCPHandler(state: state, allowPaths: true, waitForModel: true)
-        await withTaskGroup(of: Void.self) { group in
-            for await line in standardInputLines() where !line.isEmpty {
-                group.addTask {
-                    guard let response = await handler.handle(raw: line) else { return }
-                    Output.write(response.jsonString() + "\n", to: FileHandle.standardOutput)
+        let input = LineReader(fileDescriptor: 0, maxLineBytes: config.maxBodyBytes, maxPending: Self.maxInFlight)
+        await withDiscardingTaskGroup { group in
+            for await item in input.lines {
+                switch item {
+                case .line(let line) where line.isEmpty:
+                    input.release()
+                case .line(let line):
+                    group.addTask {
+                        defer { input.release() }
+                        guard let response = await handler.handle(raw: line) else { return }
+                        Output.write(response.jsonString() + "\n", to: FileHandle.standardOutput)
+                    }
+                case .tooLong(let bytes):
+                    input.release()
+                    let error = MCPHandler.messageTooLarge(bytes: bytes, limit: config.maxBodyBytes)
+                    Output.write(error.jsonString() + "\n", to: FileHandle.standardOutput)
                 }
             }
         }

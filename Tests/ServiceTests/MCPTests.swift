@@ -95,6 +95,12 @@ struct MCPTests {
         }
     }
 
+    @Test func anOverlongStdioMessageIsAnInvalidRequest() {
+        let error = MCPHandler.messageTooLarge(bytes: 2_000_000, limit: 1 << 20)
+        #expect(error["id"] == .null && error["error"]?["code"] == -32600)
+        #expect(error["error"]?["message"]?.stringValue?.contains("1048576") == true)
+    }
+
     @Test func toolCallsWaitForTheModel() async throws {
         let state = ServerState(.loading)
         let handler = MCPHandler(state: state, allowPaths: true, waitForModel: true)

@@ -80,6 +80,22 @@ err = json.loads(responses[4]["result"]["content"][0]["text"])
 assert responses[4]["result"]["isError"] and err["reason"] == "missing_input", err
 PY
 
+# stdio lines are capped at --max-body: an over-long message is answered and skipped, the next one still works.
+python3 -c 'import sys; sys.stdout.write("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\",\"pad\":\"" + "x" * (3 << 19) + "\"}\n{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"ping\"}\n")' \
+  | "$binary" mcp --max-body 1 >"$tmpdir/mcp-long.jsonl" 2>"$tmpdir/mcp-long.err" || fail "mcp with a long line exited nonzero"
+python3 - "$tmpdir/mcp-long.jsonl" <<'PY' || fail "mcp long-line output failed validation"
+import json, sys
+responses = [json.loads(line) for line in open(sys.argv[1])]
+assert len(responses) == 2, responses
+too_long = next(r for r in responses if r["id"] is None)
+assert too_long["error"]["code"] == -32600 and "exceeds the 1048576-byte limit" in too_long["error"]["message"], too_long
+assert any(r["id"] == 2 and r["result"] == {} for r in responses), responses
+PY
+set +e
+printf '%s\n' "$(head -c 1100000 /dev/zero | tr '\0' 'x')" | "$binary" embed --stdin --max-body 1 >/dev/null 2>"$tmpdir/err"; code=$?
+set -e
+[ "$code" -eq 65 ] && grep -q 'line_too_long' "$tmpdir/err" || fail "embed --stdin with a line over --max-body: exit $code"
+
 port=$(python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')
 "$binary" serve --port "$port" 2>"$tmpdir/serve.err" &
 pid=$!

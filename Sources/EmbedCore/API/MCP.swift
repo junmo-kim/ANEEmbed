@@ -71,6 +71,11 @@ public struct MCPHandler: Sendable {
         }
     }
 
+    /// The answer to a stdio message longer than the line limit (it is discarded unread, so its id is unknown).
+    public static func messageTooLarge(bytes: Int, limit: Int) -> JSONValue {
+        error(id: .null, code: -32600, message: "message of \(bytes) bytes exceeds the \(limit)-byte limit (--max-body)")
+    }
+
     static func result(id: JSONValue, _ result: JSONValue) -> JSONValue {
         ["jsonrpc": "2.0", "id": id, "result": result]
     }
