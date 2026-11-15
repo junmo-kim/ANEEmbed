@@ -78,6 +78,27 @@ struct DoctorTests {
         #expect(Self.problems(try Config(flags: ["model-dir": directory.path], environment: [:])).contains { $0.contains("manifest") })
     }
 
+    /// A data directory whose pinned revision holds `modelDirectory()`: a package consistent with its own manifest,
+    /// but not the one pinned in this build.
+    static func replacedPinnedRevision() throws -> (dataDirectory: URL, revision: URL) {
+        let dataDirectory = FileManager.default.temporaryDirectory.appendingPathComponent("aneembed-pinned-\(UUID().uuidString)")
+        let store = ModelStore(dataDirectory: dataDirectory)
+        try FileManager.default.createDirectory(at: store.modelsDirectory, withIntermediateDirectories: true)
+        let revision = store.modelsDirectory.appendingPathComponent(ModelSource.pinned.revision, isDirectory: true)
+        try FileManager.default.moveItem(at: try modelDirectory(), to: revision)
+        return (dataDirectory, revision)
+    }
+
+    @Test func aReplacedPinnedRevisionIsNotReady() throws {
+        let (dataDirectory, revision) = try Self.replacedPinnedRevision()
+        defer { try? FileManager.default.removeItem(at: dataDirectory) }
+        let config = try Config(flags: ["data-dir": dataDirectory.path], environment: [:])
+        #expect(config.modelDirectory.lastPathComponent == ModelSource.pinned.revision)
+        #expect(Self.problems(config).contains { $0.contains("pinned in this build") })
+        // The same files as --model-dir are checked against their own manifest only.
+        #expect(!Self.problems(try Config(flags: ["model-dir": revision.path], environment: [:])).contains { $0.contains("pinned") })
+    }
+
     @Test func fakeRuntimeNeedsNoModel() throws {
         let config = try Config(flags: ["model-dir": "/nonexistent/aneembed", "runtime": "fake"], environment: [:])
         #expect(Doctor.report(config)["problems"] == [])

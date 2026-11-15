@@ -49,9 +49,7 @@ public enum ModelLoader {
         guard let textModel = ModelLayout.model(ModelLayout.textModel, in: directory) else {
             throw ServiceError(.unavailable, "model_missing", "no \(ModelLayout.textModel) model in \(directory.path)")
         }
-        // The manifest is required: it is what the contract and the file checks are read from.
-        let manifest = try Manifest.load(from: directory)
-        try manifest.checkContract()
+        let manifest = try checkPackage(config, log: log)
         // Before any function is loaded: without the package's self-test nothing is checked, so nothing is served.
         let suite: SelfTestSuite?
         if config.skipSelfTest {
@@ -134,5 +132,27 @@ public enum ModelLoader {
         } catch {
             throw ServiceError(.unavailable, "model_load_failed", "\(error)")
         }
+    }
+
+    /// The checks before anything of the package is loaded; returns its manifest. The manifest is required: it is
+    /// what the contract and the file checks are read from. For the data directory's pinned revision it must be the
+    /// manifest pinned in this build.
+    static func checkPackage(_ config: Config, log: (String) -> Void = { _ in }) throws(ServiceError) -> Manifest {
+        let directory = config.modelDirectory
+        let manifest = try Manifest.load(from: directory)
+        try manifest.checkPinned(config.pinnedManifestSHA256)
+        try manifest.checkContract()
+        // Files may have changed since install or `models verify`: sizes of all, hashes of what the self-test cannot see.
+        let checkStarted = Date()
+        let changed = manifest.checkForLoad(in: directory)
+        guard changed.isEmpty else {
+            throw ServiceError(.unavailable, "model_files_changed",
+                               "the model files do not match manifest.json: "
+                               + changed.map { "\($0.path) \($0.issue)" }.joined(separator: ", "),
+                               hint: "run `aneembed models verify`; reinstall with `aneembed models install`")
+        }
+        log(String(format: "model files match the manifest (sizes; sha256 of %@) in %.2fs",
+                   Manifest.hashedAtLoad.joined(separator: ", "), Date().timeIntervalSince(checkStarted)))
+        return manifest
     }
 }

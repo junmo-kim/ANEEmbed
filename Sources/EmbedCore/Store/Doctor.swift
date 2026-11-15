@@ -33,6 +33,9 @@ public enum Doctor {
                     // Informational: another Core ML compiler stamps its version into model.mil.
                     model["compiled_differs_from_packager"] = .array(compiled.map { .string("\($0.path): \($0.issue)") })
                 }
+                do { try manifest.checkPinned(config.pinnedManifestSHA256) } catch {
+                    problems.append(.string(error.message + (error.hint.map { "; \($0)" } ?? "")))
+                }
                 if !issues.isEmpty { problems.append(.string("\(issues.count) model files fail the manifest check")) }
                 do { try manifest.checkContract() } catch { problems.append(.string(error.message)) }
             } catch {

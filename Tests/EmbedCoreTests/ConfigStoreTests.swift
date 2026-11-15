@@ -121,6 +121,22 @@ struct ModelStoreTests {
         #expect(!FileManager.default.fileExists(atPath: store.modelsDirectory.appendingPathComponent("local-x").path))
     }
 
+    /// At load: every source file present with its manifest size, and tokenizer.json and the self-test files
+    /// (which the self-test cannot check itself) hashed. The full hash pass stays in `models verify`.
+    @Test func loadChecksSizesAndTheFilesTheSelfTestCannotSee() throws {
+        let directory = try DoctorTests.modelDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let manifest = try Manifest.load(from: directory)
+        #expect(manifest.checkForLoad(in: directory).isEmpty)
+        try Data("[]".utf8).write(to: directory.appendingPathComponent(ModelLayout.tokenizer))  // same size, other bytes
+        try Data(count: 4).write(to: directory.appendingPathComponent(ModelLayout.tokenTable))
+        #expect(manifest.checkForLoad(in: directory) == [.init(path: ModelLayout.tokenTable, issue: "size_mismatch"),
+                                                         .init(path: ModelLayout.tokenizer, issue: "sha256_mismatch")])
+        var unlisted = manifest
+        unlisted.files.removeAll { $0.path == ModelLayout.tokenizer }
+        #expect(unlisted.checkForLoad(in: directory).contains(.init(path: ModelLayout.tokenizer, issue: "not_in_manifest")))
+    }
+
     /// Two installers never share a staging directory or race on the revision directory: an exclusive lock on
     /// models/.install.lock, a staging directory per process, and an atomic swap into place.
     @Test func installsAreSerializedAndSwappedAtomically() throws {
@@ -301,6 +317,26 @@ struct ModelStoreTests {
         #expect(!state.covers(osBuild: "26A434", maxTokens: 512, binary: "def"))  // another executable compiles again
         #expect(Executable.identity.count == 64)
         #expect(!operatingSystemBuild.isEmpty)
+    }
+
+    /// The data directory's pinned revision loads only with the manifest pinned in this build; another installed
+    /// revision and --model-dir are checked against their own manifest.
+    @Test func thePinnedRevisionLoadsOnlyWithThePinnedManifest() throws {
+        let (dataDirectory, revision) = try DoctorTests.replacedPinnedRevision()
+        defer { try? FileManager.default.removeItem(at: dataDirectory) }
+        let config = try Config(flags: ["data-dir": dataDirectory.path], environment: [:])
+        #expect(config.pinnedManifestSHA256 == ModelSource.pinned.manifestSHA256)
+        let error = #expect(throws: ServiceError.self) { try ModelLoader.checkPackage(config) }
+        #expect(error?.reason == "pinned_manifest_mismatch" && error?.hint?.contains("aneembed models install") == true)
+
+        let explicit = try Config(flags: ["model-dir": revision.path], environment: [:])
+        #expect(explicit.pinnedManifestSHA256 == nil)
+        #expect(throws: Never.self) { try ModelLoader.checkPackage(explicit) }
+        let store = ModelStore(dataDirectory: dataDirectory)
+        try FileManager.default.moveItem(at: revision, to: store.modelsDirectory.appendingPathComponent("local-0123456789ab"))
+        try store.activate(revision: "local-0123456789ab")
+        #expect(config.pinnedManifestSHA256 == nil)
+        #expect(throws: Never.self) { try ModelLoader.checkPackage(config) }
     }
 
     @Test func pinnedSourceIsAPublishedCommit() throws {

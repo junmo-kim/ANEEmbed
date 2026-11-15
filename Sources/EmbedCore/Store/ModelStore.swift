@@ -194,6 +194,16 @@ public struct Manifest: Sendable, Equatable {
         return try parse(data)
     }
 
+    /// Fails unless this is the manifest `pinned` names (nil: any manifest). Cheap: only manifest.json (about 24 KB)
+    /// is hashed, not the files it lists; those are checked against it by `checkForLoad`.
+    public func checkPinned(_ pinned: String?) throws(ServiceError) {
+        guard let pinned, sha256 != pinned.lowercased() else { return }
+        throw ServiceError(.unavailable, "pinned_manifest_mismatch",
+                           "the installed package of the pinned revision is not the one pinned in this build: its "
+                           + "manifest.json has sha256 \(sha256), not \(pinned)",
+                           hint: "reinstall it with `aneembed models install`")
+    }
+
     /// Fails unless the package declares exactly the contract this build implements: every packing bucket and
     /// windowed function the runtime may load, with their slots and window sizes.
     public func checkContract() throws(ServiceError) {
@@ -227,6 +237,38 @@ public struct Manifest: Sendable, Equatable {
                                + "long \(WindowContract.longLengths))",
                                hint: "install the model package this build pins (`aneembed models install`), or update aneembed")
         }
+    }
+
+    /// Files whose bytes the load-time self-test does not exercise: hashed on every load.
+    public static let hashedAtLoad = [ModelLayout.tokenizer, ModelLayout.selfTest, ModelLayout.selfTestData]
+
+    /// The cheap check of every load: each source file present, regular and of its manifest size (the token table,
+    /// the .mlpackage weights), and the files in `hashedAtLoad` hashed. A file the loader needs must be listed.
+    /// `models verify` / `doctor --verify` still hash everything.
+    public func checkForLoad(in directory: URL) -> [Problem] {
+        var problems: [Problem] = []
+        let listed = Set(files.map(\.path))
+        let selfTestFiles = [ModelLayout.selfTest, ModelLayout.selfTestData].filter {
+            FileManager.default.fileExists(atPath: directory.appendingPathComponent($0).path)
+        }
+        for path in [ModelLayout.tokenizer, ModelLayout.tokenTable] + selfTestFiles where !listed.contains(path) {
+            problems.append(Problem(path: path, issue: "not_in_manifest"))
+        }
+        for file in sourceFiles {
+            let url = directory.appendingPathComponent(file.path)
+            guard let size = (try? FileManager.default.attributesOfItem(atPath: url.path))?[.size] as? NSNumber else {
+                problems.append(Problem(path: file.path, issue: "missing"))
+                continue
+            }
+            if !Self.isRegularFile(url) {
+                problems.append(Problem(path: file.path, issue: "not_regular_file"))
+            } else if size.intValue != file.size {
+                problems.append(Problem(path: file.path, issue: "size_mismatch"))
+            } else if Self.hashedAtLoad.contains(file.path), (try? SHA256Hasher.hex(fileAt: url)) != file.sha256 {
+                problems.append(Problem(path: file.path, issue: "sha256_mismatch"))
+            }
+        }
+        return problems
     }
 
     public struct Problem: Sendable, Equatable {

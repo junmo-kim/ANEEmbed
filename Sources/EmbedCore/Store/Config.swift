@@ -111,6 +111,14 @@ public struct Config: Sendable, Equatable {
         return ModelStore(dataDirectory: dataDirectory).currentDirectory
     }
 
+    /// The SHA-256 the model's manifest.json must have: the one pinned in this build when the model is the data
+    /// directory's pinned revision (no --model-dir), so a package replaced there loads only if it is the pinned one.
+    /// nil for --model-dir and other revisions, which are checked against their own manifest only.
+    public var pinnedManifestSHA256: String? {
+        guard string("model-dir").isEmpty, modelDirectory.lastPathComponent == ModelSource.pinned.revision else { return nil }
+        return ModelSource.pinned.manifestSHA256
+    }
+
     public var limits: ServiceLimits {
         var limits = ServiceLimits()
         limits.maxTokens = maxTokens
