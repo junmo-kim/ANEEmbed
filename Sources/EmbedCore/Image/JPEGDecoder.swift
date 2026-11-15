@@ -5,6 +5,13 @@
 // block edges), which moves embeddings by up to ~0.02 cosine, so producer JPEGs are decoded here.
 // Returns nil for anything else (arithmetic coding, 12-bit, lossless, CMYK / YCCK, odd sampling, corrupt data);
 // the caller then falls back to ImageIO.
+//
+// The image is produced row by row (decodeRows), never as a whole. A sequential JPEG whose first scan holds every
+// component, which libjpeg also decodes in a single pass, is entropy-decoded one MCU row at a time into a strip of
+// coefficients, and each MCU row goes through IDCT, upsampling and colour conversion at once. Every other JPEG
+// (progressive, or sequential with a scan per component) needs all coefficients before any pixel, so those are kept
+// (2 bytes per sample) and the pixels are then produced the same way, one MCU row at a time. Upsampling keeps a few
+// sample rows of each component: those of the current MCU row and the rows above it that the fancy upsampler reads.
 import Foundation
 
 public enum JPEGDecoder {
@@ -19,7 +26,25 @@ public enum JPEGDecoder {
         var height = 0
         var blocksPerLine = 0  // MCU-padded block grid
         var blocksPerColumn = 0
-        var coefficients: [Int16] = []
+        /// All blocks, or (single-pass decoding) the blocks of one MCU row; shared, not copied, by copies of the
+        /// Component.
+        var coefficients: Coefficients?
+    }
+
+    /// Coefficients of `blocks` 8 x 8 blocks, zeroed.
+    final class Coefficients {
+        let blocks: Int
+        let values: UnsafeMutablePointer<Int16>
+
+        init(blocks: Int) {
+            self.blocks = blocks
+            values = .allocate(capacity: blocks * 64)
+            clear()
+        }
+
+        func clear() { values.initialize(repeating: 0, count: blocks * 64) }
+
+        deinit { values.deallocate() }
     }
 
     struct Huffman {
@@ -160,14 +185,35 @@ public enum JPEGDecoder {
 
     // MARK: - decode
 
+    /// An error thrown by the row sink, passed on rather than taken for a decode failure.
+    struct SinkError: Error {
+        let error: any Error
+    }
+
+    /// The whole image as interleaved RGB (tests, the fuzzer, ImagePrep.decode); nil when it is not a JPEG this
+    /// decoder handles.
     public static func decode(_ data: Data, maxPixels: Int) -> ([UInt8], Int, Int)? {
-        data.withUnsafeBytes { raw -> ([UInt8], Int, Int)? in
-            try? decode(raw.bindMemory(to: UInt8.self), maxPixels: maxPixels)
+        let collector = RGBCollector()
+        guard (try? decodeRows(data, maxPixels: maxPixels, into: collector)) == true else { return nil }
+        return (collector.rgb, collector.width, collector.height)
+    }
+
+    /// Decodes `data` row by row into `sink`. True once every row has been delivered; false for a file this decoder
+    /// does not handle or that turns out to be corrupt, possibly after some rows. Throws what `sink.start` throws.
+    static func decodeRows(_ data: Data, maxPixels: Int, into sink: some JPEGRowSink) throws -> Bool {
+        try data.withUnsafeBytes { raw in
+            do {
+                return try decode(raw.bindMemory(to: UInt8.self), maxPixels: maxPixels, sink: sink)
+            } catch let failure as SinkError {
+                throw failure.error
+            } catch {
+                return false
+            }
         }
     }
 
-    private static func decode(_ bytes: UnsafeBufferPointer<UInt8>, maxPixels: Int) throws -> ([UInt8], Int, Int)? {
-        guard bytes.count > 4, bytes[0] == 0xFF, bytes[1] == 0xD8 else { return nil }
+    private static func decode(_ bytes: UnsafeBufferPointer<UInt8>, maxPixels: Int, sink: some JPEGRowSink) throws -> Bool {
+        guard bytes.count > 4, bytes[0] == 0xFF, bytes[1] == 0xD8 else { return false }
         var quant = [[Int32]?](repeating: nil, count: 4)
         var dcTables = [Huffman?](repeating: nil, count: 4)
         var acTables = [Huffman?](repeating: nil, count: 4)
@@ -177,6 +223,9 @@ public enum JPEGDecoder {
         var sawJFIF = false, adobeTransform: Int? = nil
         var hmax = 1, vmax = 1, mcusX = 0, mcusY = 0
         var position = 2
+        var scans = 0, rgbInput = false
+        /// Set when the first scan holds every component of a sequential image: rows are produced during that scan.
+        var singlePass: RowAssembler?
 
         func u16(_ p: Int) -> Int { Int(bytes[p]) << 8 | Int(bytes[p + 1]) }
 
@@ -196,18 +245,18 @@ public enum JPEGDecoder {
             position = end
             switch marker {
             case 0xC0, 0xC1, 0xC2:  // SOF0 baseline, SOF1 extended, SOF2 progressive (Huffman)
-                guard components.isEmpty, end - start >= 6, bytes[start] == 8 else { return nil }
+                guard components.isEmpty, end - start >= 6, bytes[start] == 8 else { return false }
                 progressive = marker == 0xC2
                 height = u16(start + 1)
                 width = u16(start + 3)
                 let n = Int(bytes[start + 5])
                 guard width > 0, height > 0, width * height <= maxPixels, n == 1 || n == 3,
                     end - start >= 6 + 3 * n
-                else { return nil }
+                else { return false }
                 for i in 0..<n {
                     let p = start + 6 + 3 * i
                     let h = Int(bytes[p + 1] >> 4), v = Int(bytes[p + 1] & 15), q = Int(bytes[p + 2])
-                    guard (1...4).contains(h), (1...4).contains(v), q < 4 else { return nil }
+                    guard (1...4).contains(h), (1...4).contains(v), q < 4 else { return false }
                     components.append(Component(id: Int(bytes[p]), h: h, v: v, quantTable: q))
                 }
                 hmax = components.map(\.h).max()!
@@ -216,16 +265,15 @@ public enum JPEGDecoder {
                 mcusY = (height + 8 * vmax - 1) / (8 * vmax)
                 for i in components.indices {
                     var c = components[i]
-                    guard hmax % c.h == 0, vmax % c.v == 0 else { return nil }
+                    guard hmax % c.h == 0, vmax % c.v == 0 else { return false }
                     c.width = (width * c.h + hmax - 1) / hmax
                     c.height = (height * c.v + vmax - 1) / vmax
                     c.blocksPerLine = mcusX * c.h
                     c.blocksPerColumn = mcusY * c.v
-                    c.coefficients = [Int16](repeating: 0, count: c.blocksPerLine * c.blocksPerColumn * 64)
                     components[i] = c
                 }
             case 0xC3, 0xC5...0xC7, 0xC9...0xCB, 0xCD...0xCF:
-                return nil  // lossless, hierarchical, arithmetic
+                return false  // lossless, hierarchical, arithmetic
             case 0xC4:  // DHT
                 var p = start
                 while p < end {
@@ -284,31 +332,63 @@ public enum JPEGDecoder {
                     components[index].quant = table
                     components[index].latched = true
                 }
-                position = try decodeScan(bytes: bytes, position: end, components: &components, scan: scan,
+                if scans == 0 {
+                    // Decided at the first scan, as libjpeg does: the colour space from the markers before it, and
+                    // whether the image is decoded in a single pass.
+                    rgbInput = isRGB(components: components, sawJFIF: sawJFIF, adobeTransform: adobeTransform)
+                    if !progressive && scan.count == components.count {
+                        for i in components.indices {
+                            components[i].coefficients = Coefficients(blocks: components[i].blocksPerLine * components[i].v)
+                        }
+                        try startSink(sink, width: width, height: height)
+                        singlePass = RowAssembler(components: components, width: width, height: height, hmax: hmax,
+                                                  vmax: vmax, rgbInput: rgbInput, sink: sink)
+                    } else {
+                        for i in components.indices {
+                            components[i].coefficients = Coefficients(
+                                blocks: components[i].blocksPerLine * components[i].blocksPerColumn)
+                        }
+                    }
+                } else if singlePass != nil {
+                    // libjpeg ends such an image after its one scan; another scan is an error (JERR_EOI_EXPECTED).
+                    throw DecodeError()
+                }
+                scans += 1
+                position = try decodeScan(bytes: bytes, position: end, components: components, scan: scan,
                                           dcTables: dcTables, acTables: acTables, progressive: progressive,
                                           ss: ss, se: se, ah: ah, al: al, restartInterval: restartInterval,
-                                          mcusX: mcusX, mcusY: mcusY)
+                                          mcusX: mcusX, mcusY: mcusY, output: singlePass)
             default:
                 break
             }
         }
-        guard !components.isEmpty, components.allSatisfy(\.latched) else { return nil }
-        let rgbInput: Bool
-        if components.count == 3 {
-            if sawJFIF { rgbInput = false }
-            else if let transform = adobeTransform { rgbInput = transform == 0 }
-            else { rgbInput = components.map(\.id) == [82, 71, 66] }
-        } else {
-            rgbInput = false
-        }
-        return (output(components: &components, width: width, height: height, hmax: hmax, vmax: vmax, rgbInput: rgbInput),
-                width, height)
+        guard !components.isEmpty, components.allSatisfy(\.latched) else { return false }
+        if let singlePass { return singlePass.isComplete }
+        try startSink(sink, width: width, height: height)
+        let rows = RowAssembler(components: components, width: width, height: height, hmax: hmax, vmax: vmax,
+                                rgbInput: rgbInput, sink: sink)
+        for my in 0..<mcusY { rows.add(mcuRow: my, stripped: false) }
+        return rows.isComplete
     }
 
-    private static func decodeScan(bytes: UnsafeBufferPointer<UInt8>, position: Int, components: inout [Component],
+    /// Whether three components hold RGB rather than YCbCr (jdapimin.c default_decompress_parms).
+    static func isRGB(components: [Component], sawJFIF: Bool, adobeTransform: Int?) -> Bool {
+        guard components.count == 3 else { return false }
+        if sawJFIF { return false }
+        if let transform = adobeTransform { return transform == 0 }
+        return components.map(\.id) == [82, 71, 66]
+    }
+
+    static func startSink(_ sink: some JPEGRowSink, width: Int, height: Int) throws {
+        do { try sink.start(width: width, height: height) } catch { throw SinkError(error: error) }
+    }
+
+    /// Decodes one scan into the components' coefficients. With `output` (single-pass decoding), the coefficients
+    /// hold one MCU row, which goes to `output` as soon as it is complete.
+    private static func decodeScan(bytes: UnsafeBufferPointer<UInt8>, position: Int, components: [Component],
                                    scan: [(Int, Int, Int)], dcTables: [Huffman?], acTables: [Huffman?],
                                    progressive: Bool, ss: Int, se: Int, ah: Int, al: Int, restartInterval: Int,
-                                   mcusX: Int, mcusY: Int) throws -> Int {
+                                   mcusX: Int, mcusY: Int, output: RowAssembler?) throws -> Int {
         var reader = BitReader(bytes: bytes, position: position)
         var eobrun = 0
         var predictors = [Int](repeating: 0, count: components.count)  // last_dc_val, reset per scan
@@ -320,9 +400,14 @@ public enum JPEGDecoder {
         let dc = try scan.map { needDC && ah == 0 ? try table(dcTables, $0.1) : nil }
         let ac = try scan.map { needAC && (!progressive || ss > 0) ? try table(acTables, $0.2) : nil }
 
+        let storage = scan.map { components[$0.0].coefficients!.values }
+        /// The block row each component's coefficients start at: 0, or the current MCU row's first.
+        var firstRow = [Int](repeating: 0, count: components.count)
+
         func decodeBlock(_ s: Int, _ offset: Int) throws {
             let ci = scan[s].0
-            try components[ci].coefficients.withUnsafeMutableBufferPointer { coef in
+            let coef = storage[s]
+            do {
                 if !progressive {
                     let t = try reader.decode(dc[s]!)
                     let diff = try reader.received(t)
@@ -416,7 +501,17 @@ public enum JPEGDecoder {
         }
 
         func blockOffset(_ ci: Int, _ row: Int, _ column: Int) -> Int {
-            (row * components[ci].blocksPerLine + column) * 64
+            ((row - firstRow[ci]) * components[ci].blocksPerLine + column) * 64
+        }
+
+        /// Single pass: hands MCU row `my` over and clears the coefficients for the next one.
+        func finishRow(_ my: Int) {
+            guard let output else { return }
+            output.add(mcuRow: my, stripped: true)
+            for (ci, _, _) in scan {
+                components[ci].coefficients!.clear()
+                firstRow[ci] = (my + 1) * components[ci].v
+            }
         }
 
         var unitsLeft = restartInterval
@@ -435,11 +530,13 @@ public enum JPEGDecoder {
             // non-interleaved: the component's own block grid, not padded to MCUs
             let ci = scan[0].0
             let columns = (components[ci].width + 7) / 8, rows = (components[ci].height + 7) / 8
+            let v = components[ci].v
             for row in 0..<rows {
                 for column in 0..<columns {
                     try restartIfNeeded()
                     try decodeBlock(0, blockOffset(ci, row, column))
                 }
+                if row % v == v - 1 || row == rows - 1 { finishRow(row / v) }
             }
         } else {
             // Only the sampling factors: a copy of the Component would share its coefficient array, and decodeBlock's
@@ -457,6 +554,7 @@ public enum JPEGDecoder {
                         }
                     }
                 }
+                finishRow(my)
             }
         }
         // resume marker parsing at the marker that ended the entropy-coded segment
@@ -467,7 +565,7 @@ public enum JPEGDecoder {
         return p
     }
 
-    // MARK: - IDCT, upsampling, colour conversion
+    // MARK: - IDCT
 
     /// jpeg_idct_islow into `plane` (stride `stride`) at (x, y).
     static func idctIslow(_ coef: UnsafeBufferPointer<Int16>, _ offset: Int, _ quant: [Int32],
@@ -549,100 +647,85 @@ public enum JPEGDecoder {
         }
     }
 
-    /// Writes component `c`, upsampled to width x height (jdsample.c with jdmainct.c's replicated edge rows), into
-    /// channel `channel` of the interleaved output. A full-resolution component goes block by block straight into its
-    /// channel; a subsampled one through a plane of its own (a quarter of the image for 4:2:0 chroma).
-    static func write(_ c: Component, into rgb: UnsafeMutableBufferPointer<UInt8>, channel: Int, width: Int, height: Int,
-                      hmax: Int, vmax: Int)
-    {
-        let fh = hmax / c.h, fv = vmax / c.v
-        if fh == 1 && fv == 1 {
-            var block = [UInt8](repeating: 0, count: 64)
-            c.coefficients.withUnsafeBufferPointer { coef in
-                block.withUnsafeMutableBufferPointer { b in
-                    for row in 0..<min(c.blocksPerColumn, (height + 7) / 8) {
-                        let rows = min(8, height - row * 8)
-                        for column in 0..<min(c.blocksPerLine, (width + 7) / 8) {
-                            idctIslow(coef, (row * c.blocksPerLine + column) * 64, c.quant, b, 8, 0, 0)
-                            let columns = min(8, width - column * 8)
-                            for y in 0..<rows {
-                                let base = ((row * 8 + y) * width + column * 8) * 3 + channel
-                                for x in 0..<columns { rgb[base + x * 3] = b[y * 8 + x] }
-                            }
-                        }
-                    }
-                }
-            }
-            return
-        }
-        let stride = c.blocksPerLine * 8
-        var plane = [UInt8](repeating: 0, count: stride * c.blocksPerColumn * 8)
-        c.coefficients.withUnsafeBufferPointer { coef in
-            plane.withUnsafeMutableBufferPointer { out in
-                for row in 0..<c.blocksPerColumn {
-                    for column in 0..<c.blocksPerLine {
-                        idctIslow(coef, (row * c.blocksPerLine + column) * 64, c.quant, out, stride, column * 8, row * 8)
-                    }
-                }
-            }
-        }
-        let w = c.width, h = c.height
-        plane.withUnsafeBufferPointer { plane in
-            func at(_ x: Int, _ y: Int) -> Int { Int(plane[min(max(y, 0), h - 1) * stride + min(max(x, 0), w - 1)]) }
-            func put(_ x: Int, _ y: Int, _ value: Int) { rgb[(y * width + x) * 3 + channel] = UInt8(value) }
-            if fh == 2 && fv == 1 && w > 2 {  // h2v1_fancy_upsample
-                for y in 0..<height {
-                    for x in 0..<width {
-                        let cx = x >> 1, v3 = at(cx, y) * 3
-                        put(x, y, x & 1 == 0 ? (v3 + at(cx - 1, y) + 1) >> 2 : (v3 + at(cx + 1, y) + 2) >> 2)
-                    }
-                }
-            } else if fh == 1 && fv == 2 {  // h1v2_fancy_upsample
-                for y in 0..<height {
-                    let cy = y >> 1
-                    for x in 0..<width {
-                        let v3 = at(x, cy) * 3
-                        put(x, y, y & 1 == 0 ? (v3 + at(x, cy - 1) + 1) >> 2 : (v3 + at(x, cy + 1) + 2) >> 2)
-                    }
-                }
-            } else if fh == 2 && fv == 2 && w > 2 {  // h2v2_fancy_upsample
-                for y in 0..<height {
-                    let cy = y >> 1, ny = y & 1 == 0 ? cy - 1 : cy + 1
-                    for x in 0..<width {
-                        let cx = x >> 1
-                        let this = at(cx, cy) * 3 + at(cx, ny)
-                        if x & 1 == 0 {
-                            put(x, y, (this * 3 + at(cx - 1, cy) * 3 + at(cx - 1, ny) + 8) >> 4)
-                        } else {
-                            put(x, y, (this * 3 + at(cx + 1, cy) * 3 + at(cx + 1, ny) + 7) >> 4)
-                        }
-                    }
-                }
-            } else {  // h2v1_upsample / h2v2_upsample / int_upsample: replication
-                for y in 0..<height { for x in 0..<width { put(x, y, Int(plane[(y / fv) * stride + x / fh])) } }
-            }
-        }
-    }
+    // MARK: - upsampling and colour conversion, row by row
 
-    /// The decoded image as interleaved RGB. Memory at the pixel limit: the coefficients (2 bytes per sample) and
-    /// the output (3 bytes per pixel), plus a subsampled component's own plane; each component's coefficients are
-    /// released once written, and colour conversion runs in place.
-    static func output(components: inout [Component], width: Int, height: Int, hmax: Int, vmax: Int, rgbInput: Bool) -> [UInt8] {
-        let pixels = width * height
-        var rgb = [UInt8](repeating: 0, count: pixels * 3)
-        rgb.withUnsafeMutableBufferPointer { out in
-            for i in components.indices {
-                write(components[i], into: out, channel: i, width: width, height: height, hmax: hmax, vmax: vmax)
-                components[i].coefficients = []
+    /// Turns MCU rows of coefficients into RGB rows: the IDCT writes into a few sample rows per component, from
+    /// which each image row is upsampled (jdsample.c, with jdmainct.c's replicated edge rows), colour-converted
+    /// (jdcolor.c) and handed to the sink as soon as every sample row it reads has been decoded.
+    final class RowAssembler {
+        enum Upsampling { case none, h2v1, h1v2, h2v2, replicate }
+
+        struct Plane {
+            let quant: [Int32]
+            let coefficients: Coefficients
+            let blocksPerLine: Int
+            let v: Int
+            let fh: Int
+            let fv: Int
+            let upsampling: Upsampling
+            /// Component size in samples, and the blocks that cover it (the rest of the MCU padding is never read).
+            let width: Int
+            let height: Int
+            let blockColumns: Int
+            let blockRows: Int
+            /// Sample rows kept: this MCU row's plus at least the two above it that fancy upsampling may still read.
+            let rows: Int
+            let stride: Int
+            let samples: UnsafeMutablePointer<UInt8>
+            /// Sample rows decoded so far.
+            var decoded = 0
+
+            func row(_ y: Int) -> UnsafeMutablePointer<UInt8> { samples + (y % rows) * stride }
+            func clampedRow(_ y: Int) -> UnsafeMutablePointer<UInt8> { row(min(max(y, 0), height - 1)) }
+
+            /// The last sample row that image row `y` reads.
+            func lastRow(for y: Int) -> Int {
+                switch upsampling {
+                case .none, .h2v1: return y
+                case .h1v2, .h2v2: return min(y / 2 + 1, height - 1)
+                case .replicate: return y / fv
+                }
             }
-            if components.count == 1 {
-                for p in 0..<pixels { (out[p * 3 + 1], out[p * 3 + 2]) = (out[p * 3], out[p * 3]) }
-                return
+        }
+
+        let width: Int
+        let height: Int
+        private var planes: [Plane]
+        private let rgbInput: Bool
+        private let sink: any JPEGRowSink
+        private let line: UnsafeMutablePointer<UInt8>
+        private var nextRow = 0
+        // jdcolor.c build_ycc_rgb_table, SCALEBITS 16
+        private var crR = [Int](repeating: 0, count: 256), cbB = [Int](repeating: 0, count: 256)
+        private var crG = [Int](repeating: 0, count: 256), cbG = [Int](repeating: 0, count: 256)
+
+        init(components: [Component], width: Int, height: Int, hmax: Int, vmax: Int, rgbInput: Bool, sink: some JPEGRowSink) {
+            self.width = width
+            self.height = height
+            self.rgbInput = rgbInput
+            self.sink = sink
+            line = .allocate(capacity: width * 3)
+            planes = components.map { c in
+                let fh = hmax / c.h, fv = vmax / c.v
+                let upsampling: Upsampling
+                if fh == 1 && fv == 1 {
+                    upsampling = .none
+                } else if fh == 2 && fv == 1 && c.width > 2 {  // h2v1_fancy_upsample
+                    upsampling = .h2v1
+                } else if fh == 1 && fv == 2 {  // h1v2_fancy_upsample
+                    upsampling = .h1v2
+                } else if fh == 2 && fv == 2 && c.width > 2 {  // h2v2_fancy_upsample
+                    upsampling = .h2v2
+                } else {  // h2v1_upsample / h2v2_upsample / int_upsample: replication
+                    upsampling = .replicate
+                }
+                let stride = c.blocksPerLine * 8, rows = 8 * (c.v + 1)
+                return Plane(quant: c.quant, coefficients: c.coefficients!, blocksPerLine: c.blocksPerLine, v: c.v,
+                             fh: fh, fv: fv, upsampling: upsampling, width: c.width, height: c.height,
+                             blockColumns: (c.width + 7) / 8, blockRows: (c.height + 7) / 8, rows: rows,
+                             stride: stride, samples: .allocate(capacity: stride * rows))
             }
-            if rgbInput { return }
-            // jdcolor.c build_ycc_rgb_table, SCALEBITS 16
             let half = 1 << 15
-            var crR = [Int](repeating: 0, count: 256), cbB = crR, crG = crR, cbG = crR
             for i in 0..<256 {
                 let x = i - 128
                 crR[i] = (91881 * x + half) >> 16
@@ -650,14 +733,121 @@ public enum JPEGDecoder {
                 crG[i] = -46802 * x
                 cbG[i] = -22554 * x + half
             }
-            func clamp(_ v: Int) -> UInt8 { UInt8(min(max(v, 0), 255)) }
-            for p in 0..<pixels {
-                let y = Int(out[p * 3]), cb = Int(out[p * 3 + 1]), cr = Int(out[p * 3 + 2])
-                out[p * 3] = clamp(y + crR[cr])
-                out[p * 3 + 1] = clamp(y + ((cbG[cb] + crG[cr]) >> 16))
-                out[p * 3 + 2] = clamp(y + cbB[cb])
+        }
+
+        deinit {
+            line.deallocate()
+            for plane in planes { plane.samples.deallocate() }
+        }
+
+        /// Every image row has gone to the sink.
+        var isComplete: Bool { nextRow == height }
+
+        /// Decodes MCU row `my` into the sample rows, then hands over every image row that is complete.
+        /// `stripped`: the coefficients hold only this MCU row; otherwise all of them.
+        func add(mcuRow my: Int, stripped: Bool) {
+            for p in planes.indices {
+                let plane = planes[p]
+                let coefficients = UnsafeBufferPointer(start: plane.coefficients.values, count: plane.coefficients.blocks * 64)
+                let samples = UnsafeMutableBufferPointer(start: plane.samples, count: plane.stride * plane.rows)
+                for v in 0..<plane.v {
+                    let blockRow = my * plane.v + v
+                    guard blockRow < plane.blockRows else { break }
+                    let storedRow = stripped ? v : blockRow
+                    for column in 0..<plane.blockColumns {
+                        idctIslow(coefficients, (storedRow * plane.blocksPerLine + column) * 64, plane.quant, samples,
+                                  plane.stride, column * 8, (blockRow * 8) % plane.rows)
+                    }
+                }
+                planes[p].decoded = (my + 1) * plane.v * 8
+            }
+            while nextRow < height, planes.allSatisfy({ $0.lastRow(for: nextRow) < $0.decoded }) {
+                produce(nextRow)
+                sink.row(line)
+                nextRow += 1
             }
         }
-        return rgb
+
+        private func produce(_ y: Int) {
+            for (channel, plane) in planes.enumerated() {
+                let w = plane.width
+                func put(_ x: Int, _ value: Int) { line[x * 3 + channel] = UInt8(truncatingIfNeeded: value) }
+                switch plane.upsampling {
+                case .none:
+                    let row = plane.row(y)
+                    for x in 0..<width { line[x * 3 + channel] = row[x] }
+                case .h2v1:
+                    let row = plane.clampedRow(y)
+                    func at(_ x: Int) -> Int { Int(row[min(max(x, 0), w - 1)]) }
+                    for x in 0..<width {
+                        let cx = x >> 1, v3 = at(cx) * 3
+                        put(x, x & 1 == 0 ? (v3 + at(cx - 1) + 1) >> 2 : (v3 + at(cx + 1) + 2) >> 2)
+                    }
+                case .h1v2:
+                    let cy = y >> 1
+                    let this = plane.clampedRow(cy), other = plane.clampedRow(y & 1 == 0 ? cy - 1 : cy + 1)
+                    for x in 0..<width {
+                        let cx = min(x, w - 1), v3 = Int(this[cx]) * 3
+                        put(x, y & 1 == 0 ? (v3 + Int(other[cx]) + 1) >> 2 : (v3 + Int(other[cx]) + 2) >> 2)
+                    }
+                case .h2v2:
+                    let cy = y >> 1
+                    let this = plane.clampedRow(cy), next = plane.clampedRow(y & 1 == 0 ? cy - 1 : cy + 1)
+                    func at(_ row: UnsafeMutablePointer<UInt8>, _ x: Int) -> Int { Int(row[min(max(x, 0), w - 1)]) }
+                    for x in 0..<width {
+                        let cx = x >> 1
+                        let sum = at(this, cx) * 3 + at(next, cx)
+                        if x & 1 == 0 {
+                            put(x, (sum * 3 + at(this, cx - 1) * 3 + at(next, cx - 1) + 8) >> 4)
+                        } else {
+                            put(x, (sum * 3 + at(this, cx + 1) * 3 + at(next, cx + 1) + 7) >> 4)
+                        }
+                    }
+                case .replicate:
+                    let row = plane.row(y / plane.fv)
+                    for x in 0..<width { line[x * 3 + channel] = row[x / plane.fh] }
+                }
+            }
+            if planes.count == 1 {
+                for x in 0..<width { (line[x * 3 + 1], line[x * 3 + 2]) = (line[x * 3], line[x * 3]) }
+                return
+            }
+            if rgbInput { return }
+            func clamp(_ v: Int) -> UInt8 { UInt8(min(max(v, 0), 255)) }
+            for x in 0..<width {
+                let y = Int(line[x * 3]), cb = Int(line[x * 3 + 1]), cr = Int(line[x * 3 + 2])
+                line[x * 3] = clamp(y + crR[cr])
+                line[x * 3 + 1] = clamp(y + ((cbG[cb] + crG[cr]) >> 16))
+                line[x * 3 + 2] = clamp(y + cbB[cb])
+            }
+        }
+    }
+}
+
+/// Receives a decoded image row by row.
+protocol JPEGRowSink: AnyObject {
+    /// Called once with the image size, before the first row; an error thrown here ends the decode with that error.
+    func start(width: Int, height: Int) throws
+    /// The next row, top to bottom: `width` RGB pixels.
+    func row(_ rgb: UnsafePointer<UInt8>)
+}
+
+/// Collects the rows into one interleaved RGB image.
+final class RGBCollector: JPEGRowSink {
+    private(set) var rgb: [UInt8] = []
+    private(set) var width = 0
+    private(set) var height = 0
+    private var filled = 0
+
+    func start(width: Int, height: Int) {
+        self.width = width
+        self.height = height
+        rgb = [UInt8](repeating: 0, count: width * height * 3)
+    }
+
+    func row(_ row: UnsafePointer<UInt8>) {
+        let bytes = width * 3
+        rgb.withUnsafeMutableBufferPointer { ($0.baseAddress! + filled).update(from: row, count: bytes) }
+        filled += bytes
     }
 }

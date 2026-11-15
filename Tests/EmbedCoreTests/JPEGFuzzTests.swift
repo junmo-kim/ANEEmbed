@@ -78,6 +78,23 @@ struct JPEGFuzzTests {
         #expect(try run(["--peak", file.path, "--max-peak-mib", "0"]).0 == 1)
     }
 
+    /// --progressive writes the same flat image as a progressive JPEG with a single DC scan, which the decoder reads
+    /// like any progressive file (CI measures both kinds at 40 MP).
+    @Test func flatProgressiveJPEGsDecodeToTheSameImage() throws {
+        var decoded: [[UInt8]] = []
+        for options in [[], ["--progressive"]] {
+            let file = FileManager.default.temporaryDirectory.appendingPathComponent("jpeg-fuzz-flat-\(getpid())-\(options.count).jpg")
+            defer { try? FileManager.default.removeItem(at: file) }
+            #expect(try run(["--flat-jpeg", "100x60", "--sampling", "420"] + options + ["--out", file.path]).0 == 0)
+            let data = try Data(contentsOf: file)
+            #expect(data[data.startIndex + 71 ... data.startIndex + 72] == (options.isEmpty ? Data([0xFF, 0xC0]) : Data([0xFF, 0xC2])))
+            let (rgb, width, height) = try #require(JPEGDecoder.decode(data, maxPixels: 100 * 60))
+            #expect(width == 100 && height == 60)
+            decoded.append(rgb)
+        }
+        #expect(decoded[0] == decoded[1])
+    }
+
     /// A decode that does not return ends the tool with a message once --max-seconds have passed, instead of
     /// hanging until the CI job times out (--hang stands in for such a decode).
     @Test(.timeLimit(.minutes(1))) func aDecodeThatNeverReturnsIsCutWithAMessage() throws {

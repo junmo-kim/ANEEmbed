@@ -9,7 +9,8 @@
 //   jpeg-fuzz [--iterations N] [--seed S] [--start I] [--max-pixels P] [--max-seconds T] [--crash-file PATH] CORPUS...
 //   jpeg-fuzz --replay FILE [--max-pixels P]
 //   jpeg-fuzz --write-input I [--seed S] --out FILE CORPUS...
-//   jpeg-fuzz --flat-jpeg WIDTHxHEIGHT [--sampling 444|420] --out FILE   (a few hundred bytes, any pixel count)
+//   jpeg-fuzz --flat-jpeg WIDTHxHEIGHT [--sampling 444|420] [--progressive] --out FILE   (a few hundred bytes,
+//                                               any pixel count)
 //   jpeg-fuzz --peak FILE [--max-peak-mib M] [--max-seconds T]   (ImagePrep.prepare once; prints the peak
 //                                               physical footprint it added, and exits 1 above M)
 //
@@ -34,6 +35,7 @@ var writeInput: Int?
 var outPath: String?
 var flatSize: String?
 var sampling = "444"
+var progressive = false
 var peakPath: String?
 var maxPeakMiB: Int?
 var hang = false
@@ -67,6 +69,7 @@ while let argument = argumentList.popFirst() {
     case "--out": outPath = value()
     case "--flat-jpeg": flatSize = value()
     case "--sampling": sampling = value()
+    case "--progressive": progressive = true
     case "--peak": peakPath = value()
     case "--max-peak-mib": maxPeakMiB = number(Int.self)
     case "--hang": hang = true
@@ -116,17 +119,18 @@ func problem(_ result: ([UInt8], Int, Int)?, maxPixels: Int) -> String? {
 
 // MARK: - memory measurement
 
-/// A baseline YCbCr JPEG of one flat colour: every block is "DC difference 0, end of block", which the decoder
-/// reads from the zero bits after the end of the (empty) scan data. Tiny, and as large as its header says.
-func flatJPEG(width: Int, height: Int, chromaSubsampled: Bool) -> Data {
+/// A YCbCr JPEG of one flat colour: every block is "DC difference 0, end of block", which the decoder reads from
+/// the zero bits after the end of the (empty) scan data. Tiny, and as large as its header says. Baseline, or
+/// progressive with a single DC scan, which makes the decoder keep every coefficient as for any progressive file.
+func flatJPEG(width: Int, height: Int, chromaSubsampled: Bool, progressive: Bool) -> Data {
     var bytes: [UInt8] = [0xFF, 0xD8, 0xFF, 0xDB, 0x00, 0x43, 0x00] + [UInt8](repeating: 1, count: 64)
     let luma: UInt8 = chromaSubsampled ? 0x22 : 0x11
-    bytes += [0xFF, 0xC0, 0x00, 0x11, 0x08, UInt8(height >> 8), UInt8(height & 255), UInt8(width >> 8), UInt8(width & 255),
-              0x03, 0x01, luma, 0x00, 0x02, 0x11, 0x00, 0x03, 0x11, 0x00]
+    bytes += [0xFF, progressive ? 0xC2 : 0xC0, 0x00, 0x11, 0x08, UInt8(height >> 8), UInt8(height & 255),
+              UInt8(width >> 8), UInt8(width & 255), 0x03, 0x01, luma, 0x00, 0x02, 0x11, 0x00, 0x03, 0x11, 0x00]
     let oneCode = [UInt8(1)] + [UInt8](repeating: 0, count: 15)
     bytes += [0xFF, 0xC4, 0x00, 0x14, 0x00] + oneCode + [0x00]  // DC: code 0 -> size 0
     bytes += [0xFF, 0xC4, 0x00, 0x14, 0x10] + oneCode + [0x00]  // AC: code 0 -> end of block
-    bytes += [0xFF, 0xDA, 0x00, 0x0C, 0x03, 0x01, 0x00, 0x02, 0x00, 0x03, 0x00, 0x00, 0x3F, 0x00]
+    bytes += [0xFF, 0xDA, 0x00, 0x0C, 0x03, 0x01, 0x00, 0x02, 0x00, 0x03, 0x00, 0x00, progressive ? 0x00 : 0x3F, 0x00]
     bytes += [0xFF, 0xD9]
     return Data(bytes)
 }
@@ -143,9 +147,9 @@ if let flatSize {
     let parts = flatSize.split(separator: "x").compactMap { Int($0) }
     guard parts.count == 2, (1...65535).contains(parts[0]), (1...65535).contains(parts[1]), ["444", "420"].contains(sampling),
         let outPath
-    else { usage("--flat-jpeg WIDTHxHEIGHT [--sampling 444|420] --out FILE") }
-    guard FileManager.default.createFile(atPath: outPath, contents: flatJPEG(width: parts[0], height: parts[1],
-                                                                               chromaSubsampled: sampling == "420"))
+    else { usage("--flat-jpeg WIDTHxHEIGHT [--sampling 444|420] [--progressive] --out FILE") }
+    let flat = flatJPEG(width: parts[0], height: parts[1], chromaSubsampled: sampling == "420", progressive: progressive)
+    guard FileManager.default.createFile(atPath: outPath, contents: flat)
     else { usage("cannot write \(outPath)") }
     exit(0)
 }

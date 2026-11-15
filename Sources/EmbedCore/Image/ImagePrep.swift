@@ -48,11 +48,9 @@ public enum ImagePrep {
 
     public static func prepare(_ data: Data) throws -> PreparedImage {
         let (source, orientation) = try open(data)
-        if let (rgb, width, height) = JPEGDecoder.decode(data, maxPixels: maxSourcePixels) {
-            let resizer = try resizer(width: width, height: height, orientation: orientation)
-            rgb.withUnsafeBufferPointer { pixels in
-                for y in 0..<height { resizer.push(pixels.baseAddress! + y * width * 3) }
-            }
+        // A JPEG goes from the decoder to the resize row by row; the full-size image never exists.
+        let sink = ResizingSink(orientation: orientation)
+        if try JPEGDecoder.decodeRows(data, maxPixels: maxSourcePixels, into: sink), let resizer = sink.resizer {
             return PreparedImage(rgb: resizer.finish(), width: resizer.width, height: resizer.height)
         }
         let (rgb, width, height) = try imageIODecode(source, orientation: orientation)
@@ -337,4 +335,20 @@ public enum ImagePrep {
         }
         return (out, outWidth, outHeight)
     }
+}
+
+/// Resizes a decoder's rows as they arrive.
+final class ResizingSink: JPEGRowSink {
+    let orientation: Int
+    private(set) var resizer: RowResizer?
+
+    init(orientation: Int) {
+        self.orientation = orientation
+    }
+
+    func start(width: Int, height: Int) throws {
+        resizer = try ImagePrep.resizer(width: width, height: height, orientation: orientation)
+    }
+
+    func row(_ rgb: UnsafePointer<UInt8>) { resizer!.push(rgb) }
 }
