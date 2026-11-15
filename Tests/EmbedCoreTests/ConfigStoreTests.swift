@@ -307,14 +307,15 @@ struct ModelStoreTests {
     @Test func warmStateRoundTrips() throws {
         let directory = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: directory) }
-        let state = WarmState(osBuild: "26A434", binaryVersion: "0.1.0", binary: "abc", maxTokens: 2048, functions: ["embed_64"],
-                              warmedAt: Date(timeIntervalSince1970: 1_800_000_000), seconds: 31.5)
+        let state = WarmState(osBuild: "26A434", binaryVersion: "0.1.0", binary: "abc", manifestSHA256: "m1", maxTokens: 2048,
+                              functions: ["embed_64"], warmedAt: Date(timeIntervalSince1970: 1_800_000_000), seconds: 31.5)
         try state.save(to: directory)
         #expect(WarmState.load(from: directory) == state)
-        #expect(state.covers(osBuild: "26A434", maxTokens: 512, binary: "abc"))
-        #expect(!state.covers(osBuild: "26B1", maxTokens: 512, binary: "abc"))
-        #expect(!state.covers(osBuild: "26A434", maxTokens: 4096, binary: "abc"))
-        #expect(!state.covers(osBuild: "26A434", maxTokens: 512, binary: "def"))  // another executable compiles again
+        #expect(state.covers(osBuild: "26A434", maxTokens: 512, binary: "abc", manifestSHA256: "m1"))
+        #expect(!state.covers(osBuild: "26B1", maxTokens: 512, binary: "abc", manifestSHA256: "m1"))
+        #expect(!state.covers(osBuild: "26A434", maxTokens: 4096, binary: "abc", manifestSHA256: "m1"))
+        #expect(!state.covers(osBuild: "26A434", maxTokens: 512, binary: "def", manifestSHA256: "m1"))  // another executable
+        #expect(!state.covers(osBuild: "26A434", maxTokens: 512, binary: "abc", manifestSHA256: "m2"))  // another package
         #expect(Executable.identity.count == 64)
         #expect(!operatingSystemBuild.isEmpty)
     }

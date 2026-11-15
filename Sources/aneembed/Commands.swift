@@ -315,8 +315,9 @@ struct ModelsCommand: Command {
             throw ServiceError(.unavailable, "warm_failed", "\(error)")
         }
         let seconds = Date().timeIntervalSince(started)
-        let state = WarmState(osBuild: operatingSystemBuild, binaryVersion: aneembedVersion, maxTokens: service.maxTokens,
-                              functions: service.runtime.info.functions, warmedAt: Date(), seconds: (seconds * 10).rounded() / 10)
+        let state = WarmState(osBuild: operatingSystemBuild, binaryVersion: aneembedVersion, manifestSHA256: report.manifestSHA256,
+                              maxTokens: service.maxTokens, functions: service.runtime.info.functions, warmedAt: Date(),
+                              seconds: (seconds * 10).rounded() / 10)
         if !config.useFakeRuntime {
             do { try state.save(to: config.modelDirectory) } catch {
                 Log.info("could not record the warm state: \(error.localizedDescription)")
@@ -458,21 +459,25 @@ func load(into state: ServerState, config: Config) async {
     do throws(ServiceError) {
         let directory = config.modelDirectory
         if !config.useFakeRuntime {
-            if let warm = WarmState.load(from: directory), warm.covers(osBuild: operatingSystemBuild, maxTokens: config.maxTokens) {
+            let manifestSHA256 = (try? Manifest.load(from: directory))?.sha256 ?? ""
+            if let warm = WarmState.load(from: directory),
+                warm.covers(osBuild: operatingSystemBuild, maxTokens: config.maxTokens, manifestSHA256: manifestSHA256)
+            {
                 Log.info("loading \(directory.path) (warm for this macOS build)")
             } else {
-                Log.info("loading \(directory.path): not warmed for this macOS build and max tokens, compiling first (minutes)")
+                Log.info("loading \(directory.path): not warmed for this package, macOS build and max tokens, compiling first (minutes)")
             }
         }
-        let service = try await ModelLoader.makeService(config, log: Log.info)
+        let (service, report) = try await ModelLoader.load(config, log: Log.info)
         do { try await service.runtime.warm() } catch {
             throw ServiceError(.unavailable, "warm_failed", "\(error)")
         }
         if !config.useFakeRuntime,
-            !(WarmState.load(from: directory)?.covers(osBuild: operatingSystemBuild, maxTokens: service.maxTokens) ?? false)
+            !(WarmState.load(from: directory)?.covers(osBuild: operatingSystemBuild, maxTokens: service.maxTokens,
+                                                      manifestSHA256: report.manifestSHA256) ?? false)
         {
-            let warm = WarmState(osBuild: operatingSystemBuild, binaryVersion: aneembedVersion, maxTokens: service.maxTokens,
-                                 functions: service.runtime.info.functions,
+            let warm = WarmState(osBuild: operatingSystemBuild, binaryVersion: aneembedVersion, manifestSHA256: report.manifestSHA256,
+                                 maxTokens: service.maxTokens, functions: service.runtime.info.functions,
                                  warmedAt: Date(), seconds: (Date().timeIntervalSince(started) * 10).rounded() / 10)
             try? warm.save(to: directory)
         }

@@ -61,6 +61,8 @@ public enum Doctor {
         if let warm = WarmState.load(from: directory) {
             if warm.osBuild != operatingSystemBuild {
                 cache = "stale: warmed on macOS build \(warm.osBuild), now \(operatingSystemBuild)"
+            } else if let manifest = try? Manifest.load(from: directory), warm.manifestSHA256 != manifest.sha256 {
+                cache = "stale: warmed for another model package (manifest sha256 \(warm.manifestSHA256.prefix(12))); the next start compiles again"
             } else if warm.binary != Executable.identity {
                 cache = "stale: warmed by another aneembed binary (\(warm.binaryVersion)); the first start compiles again"
             } else if warm.maxTokens < config.maxTokens {

@@ -78,6 +78,22 @@ struct DoctorTests {
         #expect(Self.problems(try Config(flags: ["model-dir": directory.path], environment: [:])).contains { $0.contains("manifest") })
     }
 
+    /// A warm state recorded for another package (same path, replaced files) is stale.
+    @Test func warmStateOfAnotherPackageIsStale() throws {
+        let directory = try Self.modelDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let config = try Config(flags: ["model-dir": directory.path], environment: [:])
+        let manifest = try Manifest.load(from: directory)
+        func warm(_ sha: String) throws {
+            try WarmState(osBuild: operatingSystemBuild, binaryVersion: "x", manifestSHA256: sha, maxTokens: 2048, functions: [],
+                          warmedAt: Date(), seconds: 1).save(to: directory)
+        }
+        try warm(manifest.sha256)
+        #expect(Doctor.report(config)["compile_cache"] == "warm")
+        try warm(String(repeating: "0", count: 64))
+        #expect(Doctor.report(config)["compile_cache"]?.stringValue?.hasPrefix("stale") == true)
+    }
+
     /// A data directory whose pinned revision holds `modelDirectory()`: a package consistent with its own manifest,
     /// but not the one pinned in this build.
     static func replacedPinnedRevision() throws -> (dataDirectory: URL, revision: URL) {

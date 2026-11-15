@@ -8,6 +8,8 @@ import Foundation
 
 public struct LoadReport: Sendable {
     public var functions: [String] = []
+    /// SHA-256 of the loaded package's manifest.json (empty for the fake runtime).
+    public var manifestSHA256 = ""
     public var selfTest: SelfTestReport?
     public var seconds = 0.0
 }
@@ -79,6 +81,7 @@ public enum ModelLoader {
             }
 
             var report = LoadReport()
+            report.manifestSHA256 = manifest.sha256
             let loaded = buckets.functionNames + (long?.functionNames ?? []) + (vision?.functionNames ?? [])
             let loadedImageTokens = vision?.maxTokens ?? 0
             if let suite {

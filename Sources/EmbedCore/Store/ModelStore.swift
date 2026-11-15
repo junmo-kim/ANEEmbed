@@ -338,17 +338,20 @@ public struct WarmState: Sendable, Equatable {
     public var binaryVersion: String
     /// SHA-256 of the executable that warmed (empty in states written before it was recorded).
     public var binary: String
+    /// SHA-256 of the manifest of the package that was warmed (empty in states written before it was recorded).
+    public var manifestSHA256: String
     public var maxTokens: Int
     public var functions: [String]
     public var warmedAt: Date
     public var seconds: Double
 
-    public init(osBuild: String, binaryVersion: String, binary: String = Executable.identity, maxTokens: Int,
-                functions: [String], warmedAt: Date, seconds: Double)
+    public init(osBuild: String, binaryVersion: String, binary: String = Executable.identity, manifestSHA256: String,
+                maxTokens: Int, functions: [String], warmedAt: Date, seconds: Double)
     {
         self.osBuild = osBuild
         self.binaryVersion = binaryVersion
         self.binary = binary
+        self.manifestSHA256 = manifestSHA256
         self.maxTokens = maxTokens
         self.functions = functions
         self.warmedAt = warmedAt
@@ -358,7 +361,7 @@ public struct WarmState: Sendable, Equatable {
     public var json: JSONValue {
         [
             "os_build": .string(osBuild), "binary_version": .string(binaryVersion), "binary_sha256": .string(binary),
-            "max_tokens": .int(maxTokens), "functions": .array(functions.map(JSONValue.string)),
+            "manifest_sha256": .string(manifestSHA256), "max_tokens": .int(maxTokens), "functions": .array(functions.map(JSONValue.string)),
             "warmed_at": .string(ISO8601DateFormatter().string(from: warmedAt)), "seconds": .number(seconds),
         ]
     }
@@ -370,7 +373,8 @@ public struct WarmState: Sendable, Equatable {
         else { return nil }
         return WarmState(
             osBuild: build, binaryVersion: root["binary_version"]?.stringValue ?? "",
-            binary: root["binary_sha256"]?.stringValue ?? "", maxTokens: maxTokens,
+            binary: root["binary_sha256"]?.stringValue ?? "", manifestSHA256: root["manifest_sha256"]?.stringValue ?? "",
+            maxTokens: maxTokens,
             functions: root["functions"]?.arrayValue?.compactMap(\.stringValue) ?? [],
             warmedAt: root["warmed_at"]?.stringValue.flatMap { ISO8601DateFormatter().date(from: $0) } ?? .distantPast,
             seconds: root["seconds"]?.doubleValue ?? 0)
@@ -381,9 +385,9 @@ public struct WarmState: Sendable, Equatable {
                                                   atomically: true, encoding: .utf8)
     }
 
-    /// Fresh when this executable warmed on this OS build for at least `maxTokens`.
-    public func covers(osBuild: String, maxTokens: Int, binary: String = Executable.identity) -> Bool {
-        self.osBuild == osBuild && self.maxTokens >= maxTokens && self.binary == binary
+    /// Fresh when this executable warmed this package on this OS build for at least `maxTokens`.
+    public func covers(osBuild: String, maxTokens: Int, binary: String = Executable.identity, manifestSHA256: String) -> Bool {
+        self.osBuild == osBuild && self.maxTokens >= maxTokens && self.binary == binary && self.manifestSHA256 == manifestSHA256
     }
 }
 
