@@ -43,6 +43,29 @@ struct HTTPParserTests {
         #expect(throws: HTTPParseError.self) { try head(text) }
     }
 
+    /// Framing must not depend on which of two Content-Length (or Transfer-Encoding) headers a proxy in front
+    /// of the server believes; anything ambiguous is a 400 (and the connection closes).
+    @Test(arguments: [
+        "Content-Length: 0\r\nContent-Length: 44", "Content-Length: 44\r\nContent-Length: 0", "Content-Length: 5, 6",
+        "Content-Length: +5", "Content-Length: 0x5", "Content-Length: ", "Content-Length: 99999999999999999999",
+        "Transfer-Encoding: chunked\r\nContent-Length: 5", "Content-Length: 5\r\nTransfer-Encoding: identity",
+        "Transfer-Encoding: chunked\r\nTransfer-Encoding: identity", "Transfer-Encoding: identity",
+        "Transfer-Encoding: gzip, chunked", "Transfer-Encoding: chunked, identity", "Transfer-Encoding: x",
+    ])
+    func rejectsAmbiguousFraming(_ headers: String) {
+        do {
+            let parsed = try head("POST /v1/embeddings HTTP/1.1\r\n\(headers)\r\n\r\n")
+            Issue.record("accepted with Content-Length \(parsed?.contentLength ?? -1)")
+        } catch {
+            #expect(error.status == 400, "\(error)")
+        }
+    }
+
+    @Test func acceptsRepeatedIdenticalContentLengths() throws {
+        #expect(try head("POST / HTTP/1.1\r\nContent-Length: 5\r\ncontent-length: 5\r\n\r\n")?.contentLength == 5)
+        #expect(try head("POST / HTTP/1.1\r\nContent-Length: 5, 5\r\n\r\n")?.contentLength == 5)
+    }
+
     @Test func connectionHandling() throws {
         #expect(try head("GET / HTTP/1.1\r\nConnection: close\r\n\r\n")?.request.keepAlive == false)
         #expect(try head("GET / HTTP/1.0\r\n\r\n")?.request.keepAlive == false)

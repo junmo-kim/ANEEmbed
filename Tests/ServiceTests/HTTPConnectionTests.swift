@@ -163,6 +163,19 @@ struct HTTPConnectionTests {
         #expect(try JSONValue.parse(responses[3].body) == ["status": "ok"])
     }
 
+    /// A CL.CL request whose second length would smuggle a request inside the body gets one 400 and a close.
+    @Test func conflictingContentLengthsCloseTheConnection() async throws {
+        let smuggled = "GET /health HTTP/1.1\r\nHost: x\r\n\r\n"
+        let transport = try await connection { client in
+            client.write("POST /v1/embeddings HTTP/1.1\r\nContent-Length: 0\r\nContent-Length: \(smuggled.utf8.count)\r\n\r\n"
+                         + smuggled)
+            client.closeInput()
+        }
+        let (responses, rest) = parseResponses(transport.sent, methods: ["POST", "GET"])
+        #expect(responses.map(\.status) == [400] && rest.isEmpty)
+        #expect(responses.first?.headers["connection"] == "close" && transport.isCancelled)
+    }
+
     @Test func readerKeepsPipelinedBytes() throws {
         var reader = HTTPRequestReader(maxBody: 100)
         reader.append(Data("POST /a HTTP/1.1\r\nContent-Length: 3\r\n\r\nabcGET /b HTTP/1.1\r\n\r\nGET /c".utf8))

@@ -4,7 +4,7 @@ Face fp32) to also check accuracy.
 
 Usage: python3 -I serve-contract.py http://127.0.0.1:18180 [--reference ref.json] [--min-cosine 0.9999]
 """
-import argparse, base64, concurrent.futures, http.client, json, math, struct, sys, urllib.error, urllib.request, zlib
+import argparse, base64, concurrent.futures, http.client, json, math, socket, struct, sys, urllib.error, urllib.request, zlib
 
 parser = argparse.ArgumentParser()
 parser.add_argument("base")
@@ -148,6 +148,27 @@ try:
           head == (200, "15", b"") and after == (200, b'{"status":"ok"}'), (head, after))
 except (http.client.HTTPException, OSError) as e:
     check("HEAD: GET's headers, no body; the next response on the connection parses", False, repr(e))
+
+def raw_exchange(data, timeout=10):
+    """Sends raw bytes, returns everything the server sends until it closes the connection."""
+    host, port = BASE.split("//")[1].rsplit(":", 1)
+    with socket.create_connection((host, int(port)), timeout=timeout) as sock:
+        sock.sendall(data)
+        received = b""
+        while chunk := sock.recv(65536):
+            received += chunk
+        return received
+
+
+smuggled = b"GET /health HTTP/1.1\r\nHost: x\r\n\r\n"
+for name, headers in [("CL.CL", b"Content-Length: 0\r\nContent-Length: %d\r\n" % len(smuggled)),
+                      ("TE.CL", b"Transfer-Encoding: chunked\r\nContent-Length: %d\r\n" % len(smuggled))]:
+    try:
+        reply = raw_exchange(b"POST /v1/embeddings HTTP/1.1\r\nHost: x\r\n" + headers + b"\r\n" + smuggled)
+        check(f"{name} framing -> one 400, then close", reply.startswith(b"HTTP/1.1 400") and reply.count(b"HTTP/1.1") == 1,
+              reply[:80])
+    except OSError as e:
+        check(f"{name} framing -> one 400, then close", False, repr(e))
 
 with concurrent.futures.ThreadPoolExecutor(32) as pool:
     statuses = list(pool.map(lambda q: call("/v1/embeddings", {"input": q})[0], batch * 3 + batch[:4]))

@@ -1,5 +1,6 @@
 // HTTP/1.1 message parsing and serialization, independent of the socket layer so it can be tested.
-// Requests need Content-Length when they carry a body (chunked uploads are refused with 411).
+// Requests need Content-Length when they carry a body (chunked uploads are refused with 411, ambiguous framing
+// with 400).
 import Foundation
 
 public struct HTTPRequest: Sendable {
@@ -168,12 +169,26 @@ public enum HTTPParser {
         request.path = path
         request.query = query
 
-        if let encoding = request.header("Transfer-Encoding"), encoding.lowercased() != "identity" {
+        // Framing must not depend on which of several headers a proxy in front of the server reads (request
+        // smuggling): Transfer-Encoding with Content-Length, any coding but a lone chunked, and Content-Length
+        // values that differ are refused (RFC 9112 section 6).
+        func values(_ name: String) -> [String] {
+            headers.filter { $0.name.caseInsensitiveCompare(name) == .orderedSame }
+                .flatMap { $0.value.split(separator: ",", omittingEmptySubsequences: false) }
+                .map { $0.trimmingCharacters(in: .whitespaces) }
+        }
+        let codings = values("Transfer-Encoding"), lengths = values("Content-Length")
+        if !codings.isEmpty {
+            guard lengths.isEmpty else { throw .malformed("Transfer-Encoding together with Content-Length") }
+            guard codings.map({ $0.lowercased() }) == ["chunked"] else { throw .malformed("unsupported Transfer-Encoding") }
             throw .lengthRequired
         }
         var length = 0
-        if let raw = request.header("Content-Length") {
-            guard let value = Int(raw), value >= 0 else { throw .malformed("bad Content-Length") }
+        if let first = lengths.first {
+            guard lengths.allSatisfy({ $0 == first }) else { throw .malformed("conflicting Content-Length values") }
+            guard !first.isEmpty, first.utf8.count <= 18, first.utf8.allSatisfy({ (0x30...0x39).contains($0) }),
+                let value = Int(first)
+            else { throw .malformed("bad Content-Length") }
             length = value
         }
         guard length <= maxBody else { throw .bodyTooLarge(maxBody) }
