@@ -77,4 +77,15 @@ struct JPEGFuzzTests {
         #expect(status == 0 && output.contains("canvas"), "\(output)")
         #expect(try run(["--peak", file.path, "--max-peak-mib", "0"]).0 == 1)
     }
+
+    /// A decode that does not return ends the tool with a message once --max-seconds have passed, instead of
+    /// hanging until the CI job times out (--hang stands in for such a decode).
+    @Test(.timeLimit(.minutes(1))) func aDecodeThatNeverReturnsIsCutWithAMessage() throws {
+        let file = FileManager.default.temporaryDirectory.appendingPathComponent("jpeg-fuzz-hang-\(getpid()).jpg")
+        defer { try? FileManager.default.removeItem(at: file) }
+        #expect(try run(["--flat-jpeg", "64x64", "--out", file.path]).0 == 0)
+        let (status, reason, output) = try run(["--peak", file.path, "--max-seconds", "1", "--hang"])
+        #expect(reason == .exit && status == 1, "\(output)")
+        #expect(output.contains("no result after 1.0 s"), "\(output)")
+    }
 }

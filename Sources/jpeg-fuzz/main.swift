@@ -10,11 +10,16 @@
 //   jpeg-fuzz --replay FILE [--max-pixels P]
 //   jpeg-fuzz --write-input I [--seed S] --out FILE CORPUS...
 //   jpeg-fuzz --flat-jpeg WIDTHxHEIGHT [--sampling 444|420] --out FILE   (a few hundred bytes, any pixel count)
-//   jpeg-fuzz --peak FILE [--max-peak-mib M]   (ImagePrep.prepare once; prints the peak physical footprint it
-//                                               added, and exits 1 above M)
+//   jpeg-fuzz --peak FILE [--max-peak-mib M] [--max-seconds T]   (ImagePrep.prepare once; prints the peak
+//                                               physical footprint it added, and exits 1 above M)
+//
+// --max-seconds bounds one decode (default 10 s per fuzz input, 60 s for --peak). A watchdog thread enforces it while
+// the decode runs, so a decode that never finishes fails with a message instead of hanging until a CI timeout.
+// --peak --hang replaces the decode with one that never returns, to test exactly that.
 import Darwin
 import EmbedCore
 import Foundation
+import Synchronization
 
 // MARK: - arguments
 
@@ -22,7 +27,7 @@ var iterations = 20_000
 var seed: UInt64 = 1
 var start = 0
 var maxPixels = 1_000_000
-var maxSeconds = 10.0
+var maxSeconds: Double?
 var crashPath: String?
 var replayPath: String?
 var writeInput: Int?
@@ -31,6 +36,7 @@ var flatSize: String?
 var sampling = "444"
 var peakPath: String?
 var maxPeakMiB: Int?
+var hang = false
 var corpusPaths: [String] = []
 
 func usage(_ message: String) -> Never {
@@ -63,12 +69,39 @@ while let argument = argumentList.popFirst() {
     case "--sampling": sampling = value()
     case "--peak": peakPath = value()
     case "--max-peak-mib": maxPeakMiB = number(Int.self)
+    case "--hang": hang = true
     case "-h", "--help": usage("see the header of Sources/jpeg-fuzz/main.swift")
     default:
         if argument.hasPrefix("--") { usage("unknown option \(argument)") }
         corpusPaths.append(argument)
     }
 }
+
+// MARK: - watchdog
+
+/// Uptime in nanoseconds at which the current decode started; 0 while none runs.
+let decodeStarted = Atomic<UInt64>(0)
+
+/// Checks twice a second whether the current decode has run longer than `limit` seconds; if so, prints `message()`,
+/// runs `onTimeout` and exits 1. `exit` does not wait for the decode, which may never return.
+func startWatchdog(limit: Double, message: @escaping @Sendable () -> String, onTimeout: @escaping @Sendable () -> Void = {}) {
+    let thread = Thread {
+        while true {
+            Thread.sleep(forTimeInterval: 0.5)
+            let started = decodeStarted.load(ordering: .acquiring)
+            guard started != 0 else { continue }
+            if Double(DispatchTime.now().uptimeNanoseconds &- started) / 1e9 > limit {
+                FileHandle.standardError.write(Data((message() + "\n").utf8))
+                onTimeout()
+                exit(1)
+            }
+        }
+    }
+    thread.start()
+}
+
+func decodeBegins() { decodeStarted.store(max(DispatchTime.now().uptimeNanoseconds, 1), ordering: .releasing) }
+func decodeEnds() { decodeStarted.store(0, ordering: .releasing) }
 
 // MARK: - expectations
 
@@ -119,10 +152,15 @@ if let flatSize {
 
 if let peakPath {
     guard let data = FileManager.default.contents(atPath: peakPath) else { usage("cannot read \(peakPath)") }
+    let limit = maxSeconds ?? 60
+    startWatchdog(limit: limit) { "peak \(peakPath): no result after \(limit) s (--max-seconds); giving up" }
     let before = peakFootprint()
     let started = Date()
+    decodeBegins()
+    while hang { Thread.sleep(forTimeInterval: 1) }
     do {
         let image = try ImagePrep.prepare(data)
+        decodeEnds()
         let after = peakFootprint()
         let added = Int((after - before) >> 20)
         print("peak \(peakPath): \(image.width) x \(image.height) canvas; footprint peak \(added) MiB above the "
@@ -352,6 +390,13 @@ for sig in [SIGTRAP, SIGILL, SIGSEGV, SIGBUS, SIGABRT, SIGFPE] { signal(sig, han
 
 // MARK: - run
 
+let inputLimit = maxSeconds ?? 10
+startWatchdog(limit: inputLimit, message: {
+    "jpeg-fuzz: iteration \(currentIteration) is still decoding after \(inputLimit) s (--max-seconds)"
+}, onTimeout: {
+    if crashDescriptor >= 0 { _ = pwrite(crashDescriptor, currentInput, currentLength, 0) }
+})
+
 var decoded = 0, rejected = 0
 var slowest = 0.0, slowestIteration = 0
 let started = Date()
@@ -368,7 +413,9 @@ for iteration in start..<end {
     currentIteration = iteration
 
     let t0 = DispatchTime.now().uptimeNanoseconds
+    decodeBegins()
     let result = JPEGDecoder.decode(Data(bytes), maxPixels: maxPixels)
+    decodeEnds()
     let seconds = Double(DispatchTime.now().uptimeNanoseconds - t0) / 1e9
     if seconds > slowest { (slowest, slowestIteration) = (seconds, iteration) }
     if let failure = problem(result, maxPixels: maxPixels) {
@@ -376,8 +423,8 @@ for iteration in start..<end {
         if let crashPath { FileManager.default.createFile(atPath: crashPath, contents: Data(bytes)) }
         exit(1)
     }
-    if seconds > maxSeconds {
-        FileHandle.standardError.write(Data("jpeg-fuzz: iteration \(iteration) took \(seconds) s (limit \(maxSeconds) s)\n".utf8))
+    if seconds > inputLimit {
+        FileHandle.standardError.write(Data("jpeg-fuzz: iteration \(iteration) took \(seconds) s (limit \(inputLimit) s)\n".utf8))
         if let crashPath { FileManager.default.createFile(atPath: crashPath, contents: Data(bytes)) }
         exit(1)
     }

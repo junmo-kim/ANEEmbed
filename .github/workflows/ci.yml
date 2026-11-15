@@ -55,6 +55,9 @@ jobs:
       # Peak memory of one image decode at the 40 MP limit (README "Memory"): a flat 4:4:4 JPEG of a few hundred
       # bytes that declares 8000 x 5000 pixels. 361 MiB on an M4; 475 MiB before decoding straight into the output.
       - name: Image decode memory at the pixel limit
+        # About 1 s on an M4. A decode that does not finish fails here within minutes (jpeg-fuzz gives up after
+        # 60 s) instead of silently using up the job's 30 minutes.
+        timeout-minutes: 5
         run: |
           BIN="$(swift build -c release --show-bin-path)"
           "$BIN/jpeg-fuzz" --flat-jpeg 8000x5000 --sampling 444 --out "$RUNNER_TEMP/flat-40mp.jpg"
