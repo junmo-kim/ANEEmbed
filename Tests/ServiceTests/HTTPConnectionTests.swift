@@ -310,6 +310,47 @@ struct HTTPConnectionTests {
         #expect(idle.isCancelled && parseResponses(idle.sent, methods: ["GET"]).responses.map(\.status) == [200])
     }
 
+    /// Connections beyond the limit get a 503 and are closed; a slot frees when a connection ends.
+    @Test func connectionsBeyondTheLimitAreRefused() async throws {
+        let limiter = ConnectionLimiter(limit: 2)
+        let limits = HTTPConnectionLimits(maxBody: 1 << 20)
+        func accept(_ transport: MemoryTransport) -> Task<Void, Never> {
+            Task { await HTTPConnection.accept(transport, limiter: limiter, limits: limits) { await Self.router.handle($0) } }
+        }
+        let first = MemoryTransport(), second = MemoryTransport()
+        let held = [accept(first), accept(second)]
+        while limiter.active < 2 { try await Task.sleep(for: .milliseconds(10)) }
+
+        let refused = MemoryTransport()
+        await accept(refused).value
+        let (responses, _) = parseResponses(refused.sent, methods: ["GET"])
+        #expect(responses.map(\.status) == [503] && refused.isCancelled)
+        #expect(responses.first?.headers["retry-after"] == "1" && responses.first?.headers["connection"] == "close")
+        #expect(try JSONValue.parse(try #require(responses.first).body)["error"]?["code"] == "too_many_connections")
+
+        first.closeInput()
+        await held[0].value
+        #expect(limiter.active == 1)
+        let next = MemoryTransport()
+        next.write("GET /health HTTP/1.1\r\nConnection: close\r\n\r\n")
+        await accept(next).value
+        #expect(parseResponses(next.sent, methods: ["GET"]).responses.map(\.status) == [200])
+        second.closeInput()
+        await held[1].value
+        #expect(limiter.active == 0)
+    }
+
+    /// A body is handed over without a copy, and nothing of a finished request stays buffered.
+    @Test func readerReleasesWhatItReturned() throws {
+        var reader = HTTPRequestReader(maxBody: 1 << 20)
+        let body = Data(repeating: 7, count: 300_000)
+        reader.append(Data("POST /a HTTP/1.1\r\nContent-Length: \(body.count)\r\n\r\n".utf8) + body.prefix(1000))
+        #expect(try reader.next() == nil && reader.isReadingBody)
+        reader.append(body.dropFirst(1000))
+        #expect(try reader.next()?.body == body)
+        #expect(reader.bufferedBytes == 0 && !reader.isReadingBody)
+    }
+
     @Test func readerKeepsPipelinedBytes() throws {
         var reader = HTTPRequestReader(maxBody: 100)
         reader.append(Data("POST /a HTTP/1.1\r\nContent-Length: 3\r\n\r\nabcGET /b HTTP/1.1\r\n\r\nGET /c".utf8))

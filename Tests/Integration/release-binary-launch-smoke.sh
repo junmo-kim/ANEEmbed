@@ -90,4 +90,33 @@ done
 curl -sf "http://127.0.0.1:$port/health" | grep -q '"ok"' || { cat "$tmpdir/serve.err" >&2; fail "serve did not become healthy"; }
 python3 "$(dirname "${BASH_SOURCE[0]}")/serve-contract.py" "http://127.0.0.1:$port" || fail "serve contract"
 kill "$pid"; wait "$pid" 2>/dev/null || true; pid=""
+
+# Connections beyond --max-connections are answered 503 and closed; a freed slot serves again.
+"$binary" serve --port "$port" --max-connections 2 2>"$tmpdir/serve2.err" &
+pid=$!
+for _ in $(seq 1 100); do
+  curl -sf "http://127.0.0.1:$port/health" >/dev/null 2>&1 && break
+  sleep 0.1
+done
+python3 - "$port" <<'PY' || { cat "$tmpdir/serve2.err" >&2; fail "connection limit"; }
+import socket, sys, time
+port = int(sys.argv[1])
+held = [socket.create_connection(("127.0.0.1", port), timeout=10) for _ in range(2)]
+time.sleep(0.5)
+with socket.create_connection(("127.0.0.1", port), timeout=10) as extra:
+    reply = b""
+    while chunk := extra.recv(65536):
+        reply += chunk
+assert reply.startswith(b"HTTP/1.1 503") and b"too_many_connections" in reply, reply[:120]
+held.pop().close()
+time.sleep(0.5)
+with socket.create_connection(("127.0.0.1", port), timeout=10) as again:
+    again.sendall(b"GET /health HTTP/1.1\r\nConnection: close\r\n\r\n")
+    reply = b""
+    while chunk := again.recv(65536):
+        reply += chunk
+assert reply.startswith(b"HTTP/1.1 200"), reply[:120]
+print("PASS connection limit: 503 beyond --max-connections, served again after one closed")
+PY
+kill "$pid"; wait "$pid" 2>/dev/null || true; pid=""
 echo "release binary smoke test passed"

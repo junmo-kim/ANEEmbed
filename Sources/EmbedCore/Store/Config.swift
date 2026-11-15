@@ -33,6 +33,8 @@ public struct Config: Sendable, Equatable {
         Option(name: "model-name", help: "model id reported by the API", defaultValue: { "embeddinggemma-2" },
                validate: { $0.isEmpty ? "must not be empty" : nil }),
         Option(name: "max-body", help: "request body limit in MiB", defaultValue: { "72" }, validate: integer(1...1024)),
+        Option(name: "max-connections", help: "open HTTP connections; more are answered 503 and closed",
+               defaultValue: { "64" }, validate: integer(1...4096)),
         Option(name: "max-inputs", help: "texts per request", defaultValue: { "2048" }, validate: integer(1...100_000)),
         Option(name: "max-images", help: "images per request", defaultValue: { "8" }, validate: integer(1...64)),
         Option(name: "query-concurrency", help: "concurrent query-lane batches (texts <= 512 tokens)",
@@ -100,6 +102,7 @@ public struct Config: Sendable, Equatable {
     public var maxTokens: Int { int("max-tokens") }
     public var modelName: String { string("model-name") }
     public var maxBodyBytes: Int { int("max-body") << 20 }
+    public var maxConnections: Int { int("max-connections") }
     public var useFakeRuntime: Bool { string("runtime") == "fake" }
     /// `--selftest skip`: load without the package's self-test and serve every function unchecked (unsafe).
     public var skipSelfTest: Bool { string("selftest") == "skip" }

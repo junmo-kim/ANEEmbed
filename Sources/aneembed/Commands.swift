@@ -448,7 +448,7 @@ struct ServeCommand: Command {
     func run(_ arguments: ParsedArguments, config: Config, format: OutputFormat) async throws(ServiceError) -> ExitCode {
         let state = ServerState()
         let server = HTTPServer(host: config.host, port: config.port, maxBody: config.maxBodyBytes,
-                                router: Router(state: state, modelName: config.modelName))
+                                maxConnections: config.maxConnections, router: Router(state: state, modelName: config.modelName))
         try server.start()
         if !["127.0.0.1", "::1", "localhost"].contains(config.host) {
             Log.info("warning: listening on \(config.host) without authentication; anyone who can reach this port can use it")

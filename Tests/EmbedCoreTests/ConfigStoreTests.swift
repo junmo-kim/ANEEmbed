@@ -28,6 +28,12 @@ struct ConfigTests {
         #expect(throws: ServiceError.self) { try Config(flags: ["port": "x"], environment: [:]) }
         #expect(throws: ServiceError.self) { try Config(flags: ["nope": "1"], environment: [:]) }
         #expect(throws: ServiceError.self) { try Config(environment: ["ANEEMBED_RUNTIME": "gpu"]) }
+        #expect(throws: ServiceError.self) { try Config(flags: ["max-connections": "0"], environment: [:]) }
+    }
+
+    @Test func connectionLimit() throws {
+        #expect(try Config(environment: [:]).maxConnections == 64)
+        #expect(try Config(environment: ["ANEEMBED_MAX_CONNECTIONS": "8"]).maxConnections == 8)
     }
 
     @Test func modelDirectoryFollowsTheDataDirectory() throws {

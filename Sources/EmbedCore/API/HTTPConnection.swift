@@ -66,15 +66,67 @@ public struct HTTPRequestReader: Sendable {
         }
         guard let current = head, buffer.count >= current.headLength + current.contentLength else { return nil }
         var request = current.request
-        let end = buffer.startIndex + current.headLength + current.contentLength
-        request.body = Data(buffer[(buffer.startIndex + current.headLength)..<end])
-        buffer = Data(buffer[end...])  // rebase indices
+        let end = current.headLength + current.contentLength
+        if buffer.count == end {
+            // The usual case: hand the buffer over as the body (no copy of up to --max-body bytes) and keep nothing.
+            var whole = buffer
+            buffer = Data()
+            whole.removeSubrange(whole.startIndex..<(whole.startIndex + current.headLength))
+            request.body = whole
+        } else {  // pipelined bytes follow
+            request.body = buffer.subdata(in: (buffer.startIndex + current.headLength)..<(buffer.startIndex + end))
+            buffer = buffer.subdata(in: (buffer.startIndex + end)..<buffer.endIndex)
+        }
         head = nil
         return request
     }
 }
 
+/// Counts open connections against a limit.
+public final class ConnectionLimiter: @unchecked Sendable {
+    public let limit: Int
+    private let lock = NSLock()
+    private var count = 0
+
+    public init(limit: Int) {
+        self.limit = limit
+    }
+
+    public var active: Int { lock.withLock { count } }
+
+    /// Takes a slot; false when all `limit` slots are taken.
+    public func tryAcquire() -> Bool {
+        lock.withLock {
+            guard count < limit else { return false }
+            count += 1
+            return true
+        }
+    }
+
+    public func release() {
+        lock.withLock { count -= 1 }
+    }
+}
+
 public enum HTTPConnection {
+    /// Serves `transport` while fewer than `limiter.limit` connections are open; beyond that answers
+    /// `503 too_many_connections` (Retry-After: 1) and closes, so open connections and their buffers stay bounded.
+    public static func accept(_ transport: some HTTPTransport, limiter: ConnectionLimiter, limits: HTTPConnectionLimits,
+                              handler: @Sendable (HTTPRequest) async -> HTTPResponse) async
+    {
+        guard limiter.tryAcquire() else {
+            var response = HTTPResponse.openAIError(
+                ServiceError(.unavailable, "too_many_connections",
+                             "the server has \(limiter.limit) open connections, its limit; retry shortly"))
+            response.headers.append(("Retry-After", "1"))
+            _ = await transport.send(response.serialized(keepAlive: false))
+            transport.cancel()
+            return
+        }
+        defer { limiter.release() }
+        await serve(transport, limits: limits, handler: handler)
+    }
+
     /// Serves requests on `transport` until the peer closes, a request asks to close, or a limit is hit.
     /// `sleep` waits out a timeout; tests pass a clock they advance by hand.
     public static func serve(_ transport: some HTTPTransport, limits: HTTPConnectionLimits,
