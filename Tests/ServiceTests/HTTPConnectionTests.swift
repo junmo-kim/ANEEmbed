@@ -176,6 +176,19 @@ struct HTTPConnectionTests {
         #expect(responses.first?.headers["connection"] == "close" && transport.isCancelled)
     }
 
+    /// A head that arrives one byte at a time is searched for its end in linear, not quadratic, time.
+    @Test func headSearchResumesWhereItStopped() throws {
+        var reader = HTTPRequestReader(maxBody: 10)
+        let head = "GET /health HTTP/1.1\r\nX-Pad: " + String(repeating: "a", count: 32_000) + "\r\n\r\n"
+        var requests: [HTTPRequest] = []
+        for byte in head.utf8 {
+            reader.append(Data([byte]))
+            if let request = try reader.next() { requests.append(request) }
+        }
+        #expect(requests.count == 1 && requests.first?.path == "/health")
+        #expect(reader.searchedBytes < 5 * head.utf8.count, "searched \(reader.searchedBytes) bytes for a \(head.utf8.count)-byte head")
+    }
+
     @Test func readerKeepsPipelinedBytes() throws {
         var reader = HTTPRequestReader(maxBody: 100)
         reader.append(Data("POST /a HTTP/1.1\r\nContent-Length: 3\r\n\r\nabcGET /b HTTP/1.1\r\n\r\nGET /c".utf8))

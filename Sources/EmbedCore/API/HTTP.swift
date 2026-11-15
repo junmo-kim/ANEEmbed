@@ -136,9 +136,11 @@ public struct HTTPHead: Sendable {
 public enum HTTPParser {
     public static let maxHeadBytes = 64 << 10
 
-    /// Parses the head once `buffer` holds it; nil while more bytes are needed.
-    public static func parseHead(_ buffer: Data, maxBody: Int) throws(HTTPParseError) -> HTTPHead? {
-        guard let end = buffer.range(of: Data("\r\n\r\n".utf8)) else {
+    /// Parses the head once `buffer` holds it; nil while more bytes are needed. The blank line that ends the head
+    /// is searched from `scanFrom` (bytes before it were searched by an earlier call).
+    public static func parseHead(_ buffer: Data, maxBody: Int, scanFrom: Int = 0) throws(HTTPParseError) -> HTTPHead? {
+        let from = buffer.startIndex + min(max(scanFrom, 0), buffer.count)
+        guard let end = buffer.range(of: Data("\r\n\r\n".utf8), in: from..<buffer.endIndex) else {
             if buffer.count > maxHeadBytes { throw .headerTooLarge }
             return nil
         }

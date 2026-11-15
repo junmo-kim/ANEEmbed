@@ -29,6 +29,10 @@ public struct HTTPRequestReader: Sendable {
     public let maxBody: Int
     private var buffer = Data()
     private var head: HTTPHead?
+    /// Bytes of `buffer` already searched for the end of the head (minus 3, for a terminator split across reads).
+    private var scanned = 0
+    /// Total bytes searched for heads (the cost of slow, byte-by-byte heads stays linear).
+    private(set) var searchedBytes = 0
 
     public init(maxBody: Int) {
         self.maxBody = maxBody
@@ -44,8 +48,13 @@ public struct HTTPRequestReader: Sendable {
     /// The next complete request; nil while more bytes are needed.
     public mutating func next() throws(HTTPParseError) -> HTTPRequest? {
         if head == nil {
-            guard let parsed = try HTTPParser.parseHead(buffer, maxBody: maxBody) else { return nil }
+            searchedBytes += buffer.count - scanned
+            guard let parsed = try HTTPParser.parseHead(buffer, maxBody: maxBody, scanFrom: scanned) else {
+                scanned = max(buffer.count - 3, 0)
+                return nil
+            }
             head = parsed
+            scanned = 0
         }
         guard let current = head, buffer.count >= current.headLength + current.contentLength else { return nil }
         var request = current.request
