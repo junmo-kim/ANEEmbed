@@ -231,6 +231,25 @@ struct ModelStoreTests {
                                       finished: false) != nil)
     }
 
+    /// `models verify` covers the compiled models too: present and complete, or a problem. Their bytes differ between
+    /// Core ML compilers, so a hash difference is reported, not failed.
+    @Test func compiledModelsAreReportedByPresenceAndCompleteness() throws {
+        let directory = try DoctorTests.modelDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let manifest = try Manifest.load(from: directory)
+        var status = manifest.compiledStatus(in: directory)
+        #expect(status.map(\.package) == ["EmbeddingGemma2Text"] && status[0].problem && status[0].status.hasPrefix("not compiled"))
+        let compiled = directory.appendingPathComponent("EmbeddingGemma2Text.mlmodelc")
+        try FileManager.default.createDirectory(at: compiled.appendingPathComponent("weights"), withIntermediateDirectories: true)
+        try Data("program".utf8).write(to: compiled.appendingPathComponent("model.mil"))
+        status = manifest.compiledStatus(in: directory)
+        #expect(status[0].problem && status[0].status.hasPrefix("incomplete"))
+        try Data("x".utf8).write(to: compiled.appendingPathComponent("coremldata.bin"))
+        try Data("w".utf8).write(to: compiled.appendingPathComponent("weights/weight.bin"))
+        status = manifest.compiledStatus(in: directory)
+        #expect(!status[0].problem && status[0].status.hasPrefix("compiled"))
+    }
+
     @Test func readsThePackageManifest() throws {
         let manifest: JSONValue = [
             "name": "embeddinggemma-2-ane", "manifest_version": 2, "created": "2026-11-15",

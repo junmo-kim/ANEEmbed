@@ -239,6 +239,43 @@ public struct Manifest: Sendable, Equatable {
         }
     }
 
+    /// Files every compiled model (`.mlmodelc`) has; one missing or empty means an interrupted or damaged compile.
+    public static let compiledCoreFiles = ["model.mil", "coremldata.bin", "weights/weight.bin"]
+
+    /// State of each compiled model whose package is present or listed: compiled (and whether it matches the
+    /// packager's compile, informational), not compiled, or incomplete. `problem` is true for the last two.
+    /// A compile is not byte-for-byte reproducible across Core ML compilers, so its SHA-256 is not a check;
+    /// the load-time self-test is what decides whether it computes correctly.
+    /// `hash` compares the compiled files with the packager's (informational; reads every compiled file).
+    public func compiledStatus(in directory: URL, hash: Bool = false) -> [(package: String, status: String, problem: Bool)] {
+        let compiledOnly = Manifest(model: model, revision: revision, created: created,
+                                    files: files.filter { ModelLayout.isCompiled($0.path) }, sha256: sha256, buckets: buckets,
+                                    window: window, legacyLongPath: legacyLongPath)
+        let differing = Set(compiledOnly.verifyAll(in: directory, hash: hash).compiled.map { String($0.path.split(separator: "/")[0]) })
+        return ModelLayout.packages.compactMap { name in
+            let compiledName = name + ".mlmodelc"
+            let listed = files.contains { $0.path.hasPrefix(name + ".mlpackage/") || $0.path.hasPrefix(compiledName + "/") }
+            let compiled = directory.appendingPathComponent(compiledName)
+            guard listed || FileManager.default.fileExists(atPath: compiled.path) else { return nil }
+            guard FileManager.default.fileExists(atPath: compiled.path) else {
+                return (name, "not compiled: run `aneembed models warm`", true)
+            }
+            let damaged = Self.compiledCoreFiles.filter { file in
+                let url = compiled.appendingPathComponent(file)
+                let size = ((try? FileManager.default.attributesOfItem(atPath: url.path))?[.size] as? NSNumber)?.intValue ?? 0
+                return !Self.isRegularFile(url) || size == 0
+            }
+            guard damaged.isEmpty else {
+                return (name, "incomplete: \(damaged.joined(separator: ", ")) missing or empty; reinstall, or remove "
+                    + "\(compiledName) and run `aneembed models warm`", true)
+            }
+            guard hash else { return (name, "compiled", false) }
+            return (name, differing.contains(compiledName)
+                ? "compiled; differs from the packager's compile (expected with another Core ML compiler)"
+                : "compiled; matches the packager's compile", false)
+        }
+    }
+
     /// Files whose bytes the load-time self-test does not exercise: hashed on every load.
     public static let hashedAtLoad = [ModelLayout.tokenizer, ModelLayout.selfTest, ModelLayout.selfTestData]
 

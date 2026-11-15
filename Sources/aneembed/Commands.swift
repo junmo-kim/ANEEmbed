@@ -299,11 +299,16 @@ struct ModelsCommand: Command {
         let directory = config.modelDirectory
         let manifest = try Manifest.load(from: directory)
         let problems = manifest.verify(in: directory, hash: true) { Log.info("hashing \($0)") }
+        let compiled = manifest.compiledStatus(in: directory, hash: true)
+        let ok = problems.isEmpty && !compiled.contains(where: \.problem)
         Output.data([
             "model_dir": .string(directory.path), "revision": .string(manifest.revision), "files": .int(manifest.files.count),
-            "ok": .bool(problems.isEmpty), "problems": .array(problems.map { ["path": .string($0.path), "issue": .string($0.issue)] }),
+            "ok": .bool(ok), "problems": .array(problems.map { ["path": .string($0.path), "issue": .string($0.issue)] }),
+            "compiled": .object(JSONObject(compiled.map { (key: $0.package + ".mlmodelc", value: .string($0.status)) })),
+            "compiled_note": .string("compiled models are built on this Mac and are not byte-for-byte reproducible, so "
+                + "their SHA-256 is not checked; the load-time self-test checks what they compute"),
         ], format: format)
-        return problems.isEmpty ? .success : .dataError
+        return ok ? .success : .dataError
     }
 
     /// Loads (compiling on first use) and self-tests every function; records the warm state.

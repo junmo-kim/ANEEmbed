@@ -37,6 +37,9 @@ public enum Doctor {
                     problems.append(.string(error.message + (error.hint.map { "; \($0)" } ?? "")))
                 }
                 if !issues.isEmpty { problems.append(.string("\(issues.count) model files fail the manifest check")) }
+                for item in manifest.compiledStatus(in: directory) where item.status.hasPrefix("incomplete") {
+                    problems.append(.string("\(item.package).mlmodelc is \(item.status)"))
+                }
                 do { try manifest.checkContract() } catch { problems.append(.string(error.message)) }
             } catch {
                 model["manifest"] = .string(error.reason == "manifest_missing" ? "missing" : "invalid")
