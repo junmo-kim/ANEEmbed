@@ -74,6 +74,8 @@ final class MemoryTransport: HTTPTransport, @unchecked Sendable {
 
     var sent: Data { lock.withLock { output } }
     var isCancelled: Bool { lock.withLock { cancelled } }
+    /// Chunks the client wrote that the server has not received yet.
+    var pendingChunks: Int { lock.withLock { incoming.count } }
 }
 
 /// A clock the test advances by hand, so timeout tests do not depend on how fast the machine schedules tasks.
@@ -87,6 +89,8 @@ final class ManualClock: @unchecked Sendable {
 
     /// Sleeps armed so far (waiting for their deadline, woken or cancelled).
     var armed: Int { lock.withLock { armedCount } }
+    /// Sleeps waiting for their deadline now.
+    var sleeping: Int { lock.withLock { sleepers.count } }
 
     func sleep(for duration: Duration) async throws {
         let id = lock.withLock { () -> Int in

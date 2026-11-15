@@ -10,6 +10,8 @@ final class HTTPServer: @unchecked Sendable {
     let maxBody: Int
     let router: Router
     let connections: ConnectionLimiter
+    /// Large request bodies buffered at once, across connections: one of --max-body.
+    let bodies: BodyBudget
     /// Waiting for a request and receiving its head (not extended by progress).
     static let headTimeout: Duration = .seconds(60)
     /// Longest pause while a body arrives (restarted by every received chunk).
@@ -23,6 +25,7 @@ final class HTTPServer: @unchecked Sendable {
         self.maxBody = maxBody
         self.router = router
         connections = ConnectionLimiter(limit: maxConnections)
+        bodies = BodyBudget(capacity: maxBody)
     }
 
     func start() throws(ServiceError) {
@@ -63,8 +66,9 @@ final class HTTPServer: @unchecked Sendable {
 
     private func serve(_ connection: NWConnection) async {
         let limits = HTTPConnectionLimits(maxBody: maxBody, headTimeout: Self.headTimeout, bodyIdleTimeout: Self.bodyIdleTimeout)
-        await HTTPConnection.accept(NetworkTransport(connection), limiter: connections, limits: limits) { [router] request in
-            await router.handle(request)
+        await HTTPConnection.accept(NetworkTransport(connection), limiter: connections, budget: bodies,
+                                    limits: limits) { [router] request in
+            await router.handle(consume request)  // without `consume` the closure would keep the body to the end
         }
     }
 }

@@ -63,13 +63,28 @@ public struct HTTPRequestReader: Sendable {
         if taken < data.count { buffer.append(data[(data.startIndex + taken)...]) }
     }
 
-    /// The next complete request; nil while more bytes are needed.
+    /// Parses the head once it has arrived. Returns the Content-Length of a body that is not admitted yet: the caller
+    /// decides when its bytes may be read (`admitBody`) and reads none meanwhile.
+    public mutating func bodyAwaitingAdmission() throws(HTTPParseError) -> Int? {
+        try parseHead()
+        guard let head, head.contentLength > 0, body == nil else { return nil }
+        return head.contentLength
+    }
+
+    /// Admits the pending body: its buffer is allocated now and holds `reservation` until its bytes are freed.
+    public mutating func admitBody(_ reservation: BodyReservation?) {
+        guard let head, head.contentLength > 0, body == nil else { return }
+        startBody(head, reservation: reservation)
+    }
+
+    /// The next complete request; nil while more bytes are needed. A body not admitted yet is admitted without a
+    /// reservation.
     public mutating func next() throws(HTTPParseError) -> HTTPRequest? {
         try parseHead()
         guard let current = head else { return nil }
         var request = current.request
         if current.contentLength > 0 {
-            if body == nil { startBody(current) }
+            if body == nil { startBody(current, reservation: nil) }
             guard let body, body.isFull else { return nil }
             request.body = body.handOver()
             self.body = nil
@@ -94,8 +109,8 @@ public struct HTTPRequestReader: Sendable {
     }
 
     /// Allocates the body and moves the body bytes that arrived with the head into it; what follows them stays.
-    private mutating func startBody(_ current: HTTPHead) {
-        let body = BodyBuffer(count: current.contentLength)
+    private mutating func startBody(_ current: HTTPHead, reservation: BodyReservation?) {
+        let body = BodyBuffer(count: current.contentLength, reservation: reservation)
         let from = buffer.startIndex + current.headLength
         let taken = body.fill(from: buffer[from..<buffer.endIndex])
         buffer = buffer.subdata(in: (from + taken)..<buffer.endIndex)
@@ -104,15 +119,18 @@ public struct HTTPRequestReader: Sendable {
 }
 
 /// One request body, allocated at its Content-Length (no regrowing while it arrives). The bytes become a Data that
-/// frees them when the last reference goes; if the body is never completed, they are freed with the buffer.
+/// frees them when the last reference goes; if the body is never completed, they are freed with the buffer. Either
+/// way the body's budget reservation is released when its bytes are freed, not before.
 final class BodyBuffer: @unchecked Sendable {
     let count: Int
     private(set) var filled = 0
     private let bytes: UnsafeMutableRawPointer
+    private let reservation: BodyReservation?
     private var handedOver = false
 
-    init(count: Int) {
+    init(count: Int, reservation: BodyReservation?) {
         self.count = count
+        self.reservation = reservation
         bytes = .allocate(byteCount: count, alignment: 16)
     }
 
@@ -129,11 +147,16 @@ final class BodyBuffer: @unchecked Sendable {
     /// The full body as Data, which owns the bytes from now on.
     func handOver() -> Data {
         handedOver = true
-        return Data(bytesNoCopy: bytes, count: count, deallocator: .custom { pointer, _ in pointer.deallocate() })
+        return Data(bytesNoCopy: bytes, count: count, deallocator: .custom { [reservation] pointer, _ in
+            pointer.deallocate()
+            reservation?.release()
+        })
     }
 
     deinit {
-        if !handedOver { bytes.deallocate() }
+        guard !handedOver else { return }
+        bytes.deallocate()
+        reservation?.release()
     }
 }
 
@@ -166,25 +189,27 @@ public final class ConnectionLimiter: @unchecked Sendable {
 public enum HTTPConnection {
     /// Serves `transport` while fewer than `limiter.limit` connections are open; beyond that answers
     /// `503 too_many_connections` (Retry-After: 1) and closes, so open connections and their buffers stay bounded.
-    public static func accept(_ transport: some HTTPTransport, limiter: ConnectionLimiter, limits: HTTPConnectionLimits,
+    /// Bodies over `budget.unreservedLimit` share `budget` with every other connection's.
+    public static func accept(_ transport: some HTTPTransport, limiter: ConnectionLimiter, budget: BodyBudget? = nil,
+                              limits: HTTPConnectionLimits,
                               handler: @Sendable (consuming HTTPRequest) async -> HTTPResponse) async
     {
         guard limiter.tryAcquire() else {
-            var response = HTTPResponse.openAIError(
-                ServiceError(.unavailable, "too_many_connections",
-                             "the server has \(limiter.limit) open connections, its limit; retry shortly"))
-            response.headers.append(("Retry-After", "1"))
-            _ = await transport.send(response.serialized(keepAlive: false))
+            _ = await transport.send(retryLater(ServiceError(
+                .unavailable, "too_many_connections", "the server has \(limiter.limit) open connections, its limit; retry shortly")))
             transport.cancel()
             return
         }
         defer { limiter.release() }
-        await serve(transport, limits: limits, handler: handler)
+        await serve(transport, limits: limits, budget: budget, handler: handler)
     }
 
-    /// Serves requests on `transport` until the peer closes, a request asks to close, or a limit is hit.
-    /// `sleep` waits out a timeout; tests pass a clock they advance by hand.
-    public static func serve(_ transport: some HTTPTransport, limits: HTTPConnectionLimits,
+    /// Serves requests on `transport` until the peer closes, a request asks to close, or a limit is hit. A body over
+    /// `budget.unreservedLimit` is read only once `budget` has room for it (no budget: every body is read at once);
+    /// after waiting `limits.bodyIdleTimeout` for that, it is answered `503 body_budget_busy` (Retry-After: 1).
+    /// `sleep` waits out a timeout; tests pass a clock they advance by hand. `handler` owns the request: a closure
+    /// that passes it on should `consume` it, or the closure keeps the body alive until it returns.
+    public static func serve(_ transport: some HTTPTransport, limits: HTTPConnectionLimits, budget: BodyBudget? = nil,
                              sleep: @escaping @Sendable (Duration) async throws -> Void = { try await Task.sleep(for: $0) },
                              handler: @Sendable (consuming HTTPRequest) async -> HTTPResponse) async
     {
@@ -197,8 +222,31 @@ public enum HTTPConnection {
         while true {
             timer.start(limits.headTimeout)
             let request: HTTPRequest
+            // Also released once the handler returns, in case the body outlived it.
+            var reservation: BodyReservation?
             do {
                 while true {
+                    if let length = try reader.bodyAwaitingAdmission() {
+                        // A large body waits for room in the budget before any of it is read. The socket is not read
+                        // meanwhile, so TCP flow control holds the client back. The wait ends when earlier bodies are
+                        // freed, which is soon: a body is freed once its request is parsed. One that does not end
+                        // within the body idle timeout means a body is held for long (a stalled upload, say): the
+                        // client is told to retry rather than kept waiting, so waiting connections cannot pile up.
+                        timer.stop()
+                        if let budget {
+                            do {
+                                reservation = try await budget.reserve(length, waitingAtMost: limits.bodyIdleTimeout, sleep: sleep)
+                            } catch is BodyBudget.WaitTimedOut {
+                                _ = await transport.send(retryLater(ServiceError(
+                                    .unavailable, "body_budget_busy",
+                                    "the server is receiving other large request bodies; retry shortly")))
+                                return
+                            } catch {
+                                return
+                            }
+                        }
+                        reader.admitBody(reservation)
+                    }
                     if let next = try reader.next() {
                         request = next
                         break
@@ -217,9 +265,17 @@ public enum HTTPConnection {
             let keepAlive = request.keepAlive, includeBody = request.method != "HEAD"
             // The handler owns the request from here, so it can free the body before it is done.
             let response = await handler(consume request)
+            reservation?.release()
             let bytes = response.serialized(keepAlive: keepAlive, includeBody: includeBody)
             guard await transport.send(bytes), keepAlive else { return }
         }
+    }
+
+    /// `error` with `Retry-After: 1`, for a connection that is closed after it.
+    static func retryLater(_ error: ServiceError) -> Data {
+        var response = HTTPResponse.openAIError(error)
+        response.headers.append(("Retry-After", "1"))
+        return response.serialized(keepAlive: false)
     }
 }
 
