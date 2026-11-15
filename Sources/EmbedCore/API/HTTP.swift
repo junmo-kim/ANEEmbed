@@ -23,6 +23,13 @@ public struct HTTPRequest: Sendable {
         self.version = version
     }
 
+    /// The body, which the request no longer holds afterwards: once the caller drops it, its bytes are freed while
+    /// the request is still being handled.
+    public mutating func takeBody() -> Data {
+        defer { body = Data() }
+        return body
+    }
+
     public func header(_ name: String) -> String? {
         headers.last { $0.name.caseInsensitiveCompare(name) == .orderedSame }?.value
     }

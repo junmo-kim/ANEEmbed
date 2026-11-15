@@ -28,14 +28,15 @@ public struct Router: Sendable {
         return error.publicFacing
     }
 
-    public func handle(_ request: HTTPRequest) async -> HTTPResponse {
+    /// Takes the request over, so a route can free its body as soon as the body is parsed.
+    public func handle(_ request: consuming HTTPRequest) async -> HTTPResponse {
         switch (request.method, request.path) {
         case ("GET", "/health"), ("HEAD", "/health"):
             return health()
         case ("GET", "/v1/models"), ("GET", "/models"):
             return models()
         case ("POST", "/v1/embeddings"), ("POST", "/embeddings"):
-            return await embeddings(request)
+            return await embeddings(consume request)
         case ("POST", "/mcp"):
             let handler = MCPHandler(state: state, allowPaths: false, waitForModel: false, publicErrors: true, log: log)
             guard let response = await handler.handle(raw: request.body) else { return HTTPResponse(status: 202) }
@@ -80,12 +81,14 @@ public struct Router: Sendable {
         return .json(200, ["object": "list", "data": [.object(model)]])
     }
 
-    func embeddings(_ request: HTTPRequest) async -> HTTPResponse {
+    func embeddings(_ request: consuming HTTPRequest) async -> HTTPResponse {
         do throws(ServiceError) {
             // The service first: its limits bound the parse (no image is decoded beyond --max-images), and a server
             // that is still loading answers 503 without parsing.
             let service = try state.service()
-            let parsed = try EmbeddingsRequest.parse(request.body, limits: service.limits)
+            // The raw body (up to --max-body) is freed once parsed: only the decoded images stay while they are
+            // embedded.
+            let parsed = try EmbeddingsRequest.parse(request.takeBody(), limits: service.limits)
             let result: EmbeddingResult
             switch parsed.input {
             case .texts(let texts): result = try await service.embedTexts(texts, inputType: parsed.inputType)

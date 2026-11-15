@@ -32,10 +32,15 @@ public struct HTTPConnectionLimits: Sendable {
 /// Request framing over one connection's bytes: a head, then a Content-Length body; pipelined requests stay buffered.
 public struct HTTPRequestReader: Sendable {
     public let maxBody: Int
+    /// Received bytes that are not part of a body: the head being received, then whatever follows the body.
     private var buffer = Data()
     private var head: HTTPHead?
+    /// The body of `head`: one allocation of its Content-Length that the received bytes are copied into.
+    private var body: BodyBuffer?
     /// Bytes of `buffer` already searched for the end of the head (minus 3, for a terminator split across reads).
     private var scanned = 0
+    /// The size of `buffer` at the last search that did not find the end of the head.
+    private var searchedLength = 0
     /// Total bytes searched for heads (the cost of slow, byte-by-byte heads stays linear).
     private(set) var searchedBytes = 0
 
@@ -43,42 +48,92 @@ public struct HTTPRequestReader: Sendable {
         self.maxBody = maxBody
     }
 
-    /// Bytes received and not yet returned as part of a request.
+    /// Bytes received and not yet returned as part of a request, outside the body being filled.
     public var bufferedBytes: Int { buffer.count }
 
     /// The head of the next request has arrived and its body has not (yet) completely.
     public var isReadingBody: Bool { head != nil }
 
     public mutating func append(_ data: Data) {
-        buffer.append(data)
+        guard let body, !body.isFull else {
+            buffer.append(data)
+            return
+        }
+        let taken = body.fill(from: data)
+        if taken < data.count { buffer.append(data[(data.startIndex + taken)...]) }
     }
 
     /// The next complete request; nil while more bytes are needed.
     public mutating func next() throws(HTTPParseError) -> HTTPRequest? {
-        if head == nil {
-            searchedBytes += buffer.count - scanned
-            guard let parsed = try HTTPParser.parseHead(buffer, maxBody: maxBody, scanFrom: scanned) else {
-                scanned = max(buffer.count - 3, 0)
-                return nil
-            }
-            head = parsed
-            scanned = 0
-        }
-        guard let current = head, buffer.count >= current.headLength + current.contentLength else { return nil }
+        try parseHead()
+        guard let current = head else { return nil }
         var request = current.request
-        let end = current.headLength + current.contentLength
-        if buffer.count == end {
-            // The usual case: hand the buffer over as the body (no copy of up to --max-body bytes) and keep nothing.
-            var whole = buffer
-            buffer = Data()
-            whole.removeSubrange(whole.startIndex..<(whole.startIndex + current.headLength))
-            request.body = whole
-        } else {  // pipelined bytes follow
-            request.body = buffer.subdata(in: (buffer.startIndex + current.headLength)..<(buffer.startIndex + end))
-            buffer = buffer.subdata(in: (buffer.startIndex + end)..<buffer.endIndex)
+        if current.contentLength > 0 {
+            if body == nil { startBody(current) }
+            guard let body, body.isFull else { return nil }
+            request.body = body.handOver()
+            self.body = nil
+        } else {
+            buffer = buffer.subdata(in: (buffer.startIndex + current.headLength)..<buffer.endIndex)
         }
         head = nil
         return request
+    }
+
+    private mutating func parseHead() throws(HTTPParseError) {
+        guard head == nil, buffer.count > searchedLength else { return }  // nothing new since the last search
+        searchedBytes += buffer.count - scanned
+        guard let parsed = try HTTPParser.parseHead(buffer, maxBody: maxBody, scanFrom: scanned) else {
+            scanned = max(buffer.count - 3, 0)
+            searchedLength = buffer.count
+            return
+        }
+        head = parsed
+        scanned = 0
+        searchedLength = 0
+    }
+
+    /// Allocates the body and moves the body bytes that arrived with the head into it; what follows them stays.
+    private mutating func startBody(_ current: HTTPHead) {
+        let body = BodyBuffer(count: current.contentLength)
+        let from = buffer.startIndex + current.headLength
+        let taken = body.fill(from: buffer[from..<buffer.endIndex])
+        buffer = buffer.subdata(in: (from + taken)..<buffer.endIndex)
+        self.body = body
+    }
+}
+
+/// One request body, allocated at its Content-Length (no regrowing while it arrives). The bytes become a Data that
+/// frees them when the last reference goes; if the body is never completed, they are freed with the buffer.
+final class BodyBuffer: @unchecked Sendable {
+    let count: Int
+    private(set) var filled = 0
+    private let bytes: UnsafeMutableRawPointer
+    private var handedOver = false
+
+    init(count: Int) {
+        self.count = count
+        bytes = .allocate(byteCount: count, alignment: 16)
+    }
+
+    var isFull: Bool { filled == count }
+
+    /// Copies as much of `data` as still fits; returns how many bytes that was.
+    func fill(from data: Data) -> Int {
+        let taken = min(count - filled, data.count)
+        data.copyBytes(to: (bytes + filled).assumingMemoryBound(to: UInt8.self), count: taken)
+        filled += taken
+        return taken
+    }
+
+    /// The full body as Data, which owns the bytes from now on.
+    func handOver() -> Data {
+        handedOver = true
+        return Data(bytesNoCopy: bytes, count: count, deallocator: .custom { pointer, _ in pointer.deallocate() })
+    }
+
+    deinit {
+        if !handedOver { bytes.deallocate() }
     }
 }
 
@@ -112,7 +167,7 @@ public enum HTTPConnection {
     /// Serves `transport` while fewer than `limiter.limit` connections are open; beyond that answers
     /// `503 too_many_connections` (Retry-After: 1) and closes, so open connections and their buffers stay bounded.
     public static func accept(_ transport: some HTTPTransport, limiter: ConnectionLimiter, limits: HTTPConnectionLimits,
-                              handler: @Sendable (HTTPRequest) async -> HTTPResponse) async
+                              handler: @Sendable (consuming HTTPRequest) async -> HTTPResponse) async
     {
         guard limiter.tryAcquire() else {
             var response = HTTPResponse.openAIError(
@@ -131,7 +186,7 @@ public enum HTTPConnection {
     /// `sleep` waits out a timeout; tests pass a clock they advance by hand.
     public static func serve(_ transport: some HTTPTransport, limits: HTTPConnectionLimits,
                              sleep: @escaping @Sendable (Duration) async throws -> Void = { try await Task.sleep(for: $0) },
-                             handler: @Sendable (HTTPRequest) async -> HTTPResponse) async
+                             handler: @Sendable (consuming HTTPRequest) async -> HTTPResponse) async
     {
         var reader = HTTPRequestReader(maxBody: limits.maxBody)
         let timer = ConnectionTimer(transport, sleep: sleep)
@@ -159,9 +214,10 @@ public enum HTTPConnection {
                 return
             }
             timer.stop()
-            let response = await handler(request)
-            let keepAlive = request.keepAlive
-            let bytes = response.serialized(keepAlive: keepAlive, includeBody: request.method != "HEAD")
+            let keepAlive = request.keepAlive, includeBody = request.method != "HEAD"
+            // The handler owns the request from here, so it can free the body before it is done.
+            let response = await handler(consume request)
+            let bytes = response.serialized(keepAlive: keepAlive, includeBody: includeBody)
             guard await transport.send(bytes), keepAlive else { return }
         }
     }
