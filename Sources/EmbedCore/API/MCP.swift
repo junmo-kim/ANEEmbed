@@ -10,11 +10,19 @@ public struct MCPHandler: Sendable {
     public let allowPaths: Bool
     /// stdio waits for the model on tools/call; HTTP answers `loading` right away.
     public let waitForModel: Bool
+    /// HTTP: server-side failures are reported with a generic message (ServiceError.publicFacing) and their detail
+    /// goes to `log`; stdio, a local client, gets the detail.
+    public let publicErrors: Bool
+    public let log: @Sendable (String) -> Void
 
-    public init(state: ServerState, allowPaths: Bool, waitForModel: Bool) {
+    public init(state: ServerState, allowPaths: Bool, waitForModel: Bool, publicErrors: Bool = false,
+                log: @escaping @Sendable (String) -> Void = { _ in })
+    {
         self.state = state
         self.allowPaths = allowPaths
         self.waitForModel = waitForModel
+        self.publicErrors = publicErrors
+        self.log = log
     }
 
     /// Handles one JSON-RPC message; nil for notifications (no response).
@@ -53,8 +61,13 @@ public struct MCPHandler: Sendable {
                                                   context: ToolContext(service: service, allowPaths: allowPaths))
                 return Self.result(id: id, ["content": [["type": "text", "text": .string(output.render(as: format))]]])
             } catch {
+                var shown = error
+                if publicErrors {
+                    if error.kind == .internal { log("POST /mcp tools/call \(name): \(error.description)") }
+                    shown = error.publicFacing
+                }
                 return Self.result(id: id, [
-                    "content": [["type": "text", "text": .string(error.structured.render(as: format))]], "isError": true,
+                    "content": [["type": "text", "text": .string(shown.structured.render(as: format))]], "isError": true,
                 ])
             }
         default:

@@ -13,10 +13,19 @@ import Foundation
 public struct Router: Sendable {
     public let state: ServerState
     public let modelName: String
+    /// Server log: the details of internal errors, which responses do not carry.
+    public let log: @Sendable (String) -> Void
 
-    public init(state: ServerState, modelName: String) {
+    public init(state: ServerState, modelName: String, log: @escaping @Sendable (String) -> Void = { _ in }) {
         self.state = state
         self.modelName = modelName
+        self.log = log
+    }
+
+    /// The error as a client sees it (generic for 500/503), with an internal one's detail logged.
+    func published(_ error: ServiceError, _ request: HTTPRequest) -> ServiceError {
+        if error.kind == .internal { log("\(request.method) \(request.path): \(error.description)") }
+        return error.publicFacing
     }
 
     public func handle(_ request: HTTPRequest) async -> HTTPResponse {
@@ -28,7 +37,7 @@ public struct Router: Sendable {
         case ("POST", "/v1/embeddings"), ("POST", "/embeddings"):
             return await embeddings(request)
         case ("POST", "/mcp"):
-            let handler = MCPHandler(state: state, allowPaths: false, waitForModel: false)
+            let handler = MCPHandler(state: state, allowPaths: false, waitForModel: false, publicErrors: true, log: log)
             guard let response = await handler.handle(raw: request.body) else { return HTTPResponse(status: 202) }
             return .json(200, response)
         case ("QUERY", let path):
@@ -52,7 +61,8 @@ public struct Router: Sendable {
             if info.selfTestSkipped { body["selftest"] = "skipped" }
             return .json(200, .object(body))
         case .loading: return .json(503, ["status": "loading"])
-        case .failed(let error): return .json(503, ["status": "error", "detail": .string(error.message)])
+        case .failed(let error):
+            return .json(503, ["status": "error", "reason": .string(error.reason), "detail": .string(error.publicFacing.message)])
         }
     }
 
@@ -83,7 +93,7 @@ public struct Router: Sendable {
             }
             return .json(200, raw: EmbeddingsResponse.body(result, request: parsed, model: modelName))
         } catch {
-            return .openAIError(error)
+            return .openAIError(published(error, request))
         }
     }
 
@@ -131,7 +141,7 @@ public struct Router: Sendable {
             let output = try await Tools.call(tool, arguments: arguments, context: ToolContext(service: service, allowPaths: false))
             return reply(200, output)
         } catch {
-            return reply(error.httpStatus, error.structured)
+            return reply(error.httpStatus, published(error, request).structured)
         }
     }
 }

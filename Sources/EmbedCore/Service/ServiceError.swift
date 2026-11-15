@@ -73,6 +73,22 @@ public struct ServiceError: Error, Sendable, Equatable, CustomStringConvertible 
         }
     }
 
+    /// What an HTTP client sees. Server-side failures (500 internal, 503 unavailable) keep their kind, reason, param
+    /// and hint, with a generic message: the detail (paths, Core ML and ImageIO errors) is for the server log.
+    /// Client errors and `loading` describe the request or a documented state and stay as they are.
+    public var publicFacing: ServiceError {
+        switch kind {
+        case .internal:
+            return ServiceError(kind, reason, "internal server error (\(reason)); details are in the server log",
+                                param: param, hint: hint)
+        case .unavailable:
+            return ServiceError(kind, reason, "the model is not available (\(reason)); details are in the server log",
+                                param: param, hint: hint)
+        default:
+            return self
+        }
+    }
+
     /// OpenAI's error object: {"error": {"message", "type", "param", "code"}}.
     public var openAIBody: JSONValue {
         let type: String
