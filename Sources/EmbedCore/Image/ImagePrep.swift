@@ -47,10 +47,26 @@ public enum ImagePrep {
     public static let maxSourcePixels = 40_000_000
 
     public static func prepare(_ data: Data) throws -> PreparedImage {
-        let (rgb, width, height) = try decode(data)
+        let (source, orientation) = try open(data)
+        if let (rgb, width, height) = JPEGDecoder.decode(data, maxPixels: maxSourcePixels) {
+            let resizer = try resizer(width: width, height: height, orientation: orientation)
+            rgb.withUnsafeBufferPointer { pixels in
+                for y in 0..<height { resizer.push(pixels.baseAddress! + y * width * 3) }
+            }
+            return PreparedImage(rgb: resizer.finish(), width: resizer.width, height: resizer.height)
+        }
+        let (rgb, width, height) = try imageIODecode(source, orientation: orientation)
         let (targetHeight, targetWidth) = try targetSize(height: height, width: width)
         let resized = resize(rgb, width: width, height: height, toWidth: targetWidth, toHeight: targetHeight)
         return PreparedImage(rgb: resized, width: targetWidth, height: targetHeight)
+    }
+
+    /// The resize of a `width` x `height` source stored in EXIF `orientation`, to the canvas of the oriented image.
+    static func resizer(width: Int, height: Int, orientation: Int) throws -> RowResizer {
+        let transposed = (5...8).contains(orientation)
+        let (targetHeight, targetWidth) = try targetSize(height: transposed ? width : height, width: transposed ? height : width)
+        return RowResizer(sourceWidth: width, sourceHeight: height, orientation: orientation, toWidth: targetWidth,
+                          toHeight: targetHeight)
     }
 
     // MARK: - target size (transformers get_aspect_ratio_preserving_size)
@@ -80,6 +96,9 @@ public enum ImagePrep {
     }
 
     // MARK: - resize (torch uint8 antialiased bicubic, separable)
+    //
+    // torch resizes the oriented image horizontally, then vertically, with a uint8 intermediate. RowResizer runs
+    // the same two passes, with the same weights and integer arithmetic, on rows as a decoder produces them.
 
     /// Source range and int16 weights of every output index along one axis
     /// (HelperInterpBase::_compute_index_ranges_int16_weights with HelperInterpCubic::aa_filter<double, true>).
@@ -143,72 +162,42 @@ public enum ImagePrep {
     }
 
     public static func resize(_ rgb: [UInt8], width: Int, height: Int, toWidth: Int, toHeight: Int) -> [UInt8] {
-        var image = rgb
-        var currentWidth = width
-        if toWidth != width {
-            image = horizontal(image, width: width, height: height, toWidth: toWidth)
-            currentWidth = toWidth
+        let resizer = RowResizer(sourceWidth: width, sourceHeight: height, orientation: 1, toWidth: toWidth, toHeight: toHeight)
+        rgb.withUnsafeBufferPointer { pixels in
+            for y in 0..<height { resizer.push(pixels.baseAddress! + y * width * 3) }
         }
-        if toHeight != height {
-            image = vertical(image, width: currentWidth, height: height, toHeight: toHeight)
-        }
-        return image
+        return resizer.finish()
     }
 
-    private static func horizontal(_ src: [UInt8], width: Int, height: Int, toWidth: Int) -> [UInt8] {
-        let axis = axisWeights(input: width, output: toWidth)
+    /// One output pixel line of the horizontal kernel: `axis.start.count` RGB pixels from `axis` input pixels.
+    static func resample(_ src: UnsafePointer<UInt8>, _ axis: AxisWeights, into dst: UnsafeMutablePointer<UInt8>) {
         let half = Int32(1) << (axis.precision - 1), shift = axis.precision
-        var dst = [UInt8](repeating: 0, count: toWidth * height * 3)
-        src.withUnsafeBufferPointer { s in
-            dst.withUnsafeMutableBufferPointer { d in
-                axis.weights.withUnsafeBufferPointer { w in
-                    for y in 0..<height {
-                        let srcRow = y * width * 3, dstRow = y * toWidth * 3
-                        for x in 0..<toWidth {
-                            let lo = axis.start[x], size = axis.count[x], wBase = x * axis.stride
-                            for c in 0..<3 {
-                                var sum = half
-                                for j in 0..<size {
-                                    sum += Int32(s[srcRow + (lo + j) * 3 + c]) * Int32(w[wBase + j])
-                                }
-                                d[dstRow + x * 3 + c] = UInt8(clamping: min(max(sum >> shift, 0), 255))
-                            }
-                        }
-                    }
+        axis.weights.withUnsafeBufferPointer { w in
+            for x in 0..<axis.start.count {
+                let lo = axis.start[x], size = axis.count[x], wBase = x * axis.stride
+                for c in 0..<3 {
+                    var sum = half
+                    for j in 0..<size { sum += Int32(src[(lo + j) * 3 + c]) * Int32(w[wBase + j]) }
+                    dst[x * 3 + c] = UInt8(clamping: min(max(sum >> shift, 0), 255))
                 }
             }
         }
-        return dst
-    }
-
-    private static func vertical(_ src: [UInt8], width: Int, height: Int, toHeight: Int) -> [UInt8] {
-        let axis = axisWeights(input: height, output: toHeight)
-        let half = Int32(1) << (axis.precision - 1), shift = axis.precision
-        let row = width * 3
-        var dst = [UInt8](repeating: 0, count: row * toHeight)
-        var sums = [Int32](repeating: 0, count: row)
-        src.withUnsafeBufferPointer { s in
-            dst.withUnsafeMutableBufferPointer { d in
-                sums.withUnsafeMutableBufferPointer { acc in
-                    for y in 0..<toHeight {
-                        let lo = axis.start[y], size = axis.count[y], wBase = y * axis.stride
-                        for i in 0..<row { acc[i] = half }
-                        for j in 0..<size {
-                            let weight = Int32(axis.weights[wBase + j]), srcRow = (lo + j) * row
-                            for i in 0..<row { acc[i] += Int32(s[srcRow + i]) * weight }
-                        }
-                        let dstRow = y * row
-                        for i in 0..<row { d[dstRow + i] = UInt8(clamping: min(max(acc[i] >> shift, 0), 255)) }
-                    }
-                }
-            }
-        }
-        return dst
     }
 
     // MARK: - decode
 
+    /// The decoded image, oriented, at full size.
     public static func decode(_ data: Data) throws -> ([UInt8], Int, Int) {
+        let (source, orientation) = try open(data)
+        // JPEG as libjpeg-turbo decodes it (PIL); other formats and unsupported JPEG variants through ImageIO
+        if let (rgb, width, height) = JPEGDecoder.decode(data, maxPixels: maxSourcePixels) {
+            return orient(rgb, width: width, height: height, orientation: orientation)
+        }
+        return try imageIODecode(source, orientation: orientation)
+    }
+
+    /// The image source and its EXIF orientation; refuses images over `maxSourcePixels` before decoding.
+    static func open(_ data: Data) throws -> (CGImageSource, Int) {
         let options = [kCGImageSourceShouldCache: false] as CFDictionary
         guard let source = CGImageSourceCreateWithData(data as CFData, options), CGImageSourceGetCount(source) > 0 else {
             throw ImageError.decode("not an image ImageIO can read")
@@ -219,11 +208,11 @@ public enum ImagePrep {
         {
             throw ImageError.decode("\(w) x \(h) exceeds \(maxSourcePixels) pixels")
         }
-        let orientation = properties[kCGImagePropertyOrientation] as? Int ?? 1
-        // JPEG as libjpeg-turbo decodes it (PIL); other formats and unsupported JPEG variants through ImageIO
-        if let (rgb, width, height) = JPEGDecoder.decode(data, maxPixels: maxSourcePixels) {
-            return orient(rgb, width: width, height: height, orientation: orientation)
-        }
+        return (source, properties[kCGImagePropertyOrientation] as? Int ?? 1)
+    }
+
+    static func imageIODecode(_ source: CGImageSource, orientation: Int) throws -> ([UInt8], Int, Int) {
+        let options = [kCGImageSourceShouldCache: false] as CFDictionary
         guard let image = CGImageSourceCreateImageAtIndex(source, 0, options) else {
             throw ImageError.decode("ImageIO could not decode the image")
         }

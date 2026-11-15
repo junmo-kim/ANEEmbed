@@ -88,6 +88,71 @@ struct ImagePrepTests {
         #expect(flipped == [4, 5, 6, 1, 2, 3])
     }
 
+    /// The resize as torch runs it on a whole image: the horizontal pass over all rows, then the vertical pass.
+    /// The production code streams rows (RowResizer); this is the reference it must match.
+    static func referenceResize(_ rgb: [UInt8], width: Int, height: Int, toWidth: Int, toHeight: Int) -> [UInt8] {
+        var image = rgb, currentWidth = width
+        if toWidth != width {
+            let axis = ImagePrep.axisWeights(input: width, output: toWidth)
+            var out = [UInt8](repeating: 0, count: toWidth * height * 3)
+            for y in 0..<height {
+                for x in 0..<toWidth {
+                    for c in 0..<3 {
+                        var sum = Int32(1) << (axis.precision - 1)
+                        for j in 0..<axis.count[x] {
+                            sum += Int32(image[(y * width + axis.start[x] + j) * 3 + c]) * Int32(axis.weights[x * axis.stride + j])
+                        }
+                        out[(y * toWidth + x) * 3 + c] = UInt8(clamping: min(max(sum >> axis.precision, 0), 255))
+                    }
+                }
+            }
+            image = out
+            currentWidth = toWidth
+        }
+        if toHeight != height {
+            let axis = ImagePrep.axisWeights(input: height, output: toHeight), row = currentWidth * 3
+            var out = [UInt8](repeating: 0, count: row * toHeight)
+            for y in 0..<toHeight {
+                for i in 0..<row {
+                    var sum = Int32(1) << (axis.precision - 1)
+                    for j in 0..<axis.count[y] {
+                        sum += Int32(image[(axis.start[y] + j) * row + i]) * Int32(axis.weights[y * axis.stride + j])
+                    }
+                    out[y * row + i] = UInt8(clamping: min(max(sum >> axis.precision, 0), 255))
+                }
+            }
+            image = out
+        }
+        return image
+    }
+
+    /// Streaming the rows and folding the EXIF orientation into the resize gives exactly what orienting the whole
+    /// image and then resizing it gives: every orientation, scaling down, up or not at all along either axis.
+    @Test(arguments: 1...8) func streamedResizeWithOrientationIsBitExact(_ orientation: Int) {
+        var random = UInt64(orientation)
+        func byte() -> UInt8 {
+            random = random &* 6364136223846793005 &+ 1442695040888963407
+            return UInt8(truncatingIfNeeded: random >> 33)
+        }
+        for (width, height) in [(37, 23), (101, 67), (16, 90), (1, 5)] {
+            let rgb = (0..<(width * height * 3)).map { _ in byte() }
+            let (oriented, orientedWidth, orientedHeight) = ImagePrep.orient(rgb, width: width, height: height,
+                                                                           orientation: orientation)
+            let targets = [(orientedWidth, orientedHeight * 2 + 1), (orientedWidth / 2 + 1, orientedHeight),
+                           (orientedWidth * 3, max(orientedHeight / 3, 1)), (orientedWidth, orientedHeight), (48, 48)]
+            for (toWidth, toHeight) in targets {
+                let expected = Self.referenceResize(oriented, width: orientedWidth, height: orientedHeight,
+                                                    toWidth: toWidth, toHeight: toHeight)
+                let resizer = RowResizer(sourceWidth: width, sourceHeight: height, orientation: orientation,
+                                         toWidth: toWidth, toHeight: toHeight)
+                rgb.withUnsafeBufferPointer { pixels in
+                    for y in 0..<height { resizer.push(pixels.baseAddress! + y * width * 3) }
+                }
+                #expect(resizer.finish() == expected, "\(width) x \(height), orientation \(orientation) -> \(toWidth) x \(toHeight)")
+            }
+        }
+    }
+
     /// A 3-frame animation (GIF or APNG) of solid frames in `colours`, 8 x 8 px, written by ImageIO.
     static func animation(_ type: UTType, colours: [(UInt8, UInt8, UInt8)]) throws -> Data {
         let output = NSMutableData()
