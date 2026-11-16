@@ -121,6 +121,22 @@ if model.get("max_image_tokens", 0) > 0:
         s, b = call("/v1/embeddings", payload)
         check(f"{name} -> 400", s == 400, s)
 
+text = "tokenize me, détokenize me"
+s, plain = call("/tokenize", {"content": text})
+s2, framed = call("/tokenize", {"content": text, "add_special": True})
+check("POST /tokenize: add_special off by default, on adds <bos>/<eos> (the usage count)",
+      s == 200 and s2 == 200 and len(framed["tokens"]) == len(plain["tokens"]) + 2 == tokens(text), (plain, framed))
+s, b = call("/detokenize", {"tokens": plain.get("tokens", [])})
+check("POST /detokenize gives the text back", s == 200 and b.get("content") == text, b)
+s, b = call("/tokenize", {"content": "é\u0ff0", "with_pieces": True})  # U+0FF0: byte tokens for EmbeddingGemma 2
+pieces = [t["piece"] for t in b.get("tokens", [])]
+check("with_pieces joins back to the text, with byte-list pieces", s == 200 and any(isinstance(p, list) for p in pieces)
+      and b"".join(bytes(p) if isinstance(p, list) else p.encode() for p in pieces) == "é\u0ff0".encode(), b)
+s, b = call("/tokenize", {"content": "x" * (1 << 20 | 1)})
+check("/tokenize content over 1 MiB -> 413 content_too_long", s == 413 and b["error"].get("code") == "content_too_long", s)
+s, b = call("/detokenize", {"tokens": [-1]})
+check("detokenize of a non-id -> 400 invalid_token", s == 400 and b["error"].get("code") == "invalid_token", b)
+
 s, b = call("/embed_text?format=json&dimensions=128", method="QUERY", raw=b"hello", headers={"Content-Type": "text/plain"})
 check("QUERY /embed_text raw body", s == 200 and len(b["data"][0]["embedding"]) == 128, s)
 s, b = call("/mcp", {"jsonrpc": "2.0", "id": 1, "method": "tools/list"})

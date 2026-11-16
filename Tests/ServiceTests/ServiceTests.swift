@@ -52,6 +52,12 @@ struct ServiceTests {
             lock.withLock { count += 1 }
             return base.encode(text)
         }
+
+        func encode(_ text: String, addSpecial: Bool, parseSpecial: Bool) -> [Int32] {
+            base.encode(text, addSpecial: addSpecial, parseSpecial: parseSpecial)
+        }
+
+        func pieceBytes(_ id: Int32) -> [UInt8]? { base.pieceBytes(id) }
     }
 
     /// A text with more bytes than the limit's tokens can cover is refused before any text of the request is
@@ -94,7 +100,11 @@ struct ServiceTests {
 
     /// A tokenizer without <bos>/<eos> framing (post_processor null) turns "" into no ids: a 400, not a trap.
     @Test func anEmptyTokenSequenceIsRejected() async throws {
-        struct Unframed: TextTokenizer { func encode(_ text: String) -> [Int32] { text.utf8.map { Int32($0) + 3 } } }
+        struct Unframed: TextTokenizer {
+            func encode(_ text: String) -> [Int32] { text.utf8.map { Int32($0) + 3 } }
+            func encode(_ text: String, addSpecial: Bool, parseSpecial: Bool) -> [Int32] { encode(text) }
+            func pieceBytes(_ id: Int32) -> [UInt8]? { nil }
+        }
         let service = EmbeddingService(tokenizer: Unframed(), runtime: FakeRuntime.make())
         do {
             _ = try await service.embedTexts(["ok", ""])

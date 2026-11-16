@@ -4,6 +4,7 @@
 //   GET   /v1/models (/models)           the model id and its limits
 //   GET   /health                        200 ready ("ok", or "degraded" when loaded functions are not served
 //                                        or the self-test was skipped), 503 loading or failed
+//   POST  /tokenize, /detokenize         llama-server's tokenizer API (text <-> the model's token ids)
 //   POST  /mcp                           MCP JSON-RPC (one message per request)
 //   QUERY /{tool}?<options>              one-shot tool call (RFC 10008 QUERY, as in macvis): the body is the
 //                                        raw input (UTF-8 text for embed_text, image bytes for embed_image)
@@ -37,13 +38,18 @@ public struct Router: Sendable {
             return models()
         case ("POST", "/v1/embeddings"), ("POST", "/embeddings"):
             return await embeddings(consume request)
+        case ("POST", "/tokenize"):
+            return await tokenize(consume request)
+        case ("POST", "/detokenize"):
+            return await detokenize(consume request)
         case ("POST", "/mcp"):
             let handler = MCPHandler(state: state, allowPaths: false, waitForModel: false, publicErrors: true, log: log)
             guard let response = await handler.handle(raw: request.body) else { return HTTPResponse(status: 202) }
             return .json(200, response)
         case ("QUERY", let path):
             return await query(request, tool: String(path.dropFirst()))
-        case (_, "/health"), (_, "/v1/models"), (_, "/models"), (_, "/v1/embeddings"), (_, "/embeddings"), (_, "/mcp"):
+        case (_, "/health"), (_, "/v1/models"), (_, "/models"), (_, "/v1/embeddings"), (_, "/embeddings"), (_, "/mcp"),
+             (_, "/tokenize"), (_, "/detokenize"):
             return .openAIError(ServiceError(.badRequest, "method_not_allowed", "\(request.method) is not allowed on \(request.path)"))
                 .with(status: 405)
         default:
@@ -99,6 +105,36 @@ public struct Router: Sendable {
             case .images(let images): result = try await service.embedImages(images)
             }
             return .json(200, raw: EmbeddingsResponse.body(result, request: parsed, model: modelName))
+        } catch {
+            return .openAIError(published(error, request))
+        }
+    }
+
+    func tokenize(_ request: consuming HTTPRequest) async -> HTTPResponse {
+        do throws(ServiceError) {
+            let service = try state.service()
+            // The raw body is freed once parsed, as for /v1/embeddings.
+            let parsed = try TokenizeRequest.parse(request.takeBody())
+            let tokenizer = service.tokenizer
+            let body = try await service.withTokenizerLane { () throws(ServiceError) -> Data in
+                let ids = tokenizer.encode(parsed.content, addSpecial: parsed.addSpecial, parseSpecial: parsed.parseSpecial)
+                return TokenizerResponse.tokens(ids, pieces: parsed.withPieces ? tokenizer : nil)
+            }
+            return .json(200, raw: body)
+        } catch {
+            return .openAIError(published(error, request))
+        }
+    }
+
+    func detokenize(_ request: consuming HTTPRequest) async -> HTTPResponse {
+        do throws(ServiceError) {
+            let service = try state.service()
+            let ids = try DetokenizeRequest.parse(request.takeBody())
+            let tokenizer = service.tokenizer
+            let content = try await service.withTokenizerLane { () throws(ServiceError) -> String in
+                try TokenizerResponse.content(ids, tokenizer: tokenizer)
+            }
+            return .json(200, ["content": .string(content)])
         } catch {
             return .openAIError(published(error, request))
         }

@@ -115,4 +115,20 @@ public struct ByteTokenizer: TextTokenizer {
     }
 
     public var maxBytesPerToken: Int? { 1 }
+
+    /// It has no added tokens, so `parseSpecial` changes nothing.
+    public func encode(_ text: String, addSpecial: Bool, parseSpecial: Bool) -> [Int32] {
+        let ids = text.utf8.map { Int32($0) + 3 }
+        return addSpecial ? [SpecialTokens.bos] + ids + [SpecialTokens.eos] : ids
+    }
+
+    public func pieceBytes(_ id: Int32) -> [UInt8]? {
+        switch id {
+        case SpecialTokens.pad: return Array("<pad>".utf8)
+        case SpecialTokens.eos: return Array("<eos>".utf8)
+        case SpecialTokens.bos: return Array("<bos>".utf8)
+        case 3..<259: return [UInt8(id - 3)]
+        default: return nil
+        }
+    }
 }

@@ -60,8 +60,12 @@ public final class GemmaTokenizer: Sendable {
     private let addedTokens: [[UInt8]]
     private let addedTokenIDs: [Int32]
     private let addedFirstBytes: [Bool]
+    /// Whether each added token is still cut out of the text when special tokens are not parsed.
+    private let addedIsUserDefined: [Bool]
     /// Token bytes by id (for `tokens(_:)`).
     private let tokenBytes: [[UInt8]]
+    /// The byte each <0xXX> token stands for, by id (-1 for other tokens).
+    private let byteValues: [Int16]
 
     public convenience init(contentsOf url: URL) throws {
         let data: Data
@@ -102,6 +106,9 @@ public final class GemmaTokenizer: Sendable {
             bytes[value] = vocab.lookup(name) ?? -1
         }
         byteIDs = bytes
+        var values = [Int16](repeating: -1, count: bytesByID.count)
+        for (value, id) in bytes.enumerated() where id >= 0 { values[Int(id)] = Int16(value) }
+        byteValues = values
         unknownID = parsed.unknownToken.flatMap { vocab.lookup(Array($0.utf8)) }
 
         // Merges: rank = position in the list; later duplicates overwrite earlier ones.
@@ -132,6 +139,7 @@ public final class GemmaTokenizer: Sendable {
         let added = parsed.addedTokens.sorted { $0.content.count > $1.content.count }
         addedTokens = added.map(\.content)
         addedTokenIDs = added.map(\.id)
+        addedIsUserDefined = added.map { Self.userDefinedTokens.contains($0.content) }
         var first = [Bool](repeating: false, count: 256)
         for token in added where !token.content.isEmpty { first[Int(token.content[0])] = true }
         addedFirstBytes = first
@@ -143,17 +151,25 @@ public final class GemmaTokenizer: Sendable {
 
     // MARK: - Encoding
 
-    /// Token ids of `text`, with <bos>/<eos> unless `addSpecialTokens` is false.
-    public func encode(_ text: String, addSpecialTokens: Bool = true) -> [Int32] {
+    /// Added tokens that llama.cpp keeps cutting out of the text with `parse_special` false: the EmbeddingGemma 2 GGUF
+    /// types these six USER_DEFINED and the other added tokens CONTROL. tokenizer.json marks all of them special, so
+    /// the file does not tell them apart; the list was checked against llama-server b12428.
+    static let userDefinedTokens: Set<[UInt8]> = Set(
+        ["<|tool_call>", "<tool_call|>", "<tool_response|>", #"<|"|>"#, "<|channel>", "<channel|>"].map { Array($0.utf8) })
+
+    /// Token ids of `text`, with <bos>/<eos> unless `addSpecialTokens` is false. With `parseSpecial` false (llama.cpp's
+    /// parse_special) the text of a control token such as "<bos>" is not cut out first but encoded like any other
+    /// text; the user-defined tokens above still are.
+    public func encode(_ text: String, addSpecialTokens: Bool = true, parseSpecial: Bool = true) -> [Int32] {
         var output: [Int32] = []
         var scratch = BPEScratch()
-        encode(text, addSpecialTokens: addSpecialTokens, into: &output, scratch: &scratch)
+        encode(text, addSpecialTokens: addSpecialTokens, parseSpecial: parseSpecial, into: &output, scratch: &scratch)
         return output
     }
 
     /// Appends the ids of `text` to `output`, reusing `scratch` between calls.
-    public func encode(_ text: String, addSpecialTokens: Bool = true, into output: inout [Int32],
-                       scratch: inout BPEScratch)
+    public func encode(_ text: String, addSpecialTokens: Bool = true, parseSpecial: Bool = true,
+                       into output: inout [Int32], scratch: inout BPEScratch)
     {
         output.reserveCapacity(output.count + text.utf8.count / 3 + 2)
         if addSpecialTokens { output.append(contentsOf: prefixIDs) }
@@ -162,7 +178,9 @@ public final class GemmaTokenizer: Sendable {
             var pieceStart = 0
             var index = 0
             while index < utf8.count {
-                if addedFirstBytes[Int(utf8[index])], let (tokenIndex, length) = matchAddedToken(utf8, at: index) {
+                if addedFirstBytes[Int(utf8[index])],
+                   let (tokenIndex, length) = matchAddedToken(utf8, at: index, userDefinedOnly: !parseSpecial)
+                {
                     if index > pieceStart {
                         encodePiece(UnsafeBufferPointer(rebasing: utf8[pieceStart..<index]), into: &output,
                                     scratch: &scratch)
@@ -195,6 +213,33 @@ public final class GemmaTokenizer: Sendable {
         }
     }
 
+    // MARK: - Decoding
+
+    /// The bytes of text one token stands for, as tokenizer.json's decoder produces them: "▁" becomes " ", a <0xXX>
+    /// token is its byte, and any other token, special tokens included, is its vocabulary entry. nil for an id outside
+    /// the vocabulary. One token's bytes need not be valid UTF-8 (a byte token is part of a character).
+    public func pieceBytes(_ id: Int32) -> [UInt8]? {
+        guard id >= 0, Int(id) < tokenBytes.count else { return nil }
+        if byteValues[Int(id)] >= 0 { return [UInt8(byteValues[Int(id)])] }
+        let entry = tokenBytes[Int(id)]
+        // An empty entry is a gap between the ids of a sparse vocabulary, not a token.
+        guard !entry.isEmpty else { return nil }
+        guard entry.count >= 3 else { return entry }
+        var bytes: [UInt8] = []
+        bytes.reserveCapacity(entry.count)
+        var index = 0
+        while index < entry.count {
+            if index + 2 < entry.count, entry[index] == 0xE2, entry[index + 1] == 0x96, entry[index + 2] == 0x81 {
+                bytes.append(0x20)
+                index += 3
+            } else {
+                bytes.append(entry[index])
+                index += 1
+            }
+        }
+        return bytes
+    }
+
     /// The id of a vocabulary entry, compared byte for byte.
     public func id(of token: String) -> Int32? {
         let bytes = Array(token.utf8)
@@ -204,10 +249,12 @@ public final class GemmaTokenizer: Sendable {
 
     /// Leftmost-longest match of an added token at `index` (tokens are sorted longest first).
     @inline(__always)
-    private func matchAddedToken(_ utf8: UnsafeBufferPointer<UInt8>, at index: Int) -> (Int, Int)? {
+    private func matchAddedToken(_ utf8: UnsafeBufferPointer<UInt8>, at index: Int, userDefinedOnly: Bool) -> (Int, Int)? {
         for (tokenIndex, token) in addedTokens.enumerated() {
             let length = token.count
-            guard length > 0, index + length <= utf8.count else { continue }
+            guard length > 0, index + length <= utf8.count, !userDefinedOnly || addedIsUserDefined[tokenIndex] else {
+                continue
+            }
             var equal = true
             for offset in 0..<length where utf8[index + offset] != token[offset] {
                 equal = false

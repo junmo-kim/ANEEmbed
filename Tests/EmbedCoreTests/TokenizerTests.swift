@@ -94,6 +94,31 @@ struct TokenizerRuleTests {
         #expect(tokenizer.encode("<bo", addSpecialTokens: false).count == 3)
     }
 
+    /// llama-server's parse_special false: the text of a special token is encoded like any other text.
+    @Test func encodesSpecialTokenTextAsTextWithoutParseSpecial() throws {
+        let tokenizer = try tinyTokenizer()
+        let plain = tokenizer.encode("<bos>a", addSpecialTokens: false, parseSpecial: false)
+        #expect(!plain.contains(2))
+        #expect(plain.last == 4 && plain.count == 6)  // "<", "b", "o", "s", ">" one token each, then "a"
+        #expect(tokenizer.encode("<bos>a", addSpecialTokens: true, parseSpecial: false) == [2] + plain + [1])
+    }
+
+    /// tokenizer.json's decoder: "▁" -> " ", byte tokens -> their byte, other tokens (special too) -> their entry.
+    @Test func decodesEachTokenToItsBytes() throws {
+        let tokenizer = try tinyTokenizer()
+        #expect(tokenizer.pieceBytes(10) == Array(" a".utf8))
+        #expect(tokenizer.pieceBytes(9) == [0x20])
+        #expect(tokenizer.pieceBytes(30) == [0xC3] && tokenizer.pieceBytes(31) == [0xA9])
+        #expect(tokenizer.pieceBytes(36) == [0xE2])  // the byte token <0xE2>, not part of a "▁"
+        #expect(tokenizer.pieceBytes(2) == Array("<bos>".utf8))
+        #expect(tokenizer.pieceBytes(5) == Array("\u{FEFF}a".utf8))
+        #expect(tokenizer.pieceBytes(-1) == nil && tokenizer.pieceBytes(1 << 20) == nil)
+        for text in ["a  a", "é😀 aaa", "\u{F900}\u{8C48} bc", "<bos>a<eos>"] {
+            let bytes = tokenizer.encode(text, addSpecialTokens: false).flatMap { tokenizer.pieceBytes($0)! }
+            #expect(String(decoding: bytes, as: UTF8.self) == text)
+        }
+    }
+
     @Test func staleQueueEntriesUseProducedIdLikeTokenizers() throws {
         // Two merges producing the same token "aaa": (aa, a) rank 2 and (a, aa) rank 5.
         let tokenizer = try tinyTokenizer(merges: #"[["a", "a"], ["▁", "a"], ["aa", "a"], ["b", "c"], ["a", "b"], ["a", "aa"]]"#)

@@ -195,6 +195,60 @@ struct HTTPContractTests {
         #expect(await call("GET", "/nope").0 == 404)
         #expect(await call("GET", "/v1/embeddings").0 == 405)
     }
+
+    /// llama-server's POST /tokenize and /detokenize (the fake runtime's tokenizer: one id per byte + 3).
+    @Test func tokenizeAndDetokenizeLikeLlamaServer() async {
+        // add_special defaults to false, as in llama-server
+        #expect(await call("POST", "/tokenize", ["content": "hi"]) == (200, ["tokens": [107, 108]]))
+        #expect(await call("POST", "/tokenize", ["content": "hi", "add_special": true]) == (200, ["tokens": [2, 107, 108, 1]]))
+        #expect(await call("POST", "/tokenize", ["content": ""]) == (200, ["tokens": []]))
+        let (status, pieces) = await call("POST", "/tokenize", ["content": "é", "add_special": true, "with_pieces": true])
+        #expect(status == 200)
+        #expect(pieces == ["tokens": [["id": 2, "piece": "<bos>"], ["id": 198, "piece": [195]], ["id": 172, "piece": [169]],
+                                      ["id": 1, "piece": "<eos>"]]])
+        // Not limited to the embedding context: a client measures long texts to split them.
+        let long = String(repeating: "x", count: 5000)
+        let (_, measured) = await call("POST", "/tokenize", ["content": .string(long)])
+        #expect(measured["tokens"]?.arrayValue?.count == 5000)
+
+        #expect(await call("POST", "/detokenize", ["tokens": [2, 107, 108, 1]]) == (200, ["content": "<bos>hi<eos>"]))
+        #expect(await call("POST", "/detokenize", ["tokens": [198, 172]]) == (200, ["content": "é"]))
+        #expect(await call("POST", "/detokenize", ["tokens": [198]]) == (200, ["content": "\u{FFFD}"]))
+        #expect(await call("POST", "/detokenize", ["tokens": []]) == (200, ["content": ""]))
+    }
+
+    @Test func tokenizerAPIErrors() async {
+        func failure(_ path: String, _ body: JSONValue?) async -> (Int, JSONValue?, JSONValue?) {
+            let (status, response) = await call("POST", path, body)
+            return (status, response["error"]?["code"], response["error"]?["param"])
+        }
+        #expect(await failure("/tokenize", ["text": "hi"]) == (400, "invalid_content", "content"))
+        #expect(await failure("/tokenize", ["content": 3]) == (400, "invalid_content", "content"))
+        #expect(await failure("/tokenize", ["content": "hi", "add_special": "yes"]) == (400, "invalid_add_special", "add_special"))
+        #expect(await failure("/tokenize", ["content": "hi", "with_pieces": 1]) == (400, "invalid_with_pieces", "with_pieces"))
+        #expect(await failure("/tokenize", ["content": "hi", "parse_special": "no"]) == (400, "invalid_parse_special", "parse_special"))
+        #expect(await failure("/detokenize", ["text": "hi"]) == (400, "invalid_tokens", "tokens"))
+        // Bounded: at most 1 MiB of content, and of detokenized text (plus room for <bos>/<eos>)
+        let limit = TokenizeRequest.maxContentBytes
+        #expect(await call("POST", "/tokenize", ["content": .string(String(repeating: "x", count: limit))]).0 == 200)
+        #expect(await failure("/tokenize", ["content": .string(String(repeating: "x", count: limit + 1))])
+            == (413, "content_too_long", "content"))
+        let atLimit = JSONValue.array([2] + Array(repeating: JSONValue.int(123), count: limit) + [1])
+        #expect(await call("POST", "/detokenize", ["tokens": atLimit]).0 == 200)
+        let overLimit = JSONValue.array(Array(repeating: JSONValue.int(123), count: DetokenizeRequest.maxContentBytes + 1))
+        #expect(await failure("/detokenize", ["tokens": overLimit]) == (413, "content_too_long", "tokens"))
+        let (notJSON, notJSONCode, _) = await failure("/tokenize", nil)
+        #expect(notJSON == 400 && notJSONCode == "invalid_json")
+        #expect(await failure("/detokenize", ["tokens": "1 2"]) == (400, "invalid_tokens", "tokens"))
+        #expect(await failure("/detokenize", ["tokens": [107, 259]]) == (400, "invalid_token", "tokens[1]"))
+        #expect(await failure("/detokenize", ["tokens": [-1]]) == (400, "invalid_token", "tokens[0]"))
+        #expect(await failure("/detokenize", ["tokens": [1.5]]) == (400, "invalid_token", "tokens[0]"))
+        #expect(await call("GET", "/tokenize").0 == 405)
+        #expect(await call("GET", "/detokenize").0 == 405)
+        let loading = Router(state: ServerState(.loading), modelName: "m")
+        let (status, body) = await call("POST", "/tokenize", ["content": "x"], router: loading)
+        #expect(status == 503 && body["error"]?["code"] == "model_loading")
+    }
 }
 
 @Suite("QUERY and MCP over HTTP (fake runtime)")

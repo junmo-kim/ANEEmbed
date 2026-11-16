@@ -40,6 +40,7 @@ public final class EmbeddingService: Sendable {
     private let queryLane: AsyncSemaphore
     private let imageLane: AsyncSemaphore
     private let longLane: AsyncSemaphore
+    private let tokenizerLane: AsyncSemaphore
 
     public init(tokenizer: any TextTokenizer, runtime: any EmbeddingRuntime, limits: ServiceLimits = ServiceLimits(),
                 modelName: String = "embeddinggemma-2")
@@ -51,6 +52,21 @@ public final class EmbeddingService: Sendable {
         queryLane = AsyncSemaphore(max(1, limits.queryConcurrency))
         imageLane = AsyncSemaphore(max(1, limits.imageConcurrency))
         longLane = AsyncSemaphore(max(1, limits.longConcurrency))
+        tokenizerLane = AsyncSemaphore(max(1, limits.longConcurrency))
+    }
+
+    /// Runs the work of `POST /tokenize` and `/detokenize` at most `longConcurrency` at a time: tokenizing a 1 MiB text
+    /// takes 1.2–1.4 s end to end over HTTP on an M4, with the process peaking at 124 MB, so many such requests must not run at once.
+    public func withTokenizerLane<T: Sendable>(_ body: @escaping @Sendable () throws(ServiceError) -> T)
+        async throws(ServiceError) -> T
+    {
+        do {
+            return try await tokenizerLane.withPermit { try body() }
+        } catch let error as ServiceError {
+            throw error
+        } catch {
+            throw ServiceError(.internal, "internal_error", "\(error)")
+        }
     }
 
     public var maxTokens: Int { min(limits.maxTokens, runtime.info.maxTokens) }

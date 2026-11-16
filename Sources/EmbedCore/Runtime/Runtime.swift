@@ -57,6 +57,12 @@ public protocol TextTokenizer: Sendable {
     /// text of more than `limit × maxBytesPerToken` bytes is known to have more than `limit` tokens without
     /// encoding it.
     var maxBytesPerToken: Int? { get }
+    /// For `POST /tokenize` (llama-server's contract): ids of `text`, <bos>/<eos> only with `addSpecial`; with
+    /// `parseSpecial` false, control-token text such as "<bos>" is encoded as ordinary text.
+    func encode(_ text: String, addSpecial: Bool, parseSpecial: Bool) -> [Int32]
+    /// For `POST /detokenize`: the bytes of text one token stands for (special tokens as their text); nil for an id
+    /// outside the vocabulary.
+    func pieceBytes(_ id: Int32) -> [UInt8]?
 }
 
 extension TextTokenizer {
@@ -65,6 +71,10 @@ extension TextTokenizer {
 
 extension GemmaTokenizer: TextTokenizer {
     public func encode(_ text: String) -> [Int32] { encode(text, addSpecialTokens: true) }
+
+    public func encode(_ text: String, addSpecial: Bool, parseSpecial: Bool) -> [Int32] {
+        encode(text, addSpecialTokens: addSpecial, parseSpecial: parseSpecial)
+    }
 }
 
 /// Source of scaled fp16 token rows.

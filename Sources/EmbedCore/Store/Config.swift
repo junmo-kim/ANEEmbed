@@ -41,7 +41,7 @@ public struct Config: Sendable, Equatable {
                defaultValue: { "8" }, validate: integer(1...64)),
         Option(name: "image-concurrency", help: "concurrent image decodes and encodes", defaultValue: { "2" },
                validate: integer(1...64)),
-        Option(name: "long-concurrency", help: "concurrent texts over 512 tokens", defaultValue: { "2" },
+        Option(name: "long-concurrency", help: "concurrent texts over 512 tokens, and /tokenize and /detokenize requests", defaultValue: { "2" },
                validate: integer(1...64)),
         Option(name: "runtime", help: "coreml (Neural Engine) or fake (no model, for testing integrations)",
                defaultValue: { "coreml" }, validate: { ["coreml", "fake"].contains($0) ? nil : "must be coreml or fake" }),

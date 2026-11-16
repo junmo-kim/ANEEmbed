@@ -15,7 +15,8 @@ enum CLI {
           aneembed models path | verify | warm | install [--from DIR | --repo R --revision REV]
           aneembed bench [--sizes 32,128,...] [--repeat N] [--image PATH] [--concurrency N] [--buckets]
                          [--breakdown] [--settle SECONDS] [--format yaml|json]
-          aneembed serve        HTTP: OpenAI /v1/embeddings, /v1/models, /health, POST /mcp, QUERY /{tool}
+          aneembed serve        HTTP: OpenAI /v1/embeddings, /v1/models, /health, POST /tokenize, /detokenize,
+                                POST /mcp, QUERY /{tool}
           aneembed mcp          MCP over stdio (newline-delimited JSON-RPC 2.0)
           aneembed --version | --help | <command> --print-config
 
