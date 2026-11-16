@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 #
-# GitHub release notes: the CHANGELOG.md section for the tag (if any) as the keynote, then the commit
-# subjects since the previous tag. No install instructions (those live in the README).
+# GitHub release notes: the CHANGELOG.md section for the tag (if any) as the keynote, then a "What's Changed"
+# section that groups the Conventional Commits subjects since the previous tag by type, as macvis does. No install
+# instructions (those live in the README).
 #
 # Usage: scripts/gen-release-notes.sh <tag>      e.g. scripts/gen-release-notes.sh v0.1.0
 # Needs full git history and tags (actions/checkout with fetch-depth: 0).
@@ -44,9 +45,34 @@ else
 fi
 echo
 
-log="$(git log --no-merges --format='%h %s' "$RANGE" | grep -vE '^[0-9a-f]+ (chore\(release\)|Release v)' || true)"
-if [ -n "$log" ]; then
-  printf '%s\n' "$log" | sed -E 's/^([0-9a-f]+) (.*)$/- \2 (\1)/'
-else
+ALL_LOG="$(git log --no-merges --format='%h %s' "$RANGE")"
+KNOWN_TYPES="feat|fix|perf|refactor|docs|test|ci|build|revert"
+TYPES="feat:Features fix:Fixes perf:Performance refactor:Refactoring docs:Documentation test:Tests ci:CI build:Build revert:Reverts"
+
+any=0
+for pair in $TYPES; do
+  type="${pair%%:*}"
+  label="${pair#*:}"
+  matches="$(printf '%s\n' "$ALL_LOG" | grep -E "^[0-9a-f]+ ${type}(\([^)]*\))?!?: " || true)"
+  [ -z "$matches" ] && continue
+  any=1
+  echo "### ${label}"
+  echo
+  printf '%s\n' "$matches" | sed -E "s/^([0-9a-f]+) ${type}(\([^)]*\))?!?: (.*)\$/- \\3 (\\1)/"
+  echo
+done
+
+# Release commits and subjects without a known type: the former are left out, the rest go under Other.
+other="$(printf '%s\n' "$ALL_LOG" | grep -vE "^[0-9a-f]+ (${KNOWN_TYPES})(\([^)]*\))?!?: " \
+  | grep -vE '^[0-9a-f]+ (chore\(release\)|chore(\([^)]*\))?: bump version|Release v)' || true)"
+if [ -n "$other" ]; then
+  any=1
+  echo "### Other"
+  echo
+  printf '%s\n' "$other" | sed -E 's/^([0-9a-f]+) (.*)$/- \2 (\1)/'
+  echo
+fi
+
+if [ "$any" -eq 0 ]; then
   echo "_no notable changes_"
 fi

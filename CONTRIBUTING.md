@@ -45,7 +45,7 @@ ANEEMBED_EXTRA_GOLDEN=/tmp/extra.jsonl.xz swift test --filter matchesExtraGolden
 ## Pull requests
 
 - One logical change per PR; keep the diff focused, with tests for behaviour changes.
-- Commit subjects are short imperative sentences ("Add ...", "Fix ..."); the body says why.
+- Commit messages follow [Conventional Commits](https://www.conventionalcommits.org/) (`feat:`, `fix:`, `perf:`, `refactor:`, `docs:`, `test:`, `ci:`, `build:`, `chore:`, with an optional scope such as `feat(server):`); the subject is short and lowercase, the body says why. The release notes group the subjects by type.
 - Performance changes come with a measurement (before/after, machine, command).
 
 ## Releasing
@@ -54,5 +54,5 @@ A release is cut by pushing a `vX.Y.Z` tag. `.github/workflows/release.yml` test
 
 1. Bump `aneembedVersion` in `Sources/EmbedCore/Support/Version.swift`.
 2. Rename `## Unreleased` to `## vX.Y.Z` in `CHANGELOG.md`; that section becomes the release-notes keynote.
-3. Commit, tag and push the tag.
+3. Commit (`chore(release): vX.Y.Z`), tag and push the tag.
 4. After the release succeeds, update `junmo-kim/homebrew-tap`'s `Formula/aneembed.rb` to the published tarball URL and SHA-256, and check `brew upgrade junmo-kim/tap/aneembed` and `aneembed --version`.
