@@ -14,6 +14,11 @@ against it (see verify_hf.py). Differences are numerically neutral rewrites that
   * Sliding layers of the windowed functions attend block by block: query block b (B = 512 rows) sees the key
     rows b*B - 512 .. b*B + B + 512 (static, clipped slices; the band mask is an input). Padding the keys in the
     graph (F.pad) made the layer about 3x slower on the ANE, so the slices are clipped instead.
+  * Global layers of the long functions (winl) attend in blocks: query blocks of GLOBAL_QB rows, each against
+    key blocks of global_kb(S) keys with a flash-style combine, every softmax denominator a matmul with a ones
+    vector. The ANE softmax loses accuracy as the key length grows, and one [g*S, S] score tensor is slow: on an
+    M4, winl8192 went from 1457 ms to 1240 ms, and the minimum cos vs fp32 from 0.99989 (9 texts) to 0.999979
+    (3 texts); see README.
 
 Modules (all fp32 here; converted with compute_precision=FLOAT16):
   Bucket(S)           embed_S          up to k_for(S) packed sequences of total length <= S, full S x S attention
@@ -40,7 +45,13 @@ HALO = 512            # key rows on each side of a block (== WINDOW)
 BAND = BLOCK + 2 * HALO   # band_bias columns: keys b*BLOCK - HALO .. b*BLOCK + BLOCK + HALO - 1
 WINDOW_PACK = (1536, 2048)                # winp{S}_b512: windowed, packing
 WINDOW_LONG = (3072, 4096, 6144, 8192)    # winl{S}_b512: windowed, one sequence per call
+GLOBAL_QB = 128       # winl global layers: query rows per block
 SCALE = math.sqrt(512)
+
+
+def global_kb(S):
+    """winl global layers: keys per block (a divisor of S)"""
+    return 2048 if S % 2048 == 0 else 1024
 
 
 def k_for(S):
@@ -145,6 +156,43 @@ def full_attention(bias):
     return attend
 
 
+def blocked_attention(key_bias, qb, kb):
+    """Global layers of winl: query blocks of qb rows in the fold layout, each against key blocks of kb keys.
+    Per key block j: m_j = max of the scores, e_j = exp(s_j - m_j), numerator e_j @ v_j and denominator
+    e_j @ 1 (a matmul, not a reduce_sum); the blocks are combined with weights exp(m_j - max_j m_j).
+    key_bias [1,1,1,S]. Equal to full_attention in fp32. A text runs in the smallest winl size that holds it
+    (host.long_size), so the last key block always holds a real key; a block of padded keys alone would get the
+    weight exp(-1e4 + ...) = 0 anyway."""
+    def attend(q, k, v, kvh):
+        nh, S, hd, sk = (int(t) for t in (q.shape[1], q.shape[2], q.shape[3], k.shape[2]))
+        assert S % qb == 0 and sk % kb == 0, f"blocked_attention: {S} rows / {qb}, {sk} keys / {kb} do not divide"
+        g = nh // kvh
+        ones = torch.ones(kb, 1, dtype=q.dtype)
+        outs = []
+        for b in range(S // qb):
+            qf = q[:, :, b * qb:(b + 1) * qb].reshape(1, kvh, g * qb, hd)
+            ms, nums, dens = [], [], []
+            for j in range(sk // kb):
+                ks = slice(j * kb, (j + 1) * kb)
+                s = torch.matmul(qf, k[:, :, ks].transpose(-1, -2)) + key_bias[..., ks]
+                m = s.amax(-1, keepdim=True)
+                e = torch.exp(s - m)
+                ms.append(m)
+                nums.append(torch.matmul(e, v[:, :, ks]))
+                dens.append(torch.matmul(e, ones))
+            top = ms[0]
+            for m in ms[1:]:
+                top = torch.maximum(top, m)
+            num, den = 0, 0
+            for m, n_, d_ in zip(ms, nums, dens):
+                w = torch.exp(m - top)
+                num = num + n_ * w
+                den = den + d_ * w
+            outs.append((num / den).reshape(1, nh, qb, hd))
+        return torch.cat(outs, dim=2)
+    return attend
+
+
 def band_attention(band, S):
     """Block-local attention: query block b (rows b*BLOCK ..) against key rows b*BLOCK - HALO .. b*BLOCK + BLOCK +
     HALO, clipped to [0, S). band [1,1,S,BAND]: row r, column c <-> key row (r // BLOCK) * BLOCK - HALO + c
@@ -203,8 +251,8 @@ class Bucket(nn.Module):
 class Window(nn.Module):
     """winp{S}_b512 (packed): inputs_embeds [1,S,512], band_bias [1,1,S,BAND], global_bias [1,1,S,S], pool [K,S]
     winl{S}_b512 (long):    inputs_embeds [1,S,512], band_bias [1,1,S,BAND], key_bias [1,1,1,S],    pool [1,S]
-    -> embedding [K or 1, 768]. Sliding layers use band_attention, global layers attend to all S keys with the
-    third input (global_bias or key_bias, which broadcasts over query rows)."""
+    -> embedding [K or 1, 768]. Sliding layers use band_attention. Global layers attend to all S keys with the
+    third input: winp with full_attention over global_bias, winl with blocked_attention over key_bias."""
 
     def __init__(self, W, S):
         super().__init__()
@@ -214,7 +262,11 @@ class Window(nn.Module):
 
     def forward(self, inputs_embeds, band_bias, global_or_key_bias, pool):
         x = inputs_embeds
-        loc, glb = band_attention(band_bias, self.S), full_attention(global_or_key_bias)
+        loc = band_attention(band_bias, self.S)
+        if int(global_or_key_bias.shape[2]) == 1:      # winl: key_bias [1,1,1,S], one sequence
+            glb = blocked_attention(global_or_key_bias, GLOBAL_QB, global_kb(self.S))
+        else:                                           # winp: global_bias [1,1,S,S], packed sequences
+            glb = full_attention(global_or_key_bias)
         for i, m in enumerate(self.W.layers):
             c, s = self.t.get(m)
             x = layer(self.W, i, x, inputs_embeds, c, s, loc if m.swa else glb)

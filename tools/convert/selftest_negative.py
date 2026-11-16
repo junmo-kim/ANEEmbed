@@ -1,6 +1,9 @@
 """Negative control for the self-test: convert functions with the repeat_interleave K/V attention layout (known to
 miscompile on the ANE for the global layers, which have one K/V head) and run their self-tests from selftest.json,
-on the CPU and on CPU+ANE. The self-test is useful only if it fails these on the ANE.
+on the CPU and on CPU+ANE. The self-test is useful only if it fails winp2048_b512 on the ANE. The global layers of the
+long (winl) functions use eg2.blocked_attention, which this script does not replace, so only winp2048_b512 still
+puts the faulty layout into the global layers; the winl rebuilds change their sliding layers only. Existing
+neg_*.mlmodelc in work_dir are reused, so use a fresh work_dir after the code changes.
 Usage: selftest_negative.py <hf_dir> <dist> <work_dir> [function ...]   (default: winp2048_b512 winl4096_b512
 winl8192_b512). Prints one NEG line per function and compute unit."""
 import json

@@ -6,7 +6,7 @@ These scripts build the model package published as [junmo-k/embeddinggemma-2-ane
 |---|---|
 | `sources.json` | Every input, pinned: the two Hugging Face repositories (revision + sha256) and the evaluation texts and images (GitHub commit, Wikisource page revision or Python package version, path, license, sha256). |
 | `fetch.py` | `models`: downloads `google/embeddinggemma-2` and the FluidInference vision package at the pinned revisions. `data`: downloads the evaluation files (and copies the ones that ship inside pinned packages). Checks every sha256. |
-| `eg2.py` | The EmbeddingGemma 2 text encoder re-written in PyTorch for the ANE: `Bucket` (full attention) and `Window` (block-local sliding attention over a band, full global attention) modules, plus `Reference`, an fp32 ground truth equal to Hugging Face. |
+| `eg2.py` | The EmbeddingGemma 2 text encoder re-written in PyTorch for the ANE: `Bucket` (full attention) and `Window` (block-local sliding attention over a band; global attention over all keys, in query and key blocks for the long `winl` functions) modules, plus `Reference`, an fp32 ground truth equal to Hugging Face. |
 | `host.py` | Executable spec of the host contract (token rows, packing, band bias, long-text feed, vision feed) in numpy. The Swift runtime mirrors it. |
 | `build.py` | Builds the package, stage by stage (below). |
 | `selftest.py` | Generates `selftest.json` / `selftest.bin` (fp32 expectations) and runs them: `selftest.py run <dist>`. |
@@ -14,7 +14,7 @@ These scripts build the model package published as [junmo-k/embeddinggemma-2-ane
 | `verify.py` | The package on CPU + ANE through `host.py` against `eg2.Reference` (fp32): `text` (every packing function: single, packed, mixed) and `long` (2049–8192 tokens, including the lengths at and just over each size). |
 | `verify_hf.py` | Anchors to Hugging Face: `eg2.Reference` against `transformers` / `sentence-transformers` fp32 (`anchor`), and the image path on CPU + ANE against `transformers` fp32 for all three image budgets (`images`). |
 | `corpus.py`, `images.py` | Build the evaluation corpus (`corpus.json`, 12 documents) and image folder (13 images) from the fetched files. |
-| `selftest_negative.py` | Optional negative control: rebuilds `winp2048_b512`, `winl4096_b512` and `winl8192_b512` with the usual `repeat_interleave` attention and runs their self-tests on the CPU and on the ANE (results below). |
+| `selftest_negative.py` | Optional negative control: rebuilds `winp2048_b512`, `winl4096_b512` and `winl8192_b512` with the usual `repeat_interleave` attention and runs their self-tests on the CPU and on the ANE (results below). Since the long functions' global layers moved to `eg2.blocked_attention`, only `winp2048_b512` still injects the fault into the global layers. |
 
 `scripts/accuracy/` at the repository root is the other half: it measures a running `aneembed serve` (the Swift runtime, over HTTP) against the same fp32 reference on the same public data. `verify*.py` here test the package itself through the Python host contract.
 
@@ -33,7 +33,7 @@ uv pip install --python .venv/bin/python -r requirements.txt
 ## Reproducing the package
 
 ```bash
-W=../../.cache                                    # any directory (.cache/ is git-ignored)
+W=../../.cache/v0.2.0                             # any new directory per package version (.cache/ is git-ignored)
 .venv/bin/python -I fetch.py models --dest $W/models     # 1.7 GB, sha256 checked
 .venv/bin/python -I build.py --hf-dir $W/models/embeddinggemma-2 \
     --vision-dir $W/models/embeddinggemma-2-coreml --out $W/dist
@@ -54,7 +54,7 @@ Any directory works for `--dest` and `--out`; intermediate per-function packages
 
 ### What is byte-identical
 
-With the pinned environment, a clean rebuild reproduces these files byte for byte (sha256 equal to the published package):
+With the pinned environment, a clean rebuild reproduces these files byte for byte (sha256 equal to the published package). This was checked for the v0.1 package; the next package, whose `winl` functions changed (see the ANE caveats), is checked again when it is released:
 
 - `EmbeddingGemma2Text.mlpackage/Data/com.apple.CoreML/weights/weight.bin` (= `.mlmodelc/weights/weight.bin`)
 - `EmbeddingGemma2Text.mlmodelc/model.mil`, `coremldata.bin`, `metadata.json`
@@ -88,8 +88,18 @@ Each prints one line per case and a final `SUMMARY` with the minimum and median 
 
 The Neural Engine compiler runs on the user's Mac, per macOS build, and a miscompiled graph raises no error: it returns wrong numbers. What we hit, and what the code does about it:
 
-- **Attention uses the fold layout** (`eg2.attend_fold`): the query heads that share a K/V head are folded into the row dimension. The usual `repeat_interleave` layout returns zeros for query heads 1–3 of the global layers (one K/V head) at long sequence lengths; an explicit K/V copy is wrong as well. `selftest_negative.py` reproduces it: rebuilt with `repeat_interleave`, `winp2048_b512`, `winl4096_b512` and `winl8192_b512` fail their self-tests on CPU + ANE (min cosine 0.960, 0.952, 0.885; M5 Ultra, macOS 27.0.1), while on the CPU the first two pass (0.99994, 0.99953) and `winl8192_b512` scores 0.9975 (fp16 precision of that layout). Do not change the attention layout without running the self-test on the ANE.
+- **Attention uses the fold layout** (`eg2.attend_fold`): the query heads that share a K/V head are folded into the row dimension. The usual `repeat_interleave` layout returns zeros for query heads 1–3 of the global layers (one K/V head) at long sequence lengths; an explicit K/V copy is wrong as well. `selftest_negative.py` reproduces it: rebuilt with `repeat_interleave`, `winp2048_b512`, `winl4096_b512` and `winl8192_b512` fail their self-tests on CPU + ANE (min cosine 0.960, 0.952, 0.885; M5 Ultra, macOS 27.0.1), while on the CPU the first two pass (0.99994, 0.99953) and `winl8192_b512` scores 0.9975 (fp16 precision of that layout). Do not change the attention layout without running the self-test on the ANE. These failures were measured with the v0.1 package; the global layers of `winl` now use `eg2.blocked_attention` (below), which `selftest_negative.py` does not replace, so its `winl` rebuilds put `repeat_interleave` in the sliding layers only.
 - **Masks are runtime inputs and RoPE tables are graph constants.** A sliding-window mask built into the graph and a runtime positions input both produced wrong results. The windowed functions therefore take the band as an input too (`band_bias`, `[1,1,S,1536]`, see `host.band_bias`).
+- **Long global attention runs in blocks and divides by a matmul** (`eg2.blocked_attention`, `winl` only). The ANE softmax loses accuracy as the number of keys grows, and one `[4·S, S]` score tensor per global layer is slow. Each 128-row query block attends to key blocks of 2048 keys (1024 for `winl3072`), combined flash-style, and every denominator is `exp(s - max) @ 1` instead of a sum. In fp32 it equals the full attention (cos 1.00000000 against `eg2.Reference` at 3000 and 6000 tokens). On an M4 (minimum cos against fp32 over 9 texts, 3 for the new `winl8192`; p50 at the full length):
+
+  | function | before | after |
+  |---|---|---|
+  | `winl3072_b512` | 352 ms, 0.999967 | 345 ms, 0.999977 |
+  | `winl4096_b512` | 507 ms, 0.999959 | 491 ms, 0.999977 |
+  | `winl6144_b512` | 961 ms, 0.99994 | 829 ms, 0.999976 |
+  | `winl8192_b512` | 1457 ms, 0.99989 | 1240 ms, 0.999979 |
+
+  "Before" is the v0.1 package's function, "after" a standalone conversion of the same function with this code (`build.convert_one`); both were timed over 5 calls at the full length and compared with `eg2.ref_embed` by a harness outside this repository, and the release measures the rebuilt package again with `verify.py long` and `aneembed bench --buckets`; the texts include the lengths just over each smaller size (2049, 3073, 4097, 6145). The first compile takes 1.3–1.6x longer (`winl8192_b512` 170 s → 274 s on the M4). `winp` and `embed_S` are unchanged. The build skips stages and per-function packages that already exist, so build the next package into fresh `--out` and `--work` directories (or with `--force`); an older `winl` package would pass the self-test as well, since the inputs and expected vectors are the same.
 - **Windowed sliding layers slice, they do not pad.** Each 512-row query block attends to the key rows `b*512-512 … b*512+1023` taken as static slices clipped to `[0, S)`; padding the keys inside the graph (`F.pad`) gave the same numbers but made the layer about 3x slower on the ANE.
 - **Do not trust `MLComputePlan` for correctness.** It reports which device each operation is planned on, not whether the ANE computes it correctly. Only comparing outputs catches a miscompile.
 - **Run the self-test** (`selftest.py run <dist>`, or `aneembed`, which runs it at load) on every Mac and macOS version you ship to, with `cpuAndNeuralEngine`. `selftest.py run <dist> --cpu` runs the same tests on the CPU.
