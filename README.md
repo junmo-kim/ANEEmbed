@@ -161,21 +161,21 @@ Every option is a flag and an environment variable of the same name (flag > envi
 - **Use the model's prompts.** Queries as `task: search result | query: …` and documents as `title: none | text: …` (or send `input_type`: `query` / `document`). Without them texts are embedded as given.
 - **Embed an index and its queries with the same runtime.** Vectors from ANEEmbed, llama.cpp, MLX and PyTorch agree to cosine ≈ 0.9999 for text, but not bit for bit, and llama.cpp's image preprocessing differs from the official recipe (cosine ≈ 0.996). Re-embed when you switch.
 - **Bulk image jobs (backfills): one client, 4–8 images per request.** More clients barely add throughput: the Neural Engine runs one call at a time, and large JPEGs are decoded on the CPU, at most `--image-concurrency` (default 2) at a time. On an M4 with 12–24 MP photos, one client reached 1.19 images/s at 1 image per request, 1.46 at 4 and 1.51 at 8. Two or three clients reached 1.56–1.59 (+3–5 %), but short queries sent meanwhile waited about 2.5 times longer (p90 0.66–0.70 s instead of 0.28 s). If searches run at the same time, prefer one client. Downscaling very large photos on the client speeds up decoding, at the cost of pixels that differ slightly from the official preprocessing.
-- **Long documents: chunk them, or raise `--max-tokens`.** The default 2048 keeps start time and memory low; texts over the limit are rejected (`400 context_length_exceeded`), never truncated.
+- **Long documents: chunk them, or raise `--max-tokens`.** The default 2048 keeps start time and memory low; texts over the limit are rejected (`400 context_length_exceeded`), never truncated. For the most tokens per second, chunks of about 512 tokens are best; an 8192-token text is processed at about a third of that rate ([details](docs/PERFORMANCE.md#aneembed-across-machines)).
 - **Keep `serve` (or `mcp`) running.** One-off CLI commands load and self-test the model each time (about 5 s).
 
 ## Performance and memory
 
 Summary; the measurements, methods and every number are in [docs/PERFORMANCE.md](docs/PERFORMANCE.md).
 
-| ANEEmbed, warm median | Apple M4 | M5 Max | M5 Ultra |
+| ANEEmbed, warm median | Apple M4 (16 GB) | M5 Max (64 GB) | M5 Ultra (256 GB) |
 |---|---:|---:|---:|
-| short query | 7.0 ms (HTTP) | 3.2 ms | 3.4 ms |
-| 512 / 2048 tokens | 35 / 221 ms | 26 / 167 ms | 27.5 / 168 ms |
-| 4096 / 8192 tokens (`--max-tokens 8192`) | – / 1.45 s | 410 ms / 1.16 s | 424 ms / 1.19 s |
-| image, 280-token budget | 484 ms | 383 ms | 378 ms |
+| short query | 5.1 ms | 3.2 ms | 3.4 ms |
+| 512 / 2048 tokens | 31 / 211 ms | 26 / 167 ms | 27.5 / 168 ms |
+| 4096 / 8192 tokens (`--max-tokens 8192`) | 515 ms / 1.46 s | 410 ms / 1.16 s | 424 ms / 1.19 s |
+| image, 280-token budget | 488 ms | 383 ms | 378 ms |
 
-M4 over loopback HTTP, M5 Max and M5 Ultra with `aneembed bench` in process. A text runs in the smallest function that holds it, so latency steps at each function size (for example at 769, 1281, 2049, 3073, 4097 and 6145 tokens) and is flat in between.
+All three with `aneembed bench` in process. A text runs in the smallest function that holds it, so latency steps at each function size (for example at 769, 1281, 2049, 3073, 4097 and 6145 tokens) and is flat in between.
 
 - **Process memory**: about 140–380 MB, all pageable. A request keeps at most 3 Neural Engine calls of its short texts in flight, so even a batch of 2048 texts holds only a few input buffers (2048 × 512-token texts: 24 MiB).
 - **Neural Engine buffers**: owned by the process but outside its footprint, 5.3 GB at the default settings and 13.3 GB with `--max-tokens 8192`. They are wired only while used: for about a minute after start (the self-test), and during and about 10 s after each call. Idle, none is wired and the OS may discard them; the next call recreates them, which costs up to about 0.1 s once.

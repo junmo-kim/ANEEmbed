@@ -1,5 +1,32 @@
 # Performance and memory
 
+## ANEEmbed across machines
+
+| | Apple M4 (16 GB) | M5 Max (64 GB) | M5 Ultra (256 GB) |
+|---|---:|---:|---:|
+| macOS | 27.0.1 | 26.7 | 27.0.1 |
+| Neural Engines | 1 | 1 | 2 |
+| 32-token query | 5.1 ms | 3.2 ms | 3.4 ms |
+| 512 tokens | 30.6 ms | 26.2 ms | 27.5 ms |
+| 1024 tokens | 83.0 ms | 70.1 ms | 71 ms |
+| 2048 tokens | 211 ms | 167 ms | 168 ms |
+| 4096 tokens (`--max-tokens 8192`) | 515 ms | 410 ms | 424 ms |
+| 8192 tokens (`--max-tokens 8192`) | 1.46 s | 1.16 s | 1.19 s |
+| 10 × 32 tokens, one request | 17.8 ms | 13.1 ms | 8.8 ms |
+| 10 × 2048 tokens, one request | 2.11 s | 1.67 s | 0.86 s |
+| one 640 × 480 image (official 280-token layout) | 488 ms | 383 ms | 378 ms |
+| 8 clients sending single queries | 492 req/s | 747 req/s | 1,325 req/s |
+| first install, compile included (default / `+ --max-tokens 8192`) | 260 s / + 389 s | 331 s / + 349 s | 242 s / + 383 s |
+| process memory, idle | 140–270 MB | 186 MB | 155–166 MB |
+
+- **How measured.** Every column is `aneembed bench`, which sends its requests through the same router as `serve` in process, so only the loopback round trip is missing. Each cell is a warm median on texts of exactly N tokens including `<bos>`/`<eos>` and the prompt, at the default `--max-tokens 2048` unless the row says otherwise: 10 runs, 3 above 2048 tokens, 5 for the batches. Process memory is `serve`'s, idle after load.
+- **What differs.** Single texts take about the same time on an M5 Max and an M5 Ultra: one request runs on one Neural Engine. The M5 Ultra's second Neural Engine shows in concurrent and batched work: 8 clients, 10 × 32 tokens and 10 × 2048 tokens, where it took about half the M5 Max's time. From 512 tokens up the M4 took 1.17–1.26 times as long as the M5 Max (1.6 times for a 32-token query), and served two thirds of its requests per second with 8 clients.
+- **Throughput by length.** In tokens per second a single text is processed fastest at about 512 tokens: 16.7k on the M4, 19.5k on the M5 Max and 18.6k on the M5 Ultra. Shorter texts pay the fixed cost of a call (a 32-token query runs in the 64-token function, 6–10k), longer ones the attention, which grows with the square of the length: 12–17k from 768 to 1024 tokens, 8–10k at 4096 and 5.6–7.1k at 8192. A text just past a function's size runs in the next one (see [Latency steps](#latency-steps-m5-ultra)). Several texts in one request, or concurrent requests, raise the total, most on the M5 Ultra: 36k tokens/s for 10 × 32 tokens and 24k for 10 × 2048.
+- **M4.** Measured on 2026-11-16 with the v0.1.0 release binary in a fresh data directory, while other work ran on the machine (swap 5.7–6.4 GB in use). The comparison with the GPU runtimes below was measured over loopback HTTP on a quiet machine the day before. Every function passed its self-test (12/12, and 16/16 with `--max-tokens 8192`). With 8 clients the median query took 15.8 ms.
+- **Image.** On the M5 Ultra the image was 640 × 488 (266 soft tokens).
+- **M5 Max.** Every function passed its self-test on macOS 26.7's Neural Engine compiler. The memory is after 2 minutes idle, when wired memory was 72 MB above where it was before start.
+- **M5 Ultra.** The numbers were taken while another Neural Engine embedding service was running on the same machine. With 8 clients the median query took 5.9 ms. Its memory is idle under `serve`; `bench` ends at 221 MB after 150 s.
+
 ## Apple M4 (16 GB): ANEEmbed and the GPU runtimes
 
 Measured on 2026-11-15 on one Mac mini M4 (16 GB, macOS 27). Browsers and other heavy apps were closed, swap was under 4 GB at each start, and the 8192-token cases ran with the user logged out. Every runtime runs the official google/embeddinggemma-2 weights. The inputs are synthetic and public texts cut to exactly N tokens with the official tokenizer (prompt, `<bos>` and `<eos>` included), plus a 640×480 gradient PNG. Each cell is the warm median of 10 runs (3 for 8192 tokens). ANEEmbed and llama.cpp were measured as servers over loopback HTTP, client-side time including JSON. MLX and PyTorch have no embedding server here and were measured in process.
@@ -52,37 +79,24 @@ Memory:
 
 Decoding a large JPEG on the CPU (about 1.8 s for 24 MP) dominates; more clients add 3–5 % throughput and about 2.5× the query tail. The server's footprint peaked at 484 MB.
 
-## M5 Max (64 GB, macOS 26.7)
+## Latency steps (M5 Ultra)
 
-`aneembed bench`, in process: 32 tokens 3.2 ms; 512 tokens 26.2 ms; 1024 tokens 70.1 ms; 2048 tokens 167 ms; 4096 tokens 410 ms; 8192 tokens 1.16 s; 10 × 32 tokens 13.1 ms; one 640×480 image 383 ms; 8 clients 747 req/s. Every function passed its self-test on this macOS version's Neural Engine compiler. After 2 minutes idle the footprint was 186 MB, and wired memory was 72 MB above where it was before start.
+`aneembed bench` on the M5 Ultra as in the table above. A text runs in the smallest function that holds it, so latency steps at each function size and stays flat in between:
 
-## M5 Ultra, per size
-
-`aneembed bench` measures this binary in process on an M5 Ultra, macOS 27.0.1 (requests go through the same router as `serve`; only the loopback round trip is missing): warm median of 10 runs (3 above 2048 tokens), texts of exactly N tokens including `<bos>`/`<eos>` and the document prompt. Memory is `phys_footprint` after the run and 150 s of idling (freed pages are reclaimed late); see [Memory](#memory) for what it does not include.
-
-| | M5 Ultra |
+| tokens | latency |
 |---|---:|
-| 32 tokens | 3.4 ms |
-| 128 tokens | 5.5 ms |
-| 512 tokens | 27.5 ms |
-| 768 / 769 tokens | 46.4 / 70.4 ms |
-| 1024 tokens | 71 ms |
-| 1280 / 1281 tokens | 94.0 / 114.5 ms |
-| 2048 tokens | 168 ms |
-| 2049 / 3072 tokens (`--max-tokens 8192`) | 281 / 287 ms |
-| 3073 / 4096 tokens | 422 / 424 ms |
-| 4097 / 6144 tokens | 769 / 759 ms |
-| 6145 / 8192 tokens | 1168 / 1187 ms |
-| 10 texts of 32 tokens, one request | 8.8 ms |
-| 10 texts of 2048 tokens, one request | 0.86 s |
-| one image (640 × 488, 266 soft tokens) | 378 ms |
-| 8 clients sending single queries | 1325 req/s, 5.9 ms median |
-| process memory at the default `--max-tokens 2048` | 221 MB |
-| process memory with `--max-tokens 8192` | 444 MB |
+| 32 / 128 | 3.4 / 5.5 ms |
+| 512 | 27.5 ms |
+| 768 / 769 | 46.4 / 70.4 ms |
+| 1024 | 71 ms |
+| 1280 / 1281 | 94.0 / 114.5 ms |
+| 2048 | 168 ms |
+| 2049 / 3072 (`--max-tokens 8192`) | 281 / 287 ms |
+| 3073 / 4096 | 422 / 424 ms |
+| 4097 / 6144 | 769 / 759 ms |
+| 6145 / 8192 | 1168 / 1187 ms |
 
-A text runs in the smallest function that holds it, so latency steps at each function size, for example at 769 (`embed_1024`), 1281 (`winp1536`), 2049 (`winl3072`), 3073, 4097 and 6145 tokens, and stays flat in between. Measured per call (`bench --buckets`): `embed_64` … `embed_1280` 3.2 / 5.2 / 10.7 / 27.3 / 46.1 / 70.7 / 93.5 ms, `winp1536` / `winp2048` 115 / 171 ms, `winl3072` … `winl8192` 286 / 424 / 771 / 1169 ms. The M5 Ultra numbers were taken while another Neural Engine embedding service was running on the same machine.
-
-For the M4 see the comparison above. One request runs on one Neural Engine; the M5 Ultra has two, which helps concurrent and batched work.
+The steps are at 769 (`embed_1024`), 1281 (`winp1536`), 2049 (`winl3072`), 3073, 4097 and 6145 tokens. Measured per call (`bench --buckets`): `embed_64` … `embed_1280` 3.2 / 5.2 / 10.7 / 27.3 / 46.1 / 70.7 / 93.5 ms, `winp1536` / `winp2048` 115 / 171 ms, `winl3072` … `winl8192` 286 / 424 / 771 / 1169 ms.
 
 ## `--max-tokens` trade-offs
 
