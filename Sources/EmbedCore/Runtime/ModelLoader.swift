@@ -24,19 +24,19 @@ public enum ModelLoader {
     public static func load(_ config: Config, log: @Sendable (String) -> Void = { _ in }) async throws(ServiceError)
         -> (service: EmbeddingService, report: LoadReport)
     {
+        let config = try config.selectingModel(for: "load model")
         let started = Date()
         let directory = config.modelDirectory
         let tokenizerURL = directory.appendingPathComponent(ModelLayout.tokenizer)
+        guard let model = config.modelID else {
+            throw .badRequest("missing_model", "select a model with --model or --model-dir", param: "model")
+        }
         if config.useFakeRuntime {
-            let tokenizer: any TextTokenizer
-            if FileManager.default.fileExists(atPath: tokenizerURL.path), let real = try? GemmaTokenizer(contentsOf: tokenizerURL) {
-                tokenizer = real
-            } else {
-                tokenizer = ByteTokenizer()
-            }
+            let tokenizer = fakeTokenizer(model, tokenizerURL: tokenizerURL)
             log("fake runtime (no model): vectors are deterministic stand-ins, not embeddings")
-            let service = EmbeddingService(tokenizer: tokenizer, runtime: FakeRuntime.make(maxTokens: min(config.maxTokens, 2048)),
-                                           limits: config.limits, modelName: config.modelName)
+            let cap = model != .embeddingGemma2 ? config.maxTokens : min(config.maxTokens, 2048)
+            let service = EmbeddingService(tokenizer: tokenizer, runtime: FakeRuntime.make(maxTokens: cap, modelID: model),
+                                           limits: config.limits, modelName: config.modelName, modelID: model)
             return (service, LoadReport())
         }
 
@@ -46,12 +46,16 @@ public enum ModelLoader {
         }
         guard FileManager.default.fileExists(atPath: directory.path) else {
             throw ServiceError(.unavailable, "model_missing", "no model directory at \(directory.path)",
-                               hint: "run `aneembed models install`, or pass --model-dir")
+                               hint: "run `aneembed models install --model \(config.modelID?.rawValue ?? "embeddinggemma-2")` or pass --model-dir")
+        }
+        let (manifest, unavailablePackages) = try checkPackage(config, allowDegradedPPLX: true, log: log)
+        if manifest.pplxContract != nil {
+            return try await pplx(config, manifest: manifest, unavailablePackages: unavailablePackages,
+                                  started: started, log: log)
         }
         guard let textModel = ModelLayout.model(ModelLayout.textModel, in: directory) else {
             throw ServiceError(.unavailable, "model_missing", "no \(ModelLayout.textModel) model in \(directory.path)")
         }
-        let manifest = try checkPackage(config, log: log)
         // Before any function is loaded: without the package's self-test nothing is checked, so nothing is served.
         let suite: SelfTestSuite?
         if config.skipSelfTest {
@@ -62,7 +66,7 @@ public enum ModelLoader {
             suite = try SelfTestSuite.require(from: directory, manifest: manifest)
         }
         do {
-            let tokenizer = try GemmaTokenizer(contentsOf: tokenizerURL)
+            let tokenizer = try makeTokenizer(model, from: tokenizerURL)
             let table = try TokenTable(contentsOf: directory.appendingPathComponent(ModelLayout.tokenTable))
             let compiledText = try await compiledModelURL(textModel)
             var buckets = try await CoreMLBucketRunner.load(from: compiledText, maxTokens: config.maxTokens)
@@ -128,7 +132,8 @@ public enum ModelLoader {
                     + "\(notServed.filter { $0.hasPrefix("vision_") }.joined(separator: ", ")) not served")
             }
             report.seconds = Date().timeIntervalSince(started)
-            let service = EmbeddingService(tokenizer: tokenizer, runtime: runtime, limits: config.limits, modelName: config.modelName)
+            let service = EmbeddingService(tokenizer: tokenizer, runtime: runtime, limits: config.limits,
+                                           modelName: config.modelName, modelID: model)
             return (service, report)
         } catch let error as ServiceError {
             throw error
@@ -137,25 +142,91 @@ public enum ModelLoader {
         }
     }
 
+    /// The tokenizer-only CLI path needs no Core ML device or compiled package.
+    public static func loadTokenizer(_ config: Config) throws(ServiceError) -> any TextTokenizer {
+        let config = try config.selectingModel(for: "tokenize")
+        guard let model = config.modelID else {
+            throw .badRequest("missing_model", "select a model with --model or --model-dir", param: "model")
+        }
+        let directory = config.modelDirectory
+        let file = directory.appendingPathComponent(ModelLayout.tokenizer)
+        if config.useFakeRuntime { return fakeTokenizer(model, tokenizerURL: file) }
+        let manifest = try Manifest.load(from: directory)
+        try manifest.checkModel(model, directory: directory)
+        try manifest.checkPinned(config.pinnedManifestSHA256)
+        try manifest.checkContract()
+        do {
+            let data = try SmallFile.read(file, limit: 64 << 20)
+            guard let entry = manifest.sourceFiles.first(where: { $0.path == ModelLayout.tokenizer }),
+                  data.count == entry.size, SHA256Hasher.hex(data) == entry.sha256
+            else {
+                throw ServiceError(.unavailable, "model_files_changed", "\(file.path) doesn't match its manifest",
+                                   hint: "reinstall with aneembed models install --model \(model.rawValue)")
+            }
+            switch model {
+            case .embeddingGemma2: return try GemmaTokenizer(data: data)
+            case .pplx, .qwen3Embedding: return try QwenTokenizer(data: data).checked(for: model)
+            }
+        } catch let error as ServiceError {
+            throw error
+        } catch {
+            throw ServiceError(.unavailable, "tokenizer_missing", "\(file.path): \(error)",
+                               hint: "reinstall with aneembed models install --model \(model.rawValue)")
+        }
+    }
+
+    private static func fakeTokenizer(_ model: ModelID, tokenizerURL: URL) -> any TextTokenizer {
+        if FileManager.default.fileExists(atPath: tokenizerURL.path),
+           let tokenizer = try? makeTokenizer(model, from: tokenizerURL) {
+            return tokenizer
+        }
+        return ByteTokenizer(modelID: model)
+    }
+
+    static func makeTokenizer(_ model: ModelID, from url: URL) throws -> any TextTokenizer {
+        switch model {
+        case .embeddingGemma2: return try GemmaTokenizer(contentsOf: url)
+        case .pplx, .qwen3Embedding: return try QwenTokenizer(contentsOf: url).checked(for: model)
+        }
+    }
+
     /// The checks before anything of the package is loaded; returns its manifest. The manifest is required: it is
     /// what the contract and the file checks are read from. For the data directory's pinned revision it must be the
     /// manifest pinned in this build.
-    static func checkPackage(_ config: Config, log: (String) -> Void = { _ in }) throws(ServiceError) -> Manifest {
+    static func checkPackage(_ config: Config, allowDegradedPPLX: Bool = false, log: (String) -> Void = { _ in })
+        throws(ServiceError) -> (Manifest, unavailablePackages: [String: String])
+    {
         let directory = config.modelDirectory
         let manifest = try Manifest.load(from: directory)
+        if let model = config.modelID { try manifest.checkModel(model, directory: directory) }
         try manifest.checkPinned(config.pinnedManifestSHA256)
         try manifest.checkContract()
         // Files may have changed since install or `models verify`: sizes of all, hashes of what the self-test cannot see.
         let checkStarted = Date()
-        let changed = manifest.checkForLoad(in: directory)
-        guard changed.isEmpty else {
+        let groups = Dictionary(grouping: manifest.checkForLoad(in: directory)) { problem in
+            allowDegradedPPLX && manifest.pplxContract != nil ? problem.sourcePackage : nil
+        }
+        if let requiredAssets = groups[nil] {
             throw ServiceError(.unavailable, "model_files_changed",
                                "the model files do not match manifest.json: "
-                               + changed.map { "\($0.path) \($0.issue)" }.joined(separator: ", "),
+                               + requiredAssets.map { "\($0.path) \($0.issue)" }.joined(separator: ", "),
                                hint: "run `aneembed models verify`; reinstall with `aneembed models install`")
         }
-        log(String(format: "model files match the manifest (sizes; sha256 of %@) in %.2fs",
-                   Manifest.hashedAtLoad.joined(separator: ", "), Date().timeIntervalSince(checkStarted)))
-        return manifest
+        var unavailable: [String: String] = [:]
+        for (key, problems) in groups {
+            if let key { unavailable[key] = problems.map { "\($0.path) \($0.issue)" }.joined(separator: ", ") }
+        }
+        log(String(format: "checked model files against the manifest in %.2fs (%d invalid packages)",
+                   Date().timeIntervalSince(checkStarted), unavailable.count))
+        return (manifest, unavailable)
+    }
+}
+
+extension Manifest.Problem {
+    var sourcePackage: String? {
+        guard let slash = path.firstIndex(of: "/") else { return nil }
+        let directory = path[..<slash]
+        guard directory.hasSuffix(".mlpackage") else { return nil }
+        return String(directory.dropLast(".mlpackage".count))
     }
 }

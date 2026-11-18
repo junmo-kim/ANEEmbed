@@ -3,24 +3,28 @@ import Foundation
 
 enum CLI {
     static let usage = """
-        aneembed \(aneembedVersion): EmbeddingGemma 2 embeddings on the Apple Neural Engine
+        anerun \(aneembedVersion): embeddings on the Apple Neural Engine
 
         USAGE
-          aneembed embed [TEXT ...] [--stdin] [--image PATH ...] [--prompt query|document]
-                         [--dimensions 768|512|256|128] [--encoding float|base64] [--format yaml|json]
-          aneembed similarity A B [--image-a PATH] [--image-b PATH] [--prompt query|document]
+          anerun embed [TEXT ...] [--stdin] [--image PATH ...] [--prompt query|document]
+                         [--dimensions N] [--encoding float|base64] [--format yaml|json]
+          anerun similarity A B [--image-a PATH] [--image-b PATH] [--prompt query|document]
                          [--prompt-a ...] [--prompt-b ...] [--dimensions N] [--format yaml|json]
-          aneembed tokenize [TEXT ...] [--stdin] [--prompt query|document] [--show-tokens] [--format yaml|json]
-          aneembed doctor [--verify] [--format yaml|json]
-          aneembed models path | verify | warm | install [--from DIR | --repo R --revision REV]
-          aneembed bench [--sizes 32,128,...] [--repeat N] [--image PATH] [--concurrency N] [--buckets]
+          anerun tokenize [TEXT ...] [--stdin] [--prompt query|document] [--show-tokens] [--format yaml|json]
+          anerun doctor [--verify] [--format yaml|json]
+          anerun models path | verify | warm
+          anerun models install --model ID [--from DIR | --repo R --revision COMMIT]
+          anerun bench [--sizes 32,128,...] [--repeat N] [--image PATH] [--concurrency N] [--buckets]
                          [--breakdown] [--settle SECONDS] [--format yaml|json]
-          aneembed serve        HTTP: OpenAI /v1/embeddings, /v1/models, /health, POST /tokenize, /detokenize,
+          anerun serve        HTTP: OpenAI /v1/embeddings, /v1/models, /health, POST /tokenize, /detokenize,
                                 POST /mcp, QUERY /{tool}
-          aneembed mcp          MCP over stdio (newline-delimited JSON-RPC 2.0)
-          aneembed --version | --help | <command> --print-config
+          anerun mcp          MCP over stdio (newline-delimited JSON-RPC 2.0)
+          anerun --version | --help | <command> --print-config
 
-        Every command takes these options; each is also an environment variable of the same name:
+        Select a model with --model ID (or --model-dir DIR for commands that consume a package).
+        \(ModelID.catalog)
+
+        Every command takes these options. Legacy ANEEMBED_* variables are also accepted:
         \(Config.options.map { "  --\($0.name.padding(toLength: 18, withPad: " ", startingAt: 0)) \($0.environmentName.padding(toLength: 28, withPad: " ", startingAt: 0)) \($0.help)" }.joined(separator: "\n"))
 
         stdout carries data only (YAML by default, JSON with --format json; --stdin modes write JSONL).
@@ -35,7 +39,7 @@ enum CLI {
             return ExitCode.success.rawValue
         }
         if command == "--version" {
-            Output.data("aneembed \(aneembedVersion)")
+            Output.data("anerun \(aneembedVersion)")
             return ExitCode.success.rawValue
         }
         let rest = Array(arguments.dropFirst())
@@ -52,7 +56,7 @@ enum CLI {
             case "mcp": handler = MCPCommand()
             case "bench": handler = BenchCommand()
             default:
-                throw ServiceError.badRequest("unknown_command", "unknown command \(command); see aneembed --help")
+                throw ServiceError.badRequest("unknown_command", "unknown command \(command); see anerun --help")
             }
             let parsed = try handler.spec.parse(rest)
             format = parsed.value("format").flatMap(OutputFormat.init(rawValue:)) ?? .yaml
@@ -64,11 +68,24 @@ enum CLI {
                 throw ServiceError.badRequest("invalid_format", "--format must be yaml or json", param: "format")
             }
             let config = try Config(flags: parsed.configFlags)
+            let action = parsed.positionals.first ?? ""
+            let commandName = command == "models" ? "models \(action)" : command
+            let isInstall = command == "models" && action == "install" && parsed.positionals.count == 1
+            let needsModel: Bool
+            switch command {
+            case "doctor": needsModel = parsed.has("verify")
+            case "models": needsModel = parsed.positionals.count == 1 && ["path", "verify", "warm", "install"].contains(action)
+            default: needsModel = true
+            }
             if parsed.has("print-config") {
-                Output.data(config.printable, format: format)
+                let hasSelector = !config.string("model").isEmpty || !config.string("model-dir").isEmpty
+                let context = isInstall && hasSelector ? commandName : "--print-config"
+                let inspected = try config.selectingModel(for: context, required: false)
+                Output.data(inspected.printable, format: format)
                 return ExitCode.success.rawValue
             }
-            return try await handler.run(parsed, config: config, format: format).rawValue
+            let selected = try config.selectingModel(for: commandName, requiresName: isInstall, required: needsModel)
+            return try await handler.run(parsed, config: selected, format: format).rawValue
         } catch {
             Output.write(error.structured.render(as: format) + "\n", to: FileHandle.standardError)
             return error.exitCode.rawValue
@@ -124,8 +141,13 @@ struct EmbedCommand: Command {
         var options: JSONObject = [:]
         if let dimensions = arguments.value("dimensions") { options["dimensions"] = .string(dimensions) }
         if let encoding = arguments.value("encoding") { options["encoding_format"] = .string(encoding) }
-        let output = try Tools.outputOptions(options)
+        let model = config.modelID ?? .embeddingGemma2
+        let output = try Tools.outputOptions(options, modelID: model)
         let type = try inputType(arguments.value("prompt"), param: "prompt")
+        if !images.isEmpty && !model.supportsImages {
+            throw ServiceError(.invalidInput, "images_unsupported", "\(model.rawValue) accepts only text", param: "input",
+                               hint: "select --model embeddinggemma-2 for image embeddings")
+        }
         if !images.isEmpty && type != nil {
             throw .badRequest("invalid_prompt", "--prompt applies to texts only", param: "prompt")
         }
@@ -139,7 +161,7 @@ struct EmbedCommand: Command {
                 let result = try await service.embedTexts(batch.map(\.text), inputType: type)
                 var lines = ""
                 for (offset, item) in batch.enumerated() {
-                    let vector = Vectors.truncated(result.vectors[offset], to: output.dimensions)
+                    let vector = Vectors.output(result.vectors[offset], to: output.dimensions, modelID: service.modelID)
                     var record = JSONObject()
                     if let id = item.id { record["id"] = id }
                     record["index"] = .int(index + offset)
@@ -172,7 +194,7 @@ struct EmbedCommand: Command {
         } else {
             result = try await service.embedTexts(texts, inputType: type)
         }
-        Output.data(Tools.embeddingOutput(result, options: output, model: service.modelName), format: format)
+        Output.data(Tools.embeddingOutput(result, options: output, model: service.modelName, modelID: service.modelID), format: format)
         return .success
     }
 }
@@ -183,6 +205,12 @@ struct SimilarityCommand: Command {
     let spec = ArgumentSpec(values: ["image-a", "image-b", "prompt", "prompt-a", "prompt-b", "dimensions", "format"])
 
     func run(_ arguments: ParsedArguments, config: Config, format: OutputFormat) async throws(ServiceError) -> ExitCode {
+        if let model = config.modelID, !model.supportsImages,
+            arguments.value("image-a") != nil || arguments.value("image-b") != nil
+        {
+            throw ServiceError(.invalidInput, "images_unsupported", "\(model.rawValue) accepts only text", param: "input",
+                               hint: "select --model embeddinggemma-2 for image embeddings")
+        }
         var texts = arguments.positionals[...]
         var tool: JSONObject = [:]
         for side in ["a", "b"] {
@@ -212,13 +240,12 @@ struct TokenizeCommand: Command {
     let spec = ArgumentSpec(values: ["prompt", "format"], flags: ["stdin", "show-tokens"])
 
     func run(_ arguments: ParsedArguments, config: Config, format: OutputFormat) async throws(ServiceError) -> ExitCode {
-        let url = config.modelDirectory.appendingPathComponent(ModelLayout.tokenizer)
-        let tokenizer: GemmaTokenizer
-        do { tokenizer = try GemmaTokenizer(contentsOf: url) } catch {
-            throw ServiceError(.unavailable, "tokenizer_missing", "\(error)", hint: "pass --model-dir with a tokenizer.json")
-        }
+        let tokenizer = try ModelLoader.loadTokenizer(config)
         let type = try inputType(arguments.value("prompt"), param: "prompt")
-        func encode(_ text: String) -> [Int32] { tokenizer.encode(type.map { $0.apply(text) } ?? text) }
+        func encode(_ text: String) -> [Int32] {
+            let input = type?.apply(text, modelID: config.modelID ?? .embeddingGemma2) ?? text
+            return tokenizer.encode(input)
+        }
         if arguments.has("stdin") {
             var number = 0
             let input = LineReader(fileDescriptor: 0, maxLineBytes: config.maxBodyBytes, maxPending: 4)
@@ -239,7 +266,7 @@ struct TokenizeCommand: Command {
         let items: [JSONValue] = arguments.positionals.map { text in
             let ids = encode(text)
             var record: JSONObject = ["count": .int(ids.count), "ids": .array(ids.map { .int(Int($0)) })]
-            if arguments.has("show-tokens") { record["tokens"] = .array(tokenizer.tokens(ids).map(JSONValue.string)) }
+            if arguments.has("show-tokens") { record["tokens"] = .array(ids.map { .string(tokenizer.tokenLabel($0)) }) }
             return .object(record)
         }
         Output.data(["data": .array(items)], format: format)
@@ -281,6 +308,9 @@ struct ModelsCommand: Command {
                 throw .badRequest("fake_runtime", "models install compiles, warms and self-tests the model on the Neural "
                                   + "Engine; it does not run with --runtime fake", param: "runtime")
             }
+            guard let model = config.modelID else {
+                throw .badRequest("missing_model", "models install requires --model", param: "model")
+            }
             if let from = arguments.value("from") {
                 guard arguments.value("repo") == nil && arguments.value("revision") == nil else {
                     throw .badRequest("conflicting_options", "--from installs a local package; it takes no --repo or --revision")
@@ -288,14 +318,23 @@ struct ModelsCommand: Command {
                 return try await installLocal(URL(fileURLWithPath: (from as NSString).expandingTildeInPath), config: config,
                                               format: format)
             }
-            var source = ModelSource.pinned
-            if let repo = arguments.value("repo") { source.repository = repo }
-            if let revision = arguments.value("revision") {
-                source.revision = revision
-                source.manifestSHA256 = nil  // an explicit revision is trusted by its commit hash only
+            let repo = arguments.value("repo")
+            let revision = arguments.value("revision")
+            let source: ModelSource
+            if repo == nil && revision == nil {
+                source = model.source
+            } else {
+                guard let repo, ModelSource.isValidRepository(repo),
+                      let revision, revision.utf8.count == 40,
+                      revision.utf8.allSatisfy({ (48...57).contains($0) || (65...70).contains($0) || (97...102).contains($0) })
+                else {
+                    throw ServiceError(.badRequest, "invalid_model_source",
+                                       "received --repo \(repo ?? "(missing)") and --revision \(revision ?? "(missing)")",
+                                       param: "revision", hint: "supply --repo OWNER/NAME and --revision with a full 40-character commit")
+                }
+                source = ModelSource(repository: repo, revision: revision.lowercased())
             }
-            try source.validate()
-            return try await install(source, config: config, format: format)
+            return try await install(source, model: model, config: config, format: format)
         default:
             throw .badRequest("unknown_action", "unknown models action \(action); use path, verify, warm or install")
         }
@@ -304,8 +343,11 @@ struct ModelsCommand: Command {
     func verify(_ config: Config, format: OutputFormat) throws(ServiceError) -> ExitCode {
         let directory = config.modelDirectory
         let manifest = try Manifest.load(from: directory)
+        if let model = config.modelID { try manifest.checkModel(model, directory: directory) }
+        try manifest.checkPinned(config.pinnedManifestSHA256)
+        try manifest.checkContract()
         let problems = manifest.verify(in: directory, hash: true) { Log.info("hashing \($0)") }
-        let compiled = manifest.compiledStatus(in: directory, hash: true)
+        let compiled = manifest.compiledStatus(in: directory, hash: true, maxTokens: config.maxTokens)
         let ok = problems.isEmpty && !compiled.contains(where: \.problem)
         Output.data([
             "model_dir": .string(directory.path), "revision": .string(manifest.revision), "files": .int(manifest.files.count),
@@ -318,7 +360,7 @@ struct ModelsCommand: Command {
     }
 
     /// Loads (compiling on first use) and self-tests every function; records the warm state.
-    static func warm(_ config: Config) async throws(ServiceError) -> JSONValue {
+    static func warm(_ config: Config, requireCap: Bool = false) async throws(ServiceError) -> JSONValue {
         let started = Date()
         Log.info("loading \(config.modelDirectory.path) (the first time compiles for the Neural Engine; this can take minutes)")
         let (service, report) = try await ModelLoader.load(config, log: Log.info)
@@ -329,10 +371,15 @@ struct ModelsCommand: Command {
         let state = WarmState(osBuild: operatingSystemBuild, binaryVersion: aneembedVersion, manifestSHA256: report.manifestSHA256,
                               maxTokens: service.maxTokens, functions: service.runtime.info.functions, warmedAt: Date(),
                               seconds: (seconds * 10).rounded() / 10)
-        if !config.useFakeRuntime {
+        if !config.useFakeRuntime, config.modelID?.supportsImages == true {
             do { try state.save(to: config.modelDirectory) } catch {
                 Log.info("could not record the warm state: \(error.localizedDescription)")
             }
+        }
+        if requireCap && service.maxTokens < config.maxTokens {
+            throw ServiceError(.unavailable, "selftest_failed",
+                               "installed candidate serves \(service.maxTokens) tokens, requested \(config.maxTokens)",
+                               hint: "inspect the self-test log or retry with a verified package and --max-tokens \(service.maxTokens)")
         }
         var output = state.json
         if case .object(var object) = output {
@@ -343,63 +390,97 @@ struct ModelsCommand: Command {
         return output
     }
 
-    func install(_ source: ModelSource, config: Config, format: OutputFormat) async throws(ServiceError) -> ExitCode {
+    func install(_ source: ModelSource, model: ModelID, config: Config, format: OutputFormat)
+        async throws(ServiceError) -> ExitCode {
         guard source.isPublished else {
             throw ServiceError(.unavailable, "model_not_published",
-                               "no published model revision is pinned in this build",
-                               hint: "pass --from with a local package directory, or --repo and --revision")
+                               "no published revision of \(model.rawValue) is pinned in this build",
+                               hint: "run aneembed models install --model \(model.rawValue) --from DIR, or supply --repo and --revision")
         }
-        let store = ModelStore(dataDirectory: config.dataDirectory)
+        let store = ModelStore(dataDirectory: config.dataDirectory, model: model)
         let target = try store.directory(for: source.revision)
         let lock = try Self.lock(store)
         defer { lock.release() }
         ModelInstaller.removeStaleStaging(for: target)
         let started = Date()
-        try await ModelDownloader(source: source).install(into: target, store: store)
-        return try await finishInstall(store: store, revision: source.revision, fetched: Date().timeIntervalSince(started),
-                                       config: config, format: format)
+        let installed = try await ModelDownloader(source: source).install(into: target, store: store)
+        let manifest = try Manifest.load(from: installed)
+        return try await finishInstall(store: store, preferred: target, target: installed, manifest: manifest,
+                                       fetched: Date().timeIntervalSince(started), config: config, format: format)
     }
 
     func installLocal(_ source: URL, config: Config, format: OutputFormat) async throws(ServiceError) -> ExitCode {
         let manifest = try Manifest.load(from: source)
-        let store = ModelStore(dataDirectory: config.dataDirectory)
+        guard let model = config.modelID else {
+            throw .badRequest("missing_model", "models install requires --model", param: "model")
+        }
+        try manifest.checkModel(model, directory: source)
+        try manifest.checkContract()
+        let store = ModelStore(dataDirectory: config.dataDirectory, model: model)
         let revision = ModelInstaller.localRevision(manifest)
         let target = try store.directory(for: revision)
         let lock = try Self.lock(store)
         defer { lock.release() }
         ModelInstaller.removeStaleStaging(for: target)
         let started = Date()
-        if ModelInstaller.isInstalled(at: target, manifestSHA256: manifest.sha256) {
-            Log.info("\(revision) is already installed and verified")
+        let candidate = try ModelInstaller.installCandidate(target, in: store, manifestSHA256: manifest.sha256)
+        let installed = candidate.directory
+        if candidate.verified {
+            Log.info("\(installed.lastPathComponent) is already installed and verified")
         } else {
-            Log.info("installing \(source.path) as \(revision) (manifest sha256 \(manifest.sha256))")
-            _ = try ModelInstaller.copy(from: source, into: target, store: store, log: { Log.info($0) })
+            Log.info("installing \(source.path) as \(installed.lastPathComponent) (manifest sha256 \(manifest.sha256))")
+            _ = try ModelInstaller.copy(from: source, into: installed, store: store, manifest: manifest, log: Log.info)
         }
-        return try await finishInstall(store: store, revision: revision, fetched: Date().timeIntervalSince(started),
-                                       config: config, format: format)
+        return try await finishInstall(store: store, preferred: target, target: installed, manifest: manifest,
+                                       fetched: Date().timeIntervalSince(started), config: config, format: format)
     }
 
     /// The install lock: a second `models install` waits for the first one (download, compile, warm, switch).
     static func lock(_ store: ModelStore) throws(ServiceError) -> InstallLock {
-        try InstallLock.acquire(in: store) { Log.info("another `aneembed models install` is running; waiting for it") }
+        try InstallLock.acquire(in: store) { Log.info("another `anerun models install` is running; waiting for it") }
     }
 
     /// Compile, warm (with the self-test) and switch `current` to the new revision.
-    func finishInstall(store: ModelStore, revision: String, fetched: Double, config: Config, format: OutputFormat)
-        async throws(ServiceError) -> ExitCode
+    func finishInstall(store: ModelStore, preferred: URL, target: URL, manifest: Manifest, fetched: Double, config: Config,
+                       format: OutputFormat, rebuild: Bool = false) async throws(ServiceError) -> ExitCode
     {
-        let target = try store.directory(for: revision)
+        let revision = target.lastPathComponent
         let compileStarted = Date()
-        let differing = try await ModelInstaller.compile(in: target, log: { Log.info($0) })
-        let compiled = Date().timeIntervalSince(compileStarted)
-        if !differing.isEmpty {
-            Log.info("note: \(differing.count) compiled files differ from the packager's compile (another Core ML compiler); "
-                + "the self-test checks the result")
+        let differing: [Manifest.Problem]
+        let compiled: TimeInterval
+        let warm: JSONValue
+        do throws(ServiceError) {
+            differing = try await ModelInstaller.compile(in: target, maxTokens: config.maxTokens, rebuild: rebuild, log: Log.info)
+            compiled = Date().timeIntervalSince(compileStarted)
+            if !differing.isEmpty {
+                Log.info("note: \(differing.count) compiled files differ from the packager's compile (another Core ML compiler); "
+                    + "the self-test checks the result")
+            }
+            warm = try await Self.warm(config.withModelDirectory(target), requireCap: config.modelID?.supportsImages == false)
+        } catch {
+            guard !rebuild, !Task.isCancelled,
+                  ["compile_failed", "model_load_failed", "selftest_failed", "warm_failed"].contains(error.reason)
+            else { throw error }
+            let started = Date()
+            guard ModelInstaller.isInstalled(at: target, manifestSHA256: manifest.sha256) else { throw error }
+            if !store.isActive(target) {
+                Log.info("rebuilding the compiled cache for \(revision) after \(error.reason)")
+                return try await finishInstall(store: store, preferred: preferred, target: target, manifest: manifest,
+                                               fetched: fetched + Date().timeIntervalSince(started), config: config,
+                                               format: format, rebuild: true)
+            }
+            let repair = try ModelInstaller.repairCandidate(for: preferred, in: store, manifestSHA256: manifest.sha256)
+            Log.info("retrying \(revision) at \(repair.directory.path) after \(error.reason)")
+            if !repair.verified {
+                _ = try ModelInstaller.copy(from: target, into: repair.directory, store: store, manifest: manifest, log: Log.info)
+            }
+            return try await finishInstall(store: store, preferred: preferred, target: repair.directory, manifest: manifest,
+                                           fetched: fetched + Date().timeIntervalSince(started), config: config, format: format)
         }
-        var warmConfigFlags = config.values.filter { config.sources[$0.key] != .default }
-        warmConfigFlags["model-dir"] = target.path
-        let warmConfig = try Config(flags: warmConfigFlags, environment: [:])
-        let warm = try await Self.warm(warmConfig)
+        guard !Task.isCancelled else {
+            throw ServiceError(.loading, "install_cancelled", "installation cancelled before activating \(revision)",
+                               hint: "retry aneembed models install")
+        }
         do { try store.activate(revision: revision) } catch {
             throw ServiceError(.internal, "activate_failed", "cannot switch to \(revision): \(error.localizedDescription)")
         }
@@ -422,9 +503,13 @@ struct BenchCommand: Command {
     func run(_ arguments: ParsedArguments, config: Config, format: OutputFormat) async throws(ServiceError) -> ExitCode {
         var options = Bench.Options()
         if let sizes = arguments.value("sizes") {
-            let parsed = sizes.split(separator: ",").compactMap { Int($0) }
-            guard !parsed.isEmpty, parsed.allSatisfy({ $0 >= 3 && $0 <= 8192 }) else {
-                throw .badRequest("invalid_sizes", "--sizes takes token counts in 3...8192, comma separated", param: "sizes")
+            let parts = sizes.split(separator: ",", omittingEmptySubsequences: false)
+            let parsed = parts.compactMap { Int($0) }
+            let model = config.modelID ?? .embeddingGemma2
+            let range = model.supportsImages ? 3...8192 : model.tokenRange
+            guard !parsed.isEmpty, parsed.count == parts.count, parsed.allSatisfy(range.contains) else {
+                throw .badRequest("invalid_sizes", "--sizes \(sizes): expected token counts in \(range), comma separated",
+                                  param: "sizes")
             }
             options.sizes = parsed
         }
@@ -438,7 +523,13 @@ struct BenchCommand: Command {
         options.repeats = try integer("repeat", 1...1000) ?? options.repeats
         options.concurrency = try integer("concurrency", 1...256) ?? 0
         options.settleSeconds = Double(try integer("settle", 0...3600) ?? 0)
-        if let path = arguments.value("image") { options.image = try readFile(path) }
+        if let path = arguments.value("image") {
+            if let model = config.modelID, !model.supportsImages {
+                throw ServiceError(.invalidInput, "images_unsupported", "\(model.rawValue) accepts only text",
+                                   param: "image", hint: "use --model embeddinggemma-2 to benchmark an image")
+            }
+            options.image = try readFile(path)
+        }
         options.buckets = arguments.has("buckets")
         options.breakdown = arguments.has("breakdown")
         Output.data(try await Bench.run(config, options: options, log: Log.info), format: format)
@@ -455,7 +546,9 @@ struct ServeCommand: Command {
         let state = ServerState()
         let server = HTTPServer(host: config.host, port: config.port, maxBody: config.maxBodyBytes,
                                 maxConnections: config.maxConnections,
-                                router: Router(state: state, modelName: config.modelName, log: { Log.info($0) }))
+                                router: Router(state: state, modelName: config.modelName,
+                                               modelID: config.modelID ?? .embeddingGemma2,
+                                               configuredMaxTokens: config.maxTokens, log: { Log.info($0) }))
         try server.start()
         if !["127.0.0.1", "::1", "localhost"].contains(config.host) {
             Log.info("warning: listening on \(config.host) without authentication; anyone who can reach this port can use it")
@@ -471,9 +564,12 @@ func load(into state: ServerState, config: Config) async {
     do throws(ServiceError) {
         let directory = config.modelDirectory
         if !config.useFakeRuntime {
-            let manifestSHA256 = (try? Manifest.load(from: directory))?.sha256 ?? ""
-            if let warm = WarmState.load(from: directory),
-                warm.covers(osBuild: operatingSystemBuild, maxTokens: config.maxTokens, manifestSHA256: manifestSHA256)
+            let manifest = try? Manifest.load(from: directory)
+            let required = manifest?.pplxContract?.requiredFunctions(for: config.maxTokens).map(\.function) ?? []
+            let compiled = manifest?.compiledStatus(in: directory, maxTokens: config.maxTokens) ?? []
+            if let warm = WarmState.load(from: directory), !compiled.contains(where: \.problem),
+                warm.covers(osBuild: operatingSystemBuild, maxTokens: config.maxTokens, manifestSHA256: manifest?.sha256 ?? "",
+                            requiredFunctions: required)
             {
                 Log.info("loading \(directory.path) (warm for this macOS build)")
             } else {
@@ -484,9 +580,11 @@ func load(into state: ServerState, config: Config) async {
         do { try await service.runtime.warm() } catch {
             throw ServiceError(.unavailable, "warm_failed", "\(error)")
         }
-        if !config.useFakeRuntime,
-            !(WarmState.load(from: directory)?.covers(osBuild: operatingSystemBuild, maxTokens: service.maxTokens,
-                                                      manifestSHA256: report.manifestSHA256) ?? false)
+        if !config.useFakeRuntime, config.modelID?.supportsImages == true,
+            service.maxTokens < config.maxTokens
+                || !(WarmState.load(from: directory)?.covers(osBuild: operatingSystemBuild, maxTokens: service.maxTokens,
+                                                      manifestSHA256: report.manifestSHA256,
+                                                      requiredFunctions: service.runtime.info.functions) ?? false)
         {
             let warm = WarmState(osBuild: operatingSystemBuild, binaryVersion: aneembedVersion, manifestSHA256: report.manifestSHA256,
                                  maxTokens: service.maxTokens, functions: service.runtime.info.functions,
@@ -520,7 +618,9 @@ struct MCPCommand: Command {
     func run(_ arguments: ParsedArguments, config: Config, format: OutputFormat) async throws(ServiceError) -> ExitCode {
         let state = ServerState()
         let loader = Task { await load(into: state, config: config) }
-        let handler = MCPHandler(state: state, allowPaths: true, waitForModel: true)
+        let handler = MCPHandler(state: state, allowPaths: true, waitForModel: true,
+                                 modelID: config.modelID ?? .embeddingGemma2,
+                                 configuredMaxTokens: config.maxTokens)
         let input = LineReader(fileDescriptor: 0, maxLineBytes: config.maxBodyBytes, maxPending: Self.maxInFlight)
         await withDiscardingTaskGroup { group in
             for await item in input.lines {

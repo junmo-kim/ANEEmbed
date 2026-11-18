@@ -25,6 +25,7 @@ Usage (the tools/convert venv; CPU only). corpus.json and the image folder come 
     python -I scripts/accuracy/reference.py --hf-dir DIR --corpus corpus.json --images DIR --out reference.json
 """
 import argparse
+import hashlib
 import json
 import os
 import sys
@@ -49,12 +50,19 @@ def main():
     torch.set_num_threads(args.threads)
 
     from tokenizers import Tokenizer
-    from transformers import AutoModel, AutoProcessor
+    from transformers import EmbeddingGemma2Model, AutoProcessor
 
     tok = Tokenizer.from_file(os.path.join(args.hf_dir, "tokenizer.json"))
-    model = AutoModel.from_pretrained(args.hf_dir, dtype=torch.float32).eval()
-    proc = AutoProcessor.from_pretrained(args.hf_dir)
-    docs = json.load(open(args.corpus))
+    model = EmbeddingGemma2Model.from_pretrained(args.hf_dir, dtype=torch.float32, use_safetensors=True, local_files_only=True).eval()
+    proc = AutoProcessor.from_pretrained(args.hf_dir, local_files_only=True, trust_remote_code=False)
+    with open(args.corpus, "rb") as source:
+        corpus_bytes = source.read()
+    docs = json.loads(corpus_bytes)
+    legacy = any(doc.get("name") == "hf-eg2-modeling-code" for doc in docs)
+    versions = {doc.get("corpus_version", "aneembed-corpus/1" if legacy else "unversioned") for doc in docs}
+    if len(versions) != 1:
+        raise ValueError("accuracy inputs must come from a single corpus version")
+    corpus_meta = {"version": versions.pop(), "sha256": hashlib.sha256(corpus_bytes).hexdigest()}
 
     def ids_of(text):
         return [BOS] + tok.encode(text, add_special_tokens=False).ids + [EOS]
@@ -140,14 +148,15 @@ def main():
     # The pipeline above equals sentence-transformers end to end (prompt handling, pooling, normalization).
     from sentence_transformers import SentenceTransformer
 
-    st = SentenceTransformer(args.hf_dir, device="cpu", model_kwargs={"dtype": torch.float32})
+    st = SentenceTransformer(args.hf_dir, device="cpu", local_files_only=True, trust_remote_code=False,
+                             model_kwargs={"dtype": torch.float32, "use_safetensors": True})
     checks = []
     for case in cases[:12:3]:
         e = st.encode([case["texts"][0]], prompt="", normalize_embeddings=True)[0]
         checks.append(float(np.dot(e, case["reference"][0])))
     print(f"sentence-transformers cross-check min cos {min(checks):.7f}", flush=True)
 
-    meta = {"format": "aneembed-accuracy/1", "prompt": PROMPT, "precision": "fp32", "device": "cpu",
+    meta = {"format": "aneembed-accuracy/1", "corpus": corpus_meta, "prompt": PROMPT, "precision": "fp32", "device": "cpu",
             "torch": torch.__version__, "sentence_transformers_check_min_cos": min(checks),
             "seconds": round(time.time() - started, 1), "cases": cases}
     json.dump(meta, open(args.out, "w"))

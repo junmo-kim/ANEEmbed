@@ -2,11 +2,11 @@
 //
 // Scheduling: three lanes with separate concurrency limits, so a burst of long documents or images
 // cannot make short queries wait behind them (the prototype's lesson from a shared CPU worker queue).
-//   query: texts of at most 512 tokens   image: decode + vision + text   long: texts over 512 tokens
+//   query: short texts   image: decode + vision + text   long: texts above the query lane limit
 import Foundation
 
 public struct ServiceLimits: Sendable, Equatable {
-    /// Longest text accepted (tokens including <bos>/<eos>); capped by the runtime.
+    /// Longest text accepted in model tokens, capped by the runtime.
     public var maxTokens = 2048
     public var maxInputs = 2048
     public var maxImages = 8
@@ -14,7 +14,7 @@ public struct ServiceLimits: Sendable, Equatable {
     public var queryConcurrency = 8
     public var imageConcurrency = 2
     public var longConcurrency = 2
-    /// Texts up to this many tokens use the query lane.
+    /// Texts up to this many tokens use the query lane. Config uses 64 for Qwen3.
     public var shortTokens = 512
 
     public init() {}
@@ -22,7 +22,7 @@ public struct ServiceLimits: Sendable, Equatable {
 
 public struct EmbeddingResult: Sendable, Equatable {
     public var vectors: [[Float]]
-    /// Per input: tokens the model saw (texts: with <bos>/<eos>; images: soft tokens + 4).
+    /// Per input: tokens the model saw (images: soft tokens + 4).
     public var tokenCounts: [Int]
     public var totalTokens: Int { tokenCounts.reduce(0, +) }
 
@@ -37,18 +37,20 @@ public final class EmbeddingService: Sendable {
     public let runtime: any EmbeddingRuntime
     public let limits: ServiceLimits
     public let modelName: String
+    public let modelID: ModelID
     private let queryLane: AsyncSemaphore
     private let imageLane: AsyncSemaphore
     private let longLane: AsyncSemaphore
     private let tokenizerLane: AsyncSemaphore
 
     public init(tokenizer: any TextTokenizer, runtime: any EmbeddingRuntime, limits: ServiceLimits = ServiceLimits(),
-                modelName: String = "embeddinggemma-2")
+                modelName: String = "embeddinggemma-2", modelID: ModelID = .embeddingGemma2)
     {
         self.tokenizer = tokenizer
         self.runtime = runtime
         self.limits = limits
         self.modelName = modelName
+        self.modelID = modelID
         queryLane = AsyncSemaphore(max(1, limits.queryConcurrency))
         imageLane = AsyncSemaphore(max(1, limits.imageConcurrency))
         longLane = AsyncSemaphore(max(1, limits.longConcurrency))
@@ -70,10 +72,11 @@ public final class EmbeddingService: Sendable {
     }
 
     public var maxTokens: Int { min(limits.maxTokens, runtime.info.maxTokens) }
-    public var maxImageTokens: Int { runtime.info.maxImageTokens }
+    public var maxImageTokens: Int { modelID.supportsImages ? runtime.info.maxImageTokens : 0 }
 
     public func tokenize(_ text: String, inputType: InputType? = nil) -> [Int32] {
-        tokenizer.encode(inputType.map { $0.apply(text) } ?? text)
+        let prepared = inputType?.apply(text, modelID: modelID) ?? text
+        return tokenizer.encode(prepared)
     }
 
     // MARK: Texts
@@ -83,6 +86,11 @@ public final class EmbeddingService: Sendable {
         guard texts.count <= limits.maxInputs else {
             throw .badRequest("too_many_inputs", "at most \(limits.maxInputs) inputs per request", param: "input")
         }
+        return try await embedTextBatch(texts, inputType: inputType)
+    }
+
+    // A similarity request has two distinct operands, so it can validate them together without a text-list limit.
+    func embedTextBatch(_ texts: [String], inputType: InputType? = nil) async throws(ServiceError) -> EmbeddingResult {
         let limit = maxTokens
         func tooLong(_ index: Int, _ tokens: String) -> ServiceError {
             ServiceError(.invalidInput, "context_length_exceeded",
@@ -90,18 +98,38 @@ public final class EmbeddingService: Sendable {
                          param: "input",
                          hint: limit < runtime.info.maxTokens ? "raise --max-tokens (up to \(runtime.info.maxTokens))" : nil)
         }
-        // Tokenizing costs time and memory in proportion to the text, so a text that cannot fit is refused from its
-        // byte count first (no token stands for more than maxBytesPerToken bytes; see GemmaTokenizer).
-        if let bytesPerToken = tokenizer.maxBytesPerToken {
-            let prefixBytes = inputType?.prefix.utf8.count ?? 0
-            if let over = texts.firstIndex(where: { $0.utf8.count + prefixBytes > limit * bytesPerToken }) {
-                let bytes = texts[over].utf8.count + prefixBytes
-                throw tooLong(over, "at least \((bytes + bytesPerToken - 1) / bytesPerToken)")
+        var tokenized: [[Int32]]
+        switch modelID {
+        case .embeddingGemma2:
+            // Gemma can reject from the byte count before encoding any input.
+            if let bytesPerToken = tokenizer.maxBytesPerToken {
+                let prefixBytes = inputType?.prefix.utf8.count ?? 0
+                if let over = texts.firstIndex(where: { $0.utf8.count + prefixBytes > limit * bytesPerToken }) {
+                    let bytes = texts[over].utf8.count + prefixBytes
+                    throw tooLong(over, "at least \((bytes + bytesPerToken - 1) / bytesPerToken)")
+                }
             }
-        }
-        let tokenized = texts.map { tokenize($0, inputType: inputType) }
-        if let over = tokenized.firstIndex(where: { $0.count > limit }) {
-            throw tooLong(over, "\(tokenized[over].count)")
+            tokenized = texts.map { tokenize($0, inputType: inputType) }
+            if let over = tokenized.firstIndex(where: { $0.count > limit }) {
+                throw tooLong(over, "\(tokenized[over].count)")
+            }
+        case .pplx, .qwen3Embedding:
+            tokenized = []
+            tokenized.reserveCapacity(texts.count)
+            for (index, text) in texts.enumerated() {
+                let prepared = inputType?.apply(text, modelID: modelID) ?? text
+                switch tokenizer.encodeForEmbedding(prepared, limit: limit) {
+                case .tooLong(let atLeast):
+                    throw tooLong(index, "at least \(atLeast)")
+                case .ids(let ids):
+                    guard !ids.isEmpty else {
+                        throw ServiceError(.invalidInput, "empty_sequence", "input[\(index)] has no tokens",
+                                           param: "input", hint: "pass text that yields at least one token")
+                    }
+                    guard ids.count <= limit else { throw tooLong(index, "\(ids.count)") }
+                    tokenized.append(ids)
+                }
+            }
         }
         let short = tokenized.indices.filter { tokenized[$0].count <= limits.shortTokens }
         let long = tokenized.indices.filter { tokenized[$0].count > limits.shortTokens }
@@ -141,10 +169,7 @@ public final class EmbeddingService: Sendable {
         guard images.count <= limits.maxImages else {
             throw .badRequest("too_many_images", "at most \(limits.maxImages) image items per request", param: "input")
         }
-        guard maxImageTokens > 0 else {
-            throw ServiceError(.invalidInput, "images_unsupported",
-                               "image inputs are not supported: the model has no vision encoder", param: "input")
-        }
+        guard maxImageTokens > 0 else { throw Self.imagesUnsupported(modelID) }
         if let big = images.firstIndex(where: { $0.count > limits.maxImageBytes }) {
             throw ServiceError(.payloadTooLarge, "image_too_large",
                                "input[\(big)] is \(images[big].count) bytes; the limit is \(limits.maxImageBytes)",
@@ -183,6 +208,12 @@ public final class EmbeddingService: Sendable {
         } catch {
             throw Self.map(error)
         }
+    }
+
+    static func imagesUnsupported(_ modelID: ModelID) -> ServiceError {
+        ServiceError(.invalidInput, "images_unsupported",
+                     "image inputs are not supported: the model has no vision encoder", param: "input",
+                     hint: modelID.supportsImages ? nil : "select --model embeddinggemma-2 for image inputs")
     }
 
     static func map(_ error: Error) -> ServiceError {

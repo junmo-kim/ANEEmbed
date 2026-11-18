@@ -86,16 +86,16 @@ jobs:
         run: ruby Tests/Integration/release-workflow-contract.rb
 
       - name: Release binary smoke test (fake runtime, real sockets)
-        run: Tests/Integration/release-binary-launch-smoke.sh .build/release/aneembed
+        run: Tests/Integration/release-binary-launch-smoke.sh .build/release/anerun
 
       - name: Binary size
-        run: ls -l .build/release/aneembed
+        run: ls -l .build/release/anerun
 
       - name: Upload release binary
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: aneembed-macos-26
-          path: .build/release/aneembed
+          name: anerun-macos-26
+          path: .build/release/anerun
           if-no-files-found: error
           retention-days: 1
 
@@ -107,7 +107,7 @@ jobs:
           else
             OUT="$(scripts/gen-release-notes.sh "$LATEST_TAG")"
             echo "$OUT"
-            echo "$OUT" | grep -qE "^## aneembed ${LATEST_TAG}\$" || { echo "::error::missing title heading"; exit 1; }
+            echo "$OUT" | grep -qE "^## anerun ${LATEST_TAG}\$" || { echo "::error::missing title heading"; exit 1; }
             echo "$OUT" | grep -q "What's Changed" || { echo "::error::missing What's Changed section"; exit 1; }
           fi
 
@@ -130,7 +130,7 @@ jobs:
       - name: Privacy guard (network APIs only in the listener and the model downloader)
         run: |
           if grep -rInE 'URLSession|URLRequest|NWConnection|NWListener|NWPath|NWBrowser|NWEndpoint|NWParameters|import Network([^A-Za-z]|$)|getaddrinfo|CFSocket|dataTask|downloadTask' Sources/ \
-              | grep -vE '^Sources/aneembed/(HTTPServer|ModelDownloader)\.swift:'; then
+              | grep -vE '^Sources/anerun/(HTTPServer|ModelDownloader)\.swift:'; then
             echo "::error::a networking API appears outside HTTPServer.swift / ModelDownloader.swift"; exit 1
           fi
           echo "ok: networking confined to HTTPServer.swift and ModelDownloader.swift"
@@ -146,13 +146,13 @@ jobs:
       - name: Download release binary
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          name: aneembed-macos-26
+          name: anerun-macos-26
           path: dist
 
       - name: Smoke test on macOS 15
         run: |
-          chmod +x dist/aneembed
-          Tests/Integration/release-binary-launch-smoke.sh dist/aneembed
+          chmod +x dist/anerun
+          Tests/Integration/release-binary-launch-smoke.sh dist/anerun
 
   build-older-toolchain:
     name: build + test with the macOS 15 runner's default Xcode

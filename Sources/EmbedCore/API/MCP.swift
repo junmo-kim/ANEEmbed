@@ -13,15 +13,20 @@ public struct MCPHandler: Sendable {
     /// HTTP: server-side failures are reported with a generic message (ServiceError.publicFacing) and their detail
     /// goes to `log`; stdio, a local client, gets the detail.
     public let publicErrors: Bool
+    public let modelID: ModelID
+    private let configuredMaxTokens: Int
     public let log: @Sendable (String) -> Void
 
     public init(state: ServerState, allowPaths: Bool, waitForModel: Bool, publicErrors: Bool = false,
+                modelID: ModelID = .embeddingGemma2, configuredMaxTokens: Int = ServiceLimits().maxTokens,
                 log: @escaping @Sendable (String) -> Void = { _ in })
     {
         self.state = state
         self.allowPaths = allowPaths
         self.waitForModel = waitForModel
         self.publicErrors = publicErrors
+        self.modelID = modelID
+        self.configuredMaxTokens = configuredMaxTokens
         self.log = log
     }
 
@@ -45,7 +50,13 @@ public struct MCPHandler: Sendable {
         case "ping":
             return Self.result(id: id, [:])
         case "tools/list":
-            return Self.result(id: id, ["tools": .array(Tools.definitions)])
+            let maxContextLength: Int
+            if case .ready(let service) = state.status {
+                maxContextLength = service.maxTokens
+            } else {
+                maxContextLength = configuredMaxTokens
+            }
+            return Self.result(id: id, ["tools": .array(Tools.definitions(for: modelID, maxContextLength: maxContextLength))])
         case "tools/call":
             guard let name = params["name"]?.stringValue else {
                 return Self.error(id: id, code: -32602, message: "tools/call needs params.name")

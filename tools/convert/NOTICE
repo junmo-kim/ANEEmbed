@@ -11,10 +11,13 @@ Files and their origin:
   embeddings.bf16                             token embedding table extracted unchanged (bf16) from
                                               the original model.safetensors
   tokenizer.json                              the original tokenizer, unchanged
-  EmbeddingGemma2Vision.mlpackage / .mlmodelc the vision encoder conversion by FluidInference
-  position_embeddings.f16                     (https://huggingface.co/FluidInference/embeddinggemma-2-coreml,
-                                              Apache-2.0), copied unchanged
+  EmbeddingGemma2Vision.mlpackage / .mlmodelc converted by ANERun from the Google vision tower and projection
+  position_embeddings.f16                     first 1024 learned patch positions on each axis, converted to fp16
 
-Modifications relative to the original model: re-expression of the text encoder as Core ML functions
+Earlier packages shipped the vision conversion by FluidInference
+(https://huggingface.co/FluidInference/embeddinggemma-2-coreml, Apache-2.0).
+The new conversion uses the same host interface.
+
+Modifications relative to the original model: re-expression of the text and vision encoders as Core ML functions
 (fixed-length buckets, per-layer long-context functions), fp16 weights and activations, numerically
 neutral rewrites listed in the model card. No weights were retrained or altered beyond fp16 rounding.

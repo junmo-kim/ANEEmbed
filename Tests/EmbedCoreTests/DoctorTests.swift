@@ -94,6 +94,21 @@ struct DoctorTests {
         #expect(Doctor.report(config)["compile_cache"]?.stringValue?.hasPrefix("stale") == true)
     }
 
+    @Test func plainDoctorRejectsAnAssetWithTheRightSizeAndWrongHash() throws {
+        let directory = try Self.modelDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let config = try Config(flags: ["model-dir": directory.path, "runtime": "fake"], environment: [:])
+        let manifest = try Manifest.load(from: directory)
+        try WarmState(osBuild: operatingSystemBuild, binaryVersion: "test", manifestSHA256: manifest.sha256,
+                      maxTokens: 2048, functions: [], warmedAt: Date(), seconds: 0).save(to: directory)
+        #expect(Doctor.report(config)["ready"] == true)
+
+        try Data("[]".utf8).write(to: directory.appendingPathComponent(ModelLayout.tokenizer))
+        let report = Doctor.report(config)
+        #expect(report["ready"] == false)
+        #expect(report["model"]?["manifest"]?["problems"] == ["tokenizer.json: sha256_mismatch"])
+    }
+
     /// A data directory whose pinned revision holds `modelDirectory()`: a package consistent with its own manifest,
     /// but not the one pinned in this build.
     static func replacedPinnedRevision() throws -> (dataDirectory: URL, revision: URL) {
@@ -108,7 +123,8 @@ struct DoctorTests {
     @Test func aReplacedPinnedRevisionIsNotReady() throws {
         let (dataDirectory, revision) = try Self.replacedPinnedRevision()
         defer { try? FileManager.default.removeItem(at: dataDirectory) }
-        let config = try Config(flags: ["data-dir": dataDirectory.path], environment: [:])
+        let config = try Config(flags: ["data-dir": dataDirectory.path, "model": "embeddinggemma-2"], environment: [:])
+            .selectingModel(for: "doctor")
         #expect(config.modelDirectory.lastPathComponent == ModelSource.pinned.revision)
         #expect(Self.problems(config).contains { $0.contains("pinned in this build") })
         // The same files as --model-dir are checked against their own manifest only.

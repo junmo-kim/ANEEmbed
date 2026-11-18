@@ -29,10 +29,10 @@ ap.add_argument("--hf-dir", required=True, help="google/embeddinggemma-2 snapsho
 args = ap.parse_args()
 torch.set_num_threads(8)
 mode, dist, HF = args.mode, args.dist, args.hf_dir
-from transformers import AutoModel, AutoProcessor  # noqa: E402
+from transformers import EmbeddingGemma2Model, AutoProcessor  # noqa: E402
 
-model = AutoModel.from_pretrained(HF, dtype=torch.float32).eval()
-proc = AutoProcessor.from_pretrained(HF)
+model = EmbeddingGemma2Model.from_pretrained(HF, dtype=torch.float32, use_safetensors=True, local_files_only=True).eval()
+proc = AutoProcessor.from_pretrained(HF, local_files_only=True, trust_remote_code=False)
 res = {}
 
 
@@ -68,7 +68,8 @@ if mode == "anchor":
         print(f"anchor {docs[d]['name']} n={len(ids)} cos(Reference fp32, HF fp32)={c:.7f}", flush=True)
     # sentence-transformers end to end (tokenizer + prompt + pooling) for two short texts
     from sentence_transformers import SentenceTransformer
-    st = SentenceTransformer(HF, device="cpu", model_kwargs={"dtype": torch.float32})
+    st = SentenceTransformer(HF, device="cpu", local_files_only=True, trust_remote_code=False,
+                             model_kwargs={"dtype": torch.float32, "use_safetensors": True})
     for t in ("The quick brown fox jumps over the lazy dog.", "대한민국은 민주공화국이다. 대한민국의 주권은 국민에게 있다."):
         ids = tok.ids(t)
         e_st = st.encode([t], prompt=host.DOC_PREFIX, normalize_embeddings=True)[0]
@@ -135,7 +136,8 @@ if mode == "images":
             print(f"packed S={S} {items} cos={[round(c, 6) for c in cs]}", flush=True)
     # cross-check: HF reference pipeline == sentence-transformers encode (default 280 budget)
     from sentence_transformers import SentenceTransformer
-    st = SentenceTransformer(HF, device="cpu", model_kwargs={"dtype": torch.float32})
+    st = SentenceTransformer(HF, device="cpu", local_files_only=True, trust_remote_code=False,
+                             model_kwargs={"dtype": torch.float32, "use_safetensors": True})
     for p in paths[:2]:
         try:
             e_st = st.encode([Image.open(p)], normalize_embeddings=True)[0]

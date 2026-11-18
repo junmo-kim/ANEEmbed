@@ -1,8 +1,8 @@
-ANEEmbed
+ANERun
 Copyright (c) 2026 Junmo Kim. Licensed under the MIT License (see LICENSE).
 
 This software works with, but does not include, the following models. Model packages are downloaded
-separately by `aneembed models install` and keep their own licenses.
+separately by `anerun models install` and keep their own licenses.
 
 EmbeddingGemma 2 (model weights and tokenizer)
   Copyright Google LLC. Licensed under the Apache License, Version 2.0.
@@ -10,9 +10,15 @@ EmbeddingGemma 2 (model weights and tokenizer)
   Tests/Fixtures/tokenizer.json.xz is the unchanged tokenizer.json of this model, compressed, used
   only by the test suite. Tests/Fixtures/tokenizer-golden.jsonl.xz holds token ids produced from it.
 
-Core ML vision functions (vision_70 / vision_140 / vision_280) and position_embeddings.f16
-  From FluidInference/embeddinggemma-2-coreml. Licensed under the Apache License, Version 2.0.
+Previously distributed Core ML vision functions and position_embeddings.f16
+  Earlier packages used FluidInference/embeddinggemma-2-coreml. Licensed under the Apache License, Version 2.0.
   https://huggingface.co/FluidInference/embeddinggemma-2-coreml
+
+pplx-embed-v1-0.6b (model weights and tokenizer)
+  Copyright Perplexity AI. Licensed under the MIT License.
+  https://huggingface.co/perplexity-ai/pplx-embed-v1-0.6b
+  Tests/Fixtures/Qwen/tokenizer.json.xz is the compressed model tokenizer used by the test suite.
+  Its license is in tools/convert/PPLX-LICENSE.
 
 Behaviour reproduced (no code copied)
   The image preprocessing reproduces, to the bit, the output of Hugging Face transformers'

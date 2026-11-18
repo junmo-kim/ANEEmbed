@@ -1,12 +1,13 @@
 # Model conversion and verification
 
-These scripts build the model package published as [junmo-k/embeddinggemma-2-ane](https://huggingface.co/junmo-k/embeddinggemma-2-ane) from public inputs only, and check it against the original model in fp32. `aneembed` does not need them; they exist so that the package can be rebuilt and audited.
+These scripts build and verify Core ML packages for EmbeddingGemma 2, pplx-embed-v1-0.6b and Qwen3-Embedding-0.6B against pinned public sources. Published packages are available for [EmbeddingGemma 2](https://huggingface.co/junmo-k/embeddinggemma-2-ane), [PPLX](https://huggingface.co/junmo-k/pplx-embed-v1-0.6b-ane) and [Qwen](https://huggingface.co/junmo-k/qwen3-embedding-0.6b-ane). `anerun` does not need them; they exist so that the package can be rebuilt and audited.
 
 | Script | What it does |
 |---|---|
-| `sources.json` | Every input, pinned: the two Hugging Face repositories (revision + sha256) and the evaluation texts and images (GitHub commit, Wikisource page revision or Python package version, path, license, sha256). |
-| `fetch.py` | `models`: downloads `google/embeddinggemma-2` and the FluidInference vision package at the pinned revisions. `data`: downloads the evaluation files (and copies the ones that ship inside pinned packages). Checks every sha256. |
+| `sources.json` | Every input, pinned: the Hugging Face repositories (revision + sha256) and the evaluation texts and images (GitHub commit, Wikisource page revision or Python package version, path, license, sha256). |
+| `fetch.py` | `models`: downloads the selected model inputs at pinned revisions. The default fetches only the named Google checkpoint data files in `sources.json`. A verified local file is reused offline. `data`: downloads the evaluation files (and copies the ones that ship inside pinned packages). Checks every sha256. |
 | `eg2.py` | The EmbeddingGemma 2 text encoder re-written in PyTorch for the ANE: `Bucket` (full attention) and `Window` (block-local sliding attention over a band; global attention over all keys, in query and key blocks for the long `winl` functions) modules, plus `Reference`, an fp32 ground truth equal to Hugging Face. |
+| `eg2_vision.py` | Converts the Google vision weights into the three fixed Swift functions and extracts the host position table. |
 | `host.py` | Executable spec of the host contract (token rows, packing, band bias, long-text feed, vision feed) in numpy. The Swift runtime mirrors it. |
 | `build.py` | Builds the package, stage by stage (below). |
 | `selftest.py` | Generates `selftest.json` / `selftest.bin` (fp32 expectations) and runs them: `selftest.py run <dist>`. |
@@ -16,7 +17,7 @@ These scripts build the model package published as [junmo-k/embeddinggemma-2-ane
 | `corpus.py`, `images.py` | Build the evaluation corpus (`corpus.json`, 12 documents) and image folder (13 images) from the fetched files. |
 | `selftest_negative.py` | Optional negative control: rebuilds `winp2048_b512`, `winl4096_b512` and `winl8192_b512` with the usual `repeat_interleave` attention and runs their self-tests on the CPU and on the ANE (results below). Since the long functions' global layers moved to `eg2.blocked_attention`, only `winp2048_b512` still injects the fault into the global layers. |
 
-`scripts/accuracy/` at the repository root is the other half: it measures a running `aneembed serve` (the Swift runtime, over HTTP) against the same fp32 reference on the same public data. `verify*.py` here test the package itself through the Python host contract.
+`scripts/accuracy/` at the repository root is the other half: it measures a running `anerun serve` (the Swift runtime, over HTTP) against the same fp32 reference on the same public data. The EG2 verification modes here use the Python host contract. The pplx verifier uses the Swift server.
 
 ## Setup
 
@@ -28,15 +29,79 @@ uv venv --python 3.12.14 .venv
 uv pip install --python .venv/bin/python -r requirements.txt
 ```
 
-`requirements.txt` pins every package of the environment that built the published package. Conversion and the fp32 references run on the CPU only: no step selects MPS or the GPU (torch has no separate CPU wheel for macOS; the PyPI wheel is used). On an M5 Ultra a full build takes about 5.5 minutes and 16 GB of RAM (peak resident size), and needs about 7.5 GB of disk: 1.7 GB of downloads, 3.4 GB of intermediate per-function packages, 1.6 GB of output and 0.7 GB for the environment. The first `selftest.py run` on a new directory also waits for the ANE compile (about 10 minutes for all functions on an M5 Ultra). Run the scripts with `python -I` (they find their own modules; nothing is read from the current directory).
+`requirements.txt` pins every package of the environment that built the published package. Conversion and the fp32 references run on the CPU only: no step selects MPS or the GPU (torch has no separate CPU wheel for macOS; the PyPI wheel is used). For EG2, allow space for the raw Google snapshot (1.5 GB), the intermediate text and vision packages, and the compiled distribution. The first `selftest.py run` on a new directory also waits for the ANE compile (about 10 minutes for all functions on an M5 Ultra). Run scripts with `python -I` as shown below to isolate the Python import path. Model loading uses local safetensors and installed SDK classes. EG2 includes the pinned Jinja template used by the Sentence Transformers cross-check. The final corpus row comes from this repository’s pinned MIT-licensed converter and host source.
 
-## Reproducing the package
+## Qwen3-Embedding-0.6B
+
+From this directory, with the converter environment above:
+
+```sh
+W=../../.cache/qwen
+.venv/bin/python -I fetch.py models --model qwen3-embedding-0.6b --dest "$W/models"
+HF="$W/models/Qwen3-Embedding-0.6B"
+.venv/bin/python -I build.py --model qwen3-embedding-0.6b --hf-dir "$HF" --out "$W/dist"
+.venv/bin/python -I qwen_reference.py "$HF" "$W/reference" --parity --long
+.venv/bin/python -I qwen_verify.py "$W/dist" "$W/reference" --binary ../../.build/release/anerun
+```
+
+The 64-row function packs short sequences with a separate causal mask and EOS selector per input. Longer inputs use the shared pre/post projection schedule with causal attention at 2,048, 8,192 or 32,768 keys. The host keeps the residual stream in float32 and pools the final EOS row. The HTTP verifier checks token IDs, vector norms, normalized prefixes, cosine to the independent CPU reference, and over-limit rejection. It prints one JSON record per result, including the raw API vector and elapsed time. Set `--cap 64` for a short smoke test.
+
+## pplx-embed-v1-0.6b
 
 ```bash
-W=../../.cache/v0.2.0                             # any new directory per package version (.cache/ is git-ignored)
-.venv/bin/python -I fetch.py models --dest $W/models     # 1.7 GB, sha256 checked
-.venv/bin/python -I build.py --hf-dir $W/models/embeddinggemma-2 \
-    --vision-dir $W/models/embeddinggemma-2-coreml --out $W/dist
+W=../../.cache/pplx
+.venv/bin/python -I fetch.py models --model pplx-embed-v1-0.6b --dest "$W/models"
+HF="$W/models/pplx-embed-v1-0.6b"
+.venv/bin/python -I build.py --model pplx-embed-v1-0.6b --hf-dir "$HF" --out "$W/dist"
+.venv/bin/python -I selftest.py run "$W/dist" --binary ../../.build/release/anerun
+.venv/bin/python -I verify.py pplx "$W/dist" corpus.json --hf-dir "$HF" --binary ../../.build/release/anerun
+```
+
+The build checks the pinned revision and source digests, then runs
+`convert,merge,compile,assets,selftest,manifest`. Use `--stages` to run a subset and
+`--force` to rebuild existing Core ML packages. Intermediate conversion packages
+default to `<out>/../work-pplx` and can be placed elsewhere with `--work`. Their
+cache keys include the pinned source, graph code, function definitions and
+package versions. After a merge, run the compile stage before regenerating the
+manifest if the output contains local compiled packages.
+
+`PPLXText.mlpackage` contains the three packed functions, the 2K and 4K fused
+functions and the four 8K partitions. The 28 pre/post pairs and the 16K and 32K
+weightless attention functions have separate packages. The manifest validates
+the saved Core ML names, dtypes and shapes against the Swift package contract.
+The assets retain the float32 token table and final norm, tokenizer and configuration.
+The decomposed attention graphs score each key block directly. They scale
+probabilities by 32 for the value matmul and undo that scale after combining
+block means. The gain preserves small FP16 probabilities while the normalized
+value matmul fits in range. RMSNorm divides the square root of epsilon by the
+row scale before squaring so small and zero rows retain the intended epsilon.
+
+```bash
+.venv/bin/python -I test_references.py
+.venv/bin/python -I test_pplx_math.py
+.venv/bin/python -I ../../scripts/golden/pin_pplx_quantization.py \
+  --check ../../Sources/EmbedCore/Support/PPLXQuantization.swift
+```
+
+`selftest.py run` invokes Swift `models warm` with the supplied model directory.
+It checks all routes by default and accepts `--max-tokens` to verify a smaller cap.
+`verify.py pplx` starts one loopback Swift server through the largest corpus length.
+Supply a nonempty JSON list of documents with `text`. Optional `tokens` is the HF
+token count or the exact token ID list. An optional `vector` supplies 1,024 raw,
+unnormalized fp32 coordinates. For text-only documents the verifier computes
+fp32 means using the installed Qwen3 model with all keys visible to every token.
+The model specifies 1,024 unnormalized base coordinates, mean pooling and a 32K context. See the [pinned Perplexity model card](https://huggingface.co/perplexity-ai/pplx-embed-v1-0.6b/blob/2c4d510dd4a732063c31a0f70193e35067b51fd8/README.md).
+
+The hard quantizer rounds `127 * tanh(mean)` to the nearest integer (ties to even).
+The reference checks the Swift
+token counts and requires a cosine of at least 0.995 for every embedding.
+
+## Building the EmbeddingGemma 2 package
+
+```bash
+W=../../.cache/eg2                             # any new directory per package version (.cache/ is git-ignored)
+.venv/bin/python -I fetch.py models --dest $W/models     # Google raw weights and pinned data files
+.venv/bin/python -I build.py --hf-dir $W/models/embeddinggemma-2 --out $W/dist
 .venv/bin/python -I selftest.py run $W/dist               # SELFTEST PASS 16/16 ...
 ```
 
@@ -48,26 +113,17 @@ Any directory works for `--dest` and `--out`; intermediate per-function packages
    - `winl3072_b512`, `winl4096_b512`, `winl6144_b512`, `winl8192_b512`: windowed attention, one long text per call.
 2. **merge**: merges them into one multifunction `EmbeddingGemma2Text.mlpackage`; identical weight constants are stored once (363 MB instead of 3.4 GB).
 3. **compile**: `xcrun coremlcompiler compile` to `EmbeddingGemma2Text.mlmodelc`.
-4. **assets**: extracts `embeddings.bf16` (unchanged bf16 rows) from `model.safetensors`, copies `tokenizer.json`, copies the FluidInference vision package and `position_embeddings.f16` unchanged (sha256 checked) and compiles it, writes `LICENSE` (Apache-2.0 text from the pinned `transformers` wheel) and `NOTICE`.
+4. **assets**: extracts `embeddings.bf16` (unchanged bf16 rows) from `model.safetensors`, copies `tokenizer.json`, converts the vision encoder and projection into `vision_70`, `vision_140` and `vision_280`, compiles the merged package, and writes the first 1024 learned position rows on each axis to `position_embeddings.f16`. It writes `LICENSE` (Apache-2.0 text from the pinned `transformers` wheel) and `NOTICE`.
 5. **selftest**: one golden test per function (16: 13 text, 3 vision), expectations from the fp32 reference (Hugging Face fp32 for the vision functions). The token ids are the tokenized `LICENSE`.
 6. **manifest**: `manifest.json` with every file's sha256 and size, function signatures, host contract and provenance.
 
-### What is byte-identical
+The vision adapter uses the installed Transformers projection, MLP and rotary layers with fixed-shape PyTorch attention. Swift supplies patch coordinates, learned position embeddings, key validity and spatial pooling weights. The result of each function is a `[1, budget, 512]` fp16 array. See the [pinned Google model card](https://huggingface.co/google/embeddinggemma-2/blob/f9972ac22e696a105c482202646979e33e4b5a1e/README.md).
 
-With the pinned environment, a clean rebuild reproduces these files byte for byte (sha256 equal to the published package). This was checked for the v0.1 package; the next package, whose `winl` functions changed (see the ANE caveats), is checked again when it is released:
+### Comparing a rebuild to an existing release
 
-- `EmbeddingGemma2Text.mlpackage/Data/com.apple.CoreML/weights/weight.bin` (= `.mlmodelc/weights/weight.bin`)
-- `EmbeddingGemma2Text.mlmodelc/model.mil`, `coremldata.bin`, `metadata.json`
-- `embeddings.bf16`, `tokenizer.json`, `selftest.json`, `selftest.bin`, `LICENSE`, `NOTICE`
-- the vision package, which is copied unchanged
+Compare `embeddings.bf16`, `tokenizer.json`, `position_embeddings.f16` and the self-test vectors by hash. The position table's SHA-256 is `17de9480acc23638c0634a97ed89e51ed664433256d7d6f109587dcd91c79124`. Earlier releases shipped the vision package converted by FluidInference. The locally generated package preserves its input and output contract and has different graph bytes, provenance and notice.
 
-Three files differ between runs, none of them in the weights or the program:
-
-- `EmbeddingGemma2Text.mlpackage/Manifest.json`: coremltools gives every package item a fresh random UUID.
-- `EmbeddingGemma2Text.mlpackage/Data/com.apple.CoreML/model.mlmodel`: the merged protobuf is the same message (equal when parsed, and equal bytes with `SerializeToString(deterministic=True)`), but protobuf writes map fields in no fixed order.
-- `EmbeddingGemma2Text.mlmodelc/analytics/coremldata.bin`: compiler analytics, not part of the program or the weights. The vision package, whose input bytes do not change, compiles to an identical one.
-
-`manifest.json` differs only in those three hashes (and in its `created` date on another day). The compiled program depends on the Core ML compiler: another `coremlcompiler` version changes the version stamp in `model.mil`.
+To test the new vision graph against saved release expectations, place the existing `selftest.json`, `selftest.bin` and host embedding tables alongside the rebuilt compiled model in a scratch directory. Run `selftest.py run <scratch> --functions vision_70,vision_140,vision_280` and repeat with `--cpu`. Package UUIDs, protobuf field serialization and Core ML compiler metadata may vary across builds.
 
 ## Verifying against the original model
 
@@ -82,7 +138,9 @@ HF=$W/models/embeddinggemma-2
 .venv/bin/python -I verify.py long $W/dist $W/data/corpus.json --hf-dir $HF        # 2049..8192 tokens (winl)
 ```
 
-Each prints one line per case and a final `SUMMARY` with the minimum and median cosine per category. The corpus mixes English, Korean, Japanese, Chinese and French READMEs, the Korean and Japanese constitutions, technical documents and source code; the images are photos, diagrams, a plot and synthetic patterns of odd sizes. For the Swift runtime, run `scripts/accuracy/reference.py` with the same `corpus.json` and image folder, then `scripts/accuracy/compare.py` against `aneembed serve`.
+Each prints one line per case and a final `SUMMARY` with the minimum and median cosine per category. The current corpus is `aneembed-corpus/2`. Its first eleven document IDs and texts match v1. Row twelve is `anerun-eg2-converter-v2` (`tools/convert/eg2.py`, one newline, then `tools/convert/host.py`, each file pinned in `sources.json`). This keeps a code document eligible for 8,192-token cases. The published v1 row `hf-eg2-modeling-code` identifies a different text. Existing v1 `corpus.json` files remain valid inputs to the verifiers. Accuracy reference files record the corpus version and input SHA-256 so cross-version comparisons can match individual inputs.
+
+The corpus mixes English, Korean, Japanese, Chinese and French READMEs, the Korean and Japanese constitutions, technical documents and source code; the images are photos, diagrams, a plot and synthetic patterns of odd sizes. For the Swift runtime, run `scripts/accuracy/reference.py` with the same `corpus.json` and image folder, then `scripts/accuracy/compare.py` against `anerun serve`.
 
 ## ANE caveats
 
@@ -99,12 +157,12 @@ The Neural Engine compiler runs on the user's Mac, per macOS build, and a miscom
   | `winl6144_b512` | 961 ms, 0.99994 | 829 ms, 0.999976 |
   | `winl8192_b512` | 1457 ms, 0.99989 | 1240 ms, 0.999979 |
 
-  "Before" is the v0.1 package's function, "after" a standalone conversion of the same function with this code (`build.convert_one`); both were timed over 5 calls at the full length and compared with `eg2.ref_embed` by a harness outside this repository, and the release measures the rebuilt package again with `verify.py long` and `aneembed bench --buckets`; the texts include the lengths just over each smaller size (2049, 3073, 4097, 6145). The first compile takes 1.3–1.6x longer (`winl8192_b512` 170 s → 274 s on the M4). `winp` and `embed_S` are unchanged. The build skips stages and per-function packages that already exist, so build the next package into fresh `--out` and `--work` directories (or with `--force`); an older `winl` package would pass the self-test as well, since the inputs and expected vectors are the same.
+  "Before" is the v0.1 package's function, "after" a standalone conversion of the same function with this code (`build.convert_one`); both were timed over 5 calls at the full length and compared with `eg2.ref_embed` by a harness outside this repository, and the release measures the rebuilt package again with `verify.py long` and `anerun bench --buckets`; the texts include the lengths just over each smaller size (2049, 3073, 4097, 6145). The first compile takes 1.3–1.6x longer (`winl8192_b512` 170 s → 274 s on the M4). `winp` and `embed_S` are unchanged. The build skips stages and per-function packages that already exist, so build the next package into fresh `--out` and `--work` directories (or with `--force`); an older `winl` package would pass the self-test as well, since the inputs and expected vectors are the same.
 - **Windowed sliding layers slice, they do not pad.** Each 512-row query block attends to the key rows `b*512-512 … b*512+1023` taken as static slices clipped to `[0, S)`; padding the keys inside the graph (`F.pad`) gave the same numbers but made the layer about 3x slower on the ANE.
 - **Do not trust `MLComputePlan` for correctness.** It reports which device each operation is planned on, not whether the ANE computes it correctly. Only comparing outputs catches a miscompile.
-- **Run the self-test** (`selftest.py run <dist>`, or `aneembed`, which runs it at load) on every Mac and macOS version you ship to, with `cpuAndNeuralEngine`. `selftest.py run <dist> --cpu` runs the same tests on the CPU.
+- **Run the self-test** (`selftest.py run <dist>`, or `anerun`, which runs it at load) on every Mac and macOS version you ship to, with `cpuAndNeuralEngine`. `selftest.py run <dist> --cpu` runs the same tests on the CPU.
 - Fixed shapes only: variable (enumerated) shapes move the whole graph to the CPU.
 
 ## License
 
-The scripts are part of ANEEmbed and MIT licensed (see `LICENSE` at the repository root). The package they build contains EmbeddingGemma 2 by Google (Apache-2.0, Gemma Prohibited Use Policy) and the vision encoder conversion by FluidInference (Apache-2.0); `NOTICE` here is the notice file copied into the package.
+The scripts are part of ANERun and MIT licensed (see `LICENSE` at the repository root). The package they build contains EmbeddingGemma 2 by Google (Apache-2.0, Gemma Prohibited Use Policy) with its text and vision weights converted locally. The package includes `LICENSE` and the `NOTICE` in this directory, which also credits the earlier FluidInference packages.

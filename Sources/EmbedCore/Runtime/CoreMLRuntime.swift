@@ -17,14 +17,78 @@ public enum NeuralEngine {
     }
 }
 
-/// Loads an .mlmodelc, compiling an .mlpackage next to it first if needed (once, at install/warm time).
-func compiledModelURL(_ url: URL) async throws -> URL {
-    guard url.pathExtension == "mlpackage" else { return url }
-    let target = url.deletingPathExtension().appendingPathExtension("mlmodelc")
-    if FileManager.default.fileExists(atPath: target.path) { return target }
-    let compiled = try await MLModel.compileModel(at: url)
-    try? FileManager.default.removeItem(at: target)
-    try FileManager.default.moveItem(at: compiled, to: target)
+/// Publishes a complete compiled model atomically. Concurrent warm/serve processes share this
+/// cache by revision and package path, which are also part of the OS's ANE cache key.
+func compiledModelURL(_ url: URL, rebuild: Bool = false) async throws -> URL {
+    let base = url.deletingPathExtension()
+    let source = base.appendingPathExtension("mlpackage")
+    let target = base.appendingPathExtension("mlmodelc")
+    let parent = base.deletingLastPathComponent()
+    let stage = parent.appendingPathComponent(".\(base.lastPathComponent)\(ModelLayout.compileStageSuffix)", isDirectory: false)
+    let files = Manifest.compiledCoreFiles
+
+    func complete(_ directory: URL) -> Bool {
+        let parent = directory.deletingLastPathComponent()
+        return files.allSatisfy { name in
+            guard case .success(let size) = Manifest.regularFileSize("\(directory.lastPathComponent)/\(name)", in: parent)
+            else { return false }
+            return size > 0
+        }
+    }
+
+    func reclaimStage() throws {
+        var info = stat()
+        if lstat(stage.path, &info) != 0 {
+            if errno == ENOENT { return }
+            throw RuntimeError.model("cannot inspect compiled staging slot at \(stage.path): \(String(cString: strerror(errno)))")
+        }
+        if (info.st_mode & S_IFMT) == S_IFDIR {
+            try FileManager.default.removeItem(at: stage)
+        } else if unlink(stage.path) != 0 {
+            throw RuntimeError.model("cannot remove compiled staging slot at \(stage.path): \(String(cString: strerror(errno)))")
+        }
+    }
+
+    // A complete cache needs the lock only when a staging entry needs attention.
+    var stageInfo = stat()
+    if !rebuild, complete(target), lstat(stage.path, &stageInfo) != 0, errno == ENOENT { return target }
+
+    let lock = parent.appendingPathComponent(".\(base.lastPathComponent)\(ModelLayout.compileLockSuffix)")
+    let descriptor = open(lock.path, O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK, 0o644)
+    guard descriptor >= 0 else { throw RuntimeError.model("cannot open compile lock at \(lock.path)") }
+    defer { close(descriptor) }
+    var info = stat()
+    guard fstat(descriptor, &info) == 0, SmallFile.isRegular(info) else {
+        throw RuntimeError.model("compile lock is not a regular file at \(lock.path)")
+    }
+    while flock(descriptor, LOCK_EX | LOCK_NB) != 0 {
+        if errno == EINTR { try Task.checkCancellation(); continue }
+        guard errno == EWOULDBLOCK else { throw RuntimeError.model("cannot lock \(lock.path)") }
+        try await Task.sleep(for: .milliseconds(20))
+    }
+    try Task.checkCancellation()
+    try reclaimStage()
+    if !rebuild, complete(target) { return target }
+    guard FileManager.default.fileExists(atPath: source.path) else {
+        throw RuntimeError.model("incomplete compiled model at \(target.path), and no source package")
+    }
+
+    let compiled = try await MLModel.compileModel(at: source)
+    defer { try? FileManager.default.removeItem(at: compiled) }
+    guard complete(compiled) else { throw RuntimeError.model("compiler produced an incomplete model at \(source.path)") }
+    defer { try? reclaimStage() }
+    try FileManager.default.moveItem(at: compiled, to: stage)
+    try Task.checkCancellation()
+    var targetInfo = stat()
+    let replacing = lstat(target.path, &targetInfo) == 0
+    guard replacing || errno == ENOENT else {
+        throw RuntimeError.model("cannot inspect compiled model at \(target.path): \(String(cString: strerror(errno)))")
+    }
+    let flags = replacing ? UInt32(RENAME_SWAP) : UInt32(RENAME_EXCL)
+    let result = renamex_np(stage.path, target.path, flags)
+    guard result == 0 else {
+        throw RuntimeError.model("cannot publish compiled model at \(target.path): \(String(cString: strerror(errno)))")
+    }
     return target
 }
 
@@ -191,7 +255,7 @@ public final class CoreMLBucketRunner: BucketFunctionRunner, @unchecked Sendable
     }
 }
 
-/// vision_70 / vision_140 / vision_280 of the vision package (FluidInference/embeddinggemma-2-coreml):
+/// EmbeddingGemma vision package functions vision_70, vision_140 and vision_280:
 /// 16 px patches scaled to [0, 1], 2-D position embeddings from position_embeddings.f16 (x row + y row),
 /// and a 3 x 3 average pool of the patch grid into soft tokens.
 public final class CoreMLVisionEncoder: VisionEncoder, @unchecked Sendable {
@@ -236,7 +300,7 @@ public final class CoreMLVisionEncoder: VisionEncoder, @unchecked Sendable {
         try checkSignature(model, name: "vision_\(budget)", inputs: [
             ("patches", [1, total, patchWidth]), ("positions", [1, total, 2]), ("position_embeddings", [1, total, patchWidth]),
             ("valid", [1, total]), ("pool", [budget, total]),
-        ], output: "image_tokens", layout: "the vision package of FluidInference/embeddinggemma-2-coreml")
+        ], output: "image_tokens", layout: "the EmbeddingGemma 2 vision package")
     }
 
     public func warm() async throws {

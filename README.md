@@ -1,15 +1,22 @@
-# ANEEmbed (`aneembed`)
+# ANERun (`anerun`)
 
-[![CI](https://github.com/junmo-kim/ANEEmbed/actions/workflows/ci.yml/badge.svg)](https://github.com/junmo-kim/ANEEmbed/actions/workflows/ci.yml) [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE) ![Platform: macOS 15+ · Apple Silicon](https://img.shields.io/badge/platform-macOS%2015%2B%20%C2%B7%20Apple%20Silicon-lightgrey)
+[![CI](https://github.com/junmo-kim/ANERun/actions/workflows/ci.yml/badge.svg)](https://github.com/junmo-kim/ANERun/actions/workflows/ci.yml) [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE) ![Platform: macOS 15+ · Apple Silicon](https://img.shields.io/badge/platform-macOS%2015%2B%20%C2%B7%20Apple%20Silicon-lightgrey)
 
+Local embeddings on the **Apple Neural Engine** from a single **Swift binary with no third-party dependencies**. Use the CLI, an OpenAI-compatible `/v1/embeddings` server or an MCP server.
 
-EmbeddingGemma 2 embeddings that run **only on the Apple Neural Engine**, as a single **100% Swift binary with no third-party dependencies** (Foundation, Network, CoreML, ImageIO, Accelerate). An OpenAI-compatible `/v1/embeddings` server, a CLI and an MCP server in one.
+| Model ID | Inputs | Maximum context | Output |
+|---|---|---:|---|
+| `embeddinggemma-2` | Text and images | 8,192 tokens | 768 normalized values, or normalized prefixes of 512, 256 or 128 |
+| `pplx-embed-v1-0.6b` | Text | 32,768 tokens | 1,024 signed int8 values, with prefixes of 1–1,024 |
+| `qwen3-embedding-0.6b` | Text | 32,768 tokens including EOS | Normalized float vector, 32–1,024 dimensions (default 1,024) |
 
-## At a glance
+Each server process serves one model. Select it with `--model ID` or point to a verified local package with `--model-dir DIR`. For a v0.1.1 configuration, add `--model embeddinggemma-2` or set `ANERUN_MODEL=embeddinggemma-2` to keep using its existing package. Keep each index and its queries on the same model and dimensions.
+
+## EmbeddingGemma 2 at a glance
 
 The same 16 GB Apple M4 (macOS 27), the same inputs, warm medians, measured on a quiet machine. Every runtime runs the official google/embeddinggemma-2 model; accuracy is the lowest cosine to the official fp32 vectors over the same 26 texts. Details, versions and flags: [docs/PERFORMANCE.md](docs/PERFORMANCE.md).
 
-| Apple M4, 16 GB | **ANEEmbed** (Neural Engine) | llama.cpp (Metal GPU) | MLX (Metal GPU) | official PyTorch, fp32 (MPS GPU) |
+| Apple M4, 16 GB | **ANERun** (Neural Engine) | llama.cpp (Metal GPU) | MLX (Metal GPU) | official PyTorch, fp32 (MPS GPU) |
 |---|---:|---:|---:|---:|
 | short query (32 tokens) | **7.0 ms** | 14 ms | 15–17 ms | 59–72 ms |
 | 2048-token document | **221 ms** | 406 ms | 396 ms | 616 ms |
@@ -22,7 +29,7 @@ The same 16 GB Apple M4 (macOS 27), the same inputs, warm medians, measured on a
 | uses the GPU | **no** | yes | yes | yes |
 | lowest text cosine vs official fp32 | 0.99997 | 0.999997 (BF16) / 0.99989 (Q8_0) | 0.99994 (bf16) / 0.99976 (8bit) | 1 (reference) |
 
-ANEEmbed and llama.cpp are measured as servers over loopback HTTP; MLX and PyTorch have no embedding server here and are measured in process, which spares them the HTTP round trip. For llama.cpp and MLX each cell shows the best of BF16 and 8-bit. On an M5 Ultra ANEEmbed takes 3.4 ms, 168 ms and 1.19 s for the three text sizes.
+ANERun and llama.cpp are measured as servers over loopback HTTP; MLX and PyTorch have no embedding server here and are measured in process, which spares them the HTTP round trip. For llama.cpp and MLX each cell shows the best of BF16 and 8-bit. On an M5 Ultra ANERun takes 3.4 ms, 168 ms and 1.19 s for the three text sizes.
 
 ¹ At `--image-min-tokens 280` (304 tokens, cosine 0.99934). llama.cpp's default budget is 134 tokens: 217 ms, but cosine 0.9963 to the official image vector.
 
@@ -32,82 +39,81 @@ ANEEmbed and llama.cpp are measured as servers over loopback HTTP; MLX and PyTor
 
 ⁴ No embedding server; measured in process only.
 
-## Why
+## EmbeddingGemma 2 features
 
 - **Leaves the GPU alone.** Nothing runs on the GPU, so a local LLM keeps all of it.
 - **Memory the OS can take back.** The process itself uses about 140–380 MB, all of it pageable: under memory pressure it is compressed or swapped like any app. The Neural Engine's working buffers are wired only while a call runs and for about 10 s after it; idle, they are purgeable. A Metal runtime keeps its buffers wired, or held, for as long as the model is loaded. Request data is never written to disk.
 - **Fast.** One Neural Engine call per text up to 8192 tokens, short texts packed together, and separate lanes so long documents and images do not hold short queries back.
 - **Accurate.** Cosine ≥ 0.99990 (median 0.999975) to the official fp32 model on every public test input, texts up to 8192 tokens and images (see [Accuracy](#accuracy)).
 - **Checks itself.** Every model function is tested against golden outputs when it loads, and one the Neural Engine compiler got wrong is not used (see [Self-test](#self-test)).
-- **OpenAI drop-in, CLI and MCP** from one binary: `POST /v1/embeddings` with text and images, `encoding_format` float/base64, Matryoshka `dimensions` 768/512/256/128; `aneembed embed`, `aneembed serve`, `aneembed mcp`.
+- **OpenAI drop-in, CLI and MCP** from one binary: `POST /v1/embeddings` with text and images, `encoding_format` float/base64, Matryoshka `dimensions` 768/512/256/128; `anerun embed`, `anerun serve`, `anerun mcp`.
 
-## Trade-offs
+## EmbeddingGemma 2 trade-offs
 
-- **The first install compiles for the Neural Engine:** about 4 minutes (M5 Ultra) to 5.5 minutes (M5 Max), plus about 6 more for `--max-tokens 8192`. The OS caches the result; an upgraded `aneembed` or a macOS update compiles again. llama.cpp and MLX start in seconds.
-- **llama.cpp BF16 is closer to the official vectors** (0.999997 against ANEEmbed's 0.99997). Both are far closer than the 8-bit ports.
+- **The first install compiles for the Neural Engine:** about 4 minutes (M5 Ultra) to 5.5 minutes (M5 Max), plus about 6 more for `--max-tokens 8192`. The OS caches the result; an upgraded `anerun` or a macOS update compiles again. llama.cpp and MLX start in seconds.
+- **llama.cpp BF16 is closer to the official vectors** (0.999997 against ANERun's 0.99997). Both are far closer than the 8-bit ports.
 - **Texts over 2048 tokens need `--max-tokens 8192`**, which compiles four more functions. At start the self-test wires about 9 GB of Neural Engine buffers for about a minute; on a 16 GB Mac, start it when memory is free.
 - **The Neural Engine runs one call at a time.** While a request of large images is processed, short queries wait for it (on an M4: query p90 0.28 s while one client uploads 8 photos of 12–24 MP per request, 0.66 s with three such clients). See [Best practices](#best-practices) for bulk image jobs.
 - **Apple silicon and macOS 15 or later only.** Text up to 8192 tokens (2048 by default); images at the model's official 280-token budget; HEIC decodes slightly differently from the official path (see [Image input formats](#image-input-formats)).
 
 ## Install
 
-Apple Silicon, macOS 15 or later.
+Build from this checkout on an Apple silicon Mac. Use Xcode 16 or newer for embeddings on macOS 15 or newer.
 
-**Homebrew**
-
-```bash
-brew install junmo-kim/tap/aneembed
+```sh
+swift build -c release
+mkdir -p "$HOME/.local/bin"
+install -m 755 .build/release/anerun "$HOME/.local/bin/anerun"
+export PATH="$HOME/.local/bin:$PATH"
+anerun --version
 ```
 
-**mise**
+Installs write a separate active revision for each model. Selecting EmbeddingGemma 2 can reuse the legacy installation when it has no model-specific active revision. Keep the package at its original path; the first start with a different executable or invocation path can compile again.
+
+Install the package for your selected model. The installer verifies the source files and compiles and self-tests the functions required by the configured context limit. The OS caches the Neural Engine compilation. The EmbeddingGemma 2 package is about 1 GB. [EmbeddingGemma 2 package](https://huggingface.co/junmo-k/embeddinggemma-2-ane)
 
 ```bash
-mise use -g github:junmo-kim/ANEEmbed
+anerun models install --model embeddinggemma-2
+anerun doctor --model embeddinggemma-2
 ```
 
-**From source** (Xcode 16 or later)
+Embedding models default to a 2,048-token context. Set `--max-tokens` or `ANERUN_MAX_TOKENS` for the install, warm and serve commands when you need more. Use 8192 for the full EmbeddingGemma 2 text range, or 32768 for the full pplx or Qwen range.
 
-```bash
-swift build -c release && cp .build/release/aneembed /usr/local/bin/
-```
+Install Qwen with `anerun models install --model qwen3-embedding-0.6b`. Use `--prompt query` (HTTP `input_type: "query"`) for a retrieval query. Documents use the original text. For a custom instruction, pass the full `Instruct: ...\nQuery:...` text without a prompt option. The tokenizer appends EOS before the context limit is checked.
 
-Then install the model ([junmo-k/embeddinggemma-2-ane](https://huggingface.co/junmo-k/embeddinggemma-2-ane), about 900 MB). This downloads a pinned revision, checks every file's SHA-256 against a hash compiled into the binary, compiles the package on this Mac, then compiles each function for the Neural Engine once and runs the self-test. The OS caches the Neural Engine compile, so later starts take seconds instead of minutes:
+Install PPLX with `anerun models install --model pplx-embed-v1-0.6b`. Both installers verify the pinned manifest and file hashes. For a locally converted package, add `--from DIR`. [PPLX package](https://huggingface.co/junmo-k/pplx-embed-v1-0.6b-ane) · [Qwen package](https://huggingface.co/junmo-k/qwen3-embedding-0.6b-ane)
 
-```bash
-aneembed models install                  # about 4 minutes the first time (M5 Ultra)
-aneembed doctor        # Neural Engine, model files, compile cache, self-test: what is ready and what to fix
-```
+To override the source, give both `--repo OWNER/NAME` and `--revision` with a full 40-character commit SHA.
 
-For texts over 2048 tokens set the limit for every command, e.g. `export ANEEMBED_MAX_TOKENS=8192`, and run `aneembed models warm` once (the long-text functions: about 6.5 more minutes on an M5 Ultra, see [trade-offs](#--max-tokens-trade-offs)).
+Installs for the same model share a lock. Each model has its own active revision, and the installer switches it atomically after verification and warmup. `anerun models path --model ID` shows the selected package. `anerun models warm --model ID` prepares it after a change to the package path, macOS build, executable or context limit. `serve` also warms and self-tests before reporting ready.
 
-`aneembed models install --from DIR` installs a local copy of the package instead (same checks, no network; every file must be a regular file). Installs take a lock in the models directory, so a second `models install` waits for the first; the new revision replaces an old one in a single rename, and a revision already installed is reused only when its manifest matches the pinned hash (or, with `--revision`, the manifest the repository serves now). `--revision` takes one plain name (a commit hash, or letters, digits, `.`, `_`, `-`); `models install` does not run with `--runtime fake`. `aneembed models warm` compiles again in place, which an upgraded `aneembed` needs once: the OS keeps the compile per model path, macOS build and executable (`serve` does it by itself before it reports healthy, and `doctor` says when it is due).
-
-The release binary is ad-hoc signed. A tarball downloaded with a browser carries a quarantine attribute; clear it with `xattr -d com.apple.quarantine aneembed` (Homebrew, mise and curl do not set it).
+The release binary is ad-hoc signed. A tarball downloaded with a browser carries a quarantine attribute; clear it with `xattr -d com.apple.quarantine anerun` (Homebrew, mise and curl do not set it).
 
 ## Usage
 
 ```bash
-aneembed serve                                    # http://127.0.0.1:18180
+export ANERUN_MODEL=embeddinggemma-2
+anerun serve                                    # http://127.0.0.1:18180
 curl -s localhost:18180/v1/embeddings -H 'Content-Type: application/json' \
   -d '{"input": "task: search result | query: how do I reset my router?"}'
 
-aneembed embed "first text" "second text" --format json
-aneembed embed --prompt query "how do I reset my router?"    # adds the model's query prefix
-aneembed embed --image photo.jpg --dimensions 256
-cat docs.jsonl | aneembed embed --stdin --prompt document   # JSONL in, JSONL out, batched
-aneembed similarity "a cat on a mat" --image-b cat.jpg
-aneembed tokenize "hello world" --show-tokens
+anerun embed "first text" "second text" --format json
+anerun embed --prompt query "how do I reset my router?"    # adds the model's query prefix
+anerun embed --image photo.jpg --dimensions 256
+cat docs.jsonl | anerun embed --stdin --prompt document   # JSONL in, JSONL out, batched
+anerun similarity "a cat on a mat" --image-b cat.jpg
+anerun tokenize "hello world" --show-tokens
 ```
 
-One-off commands load and self-test the model each time (4.9 s on an M5 Ultra with a warm cache, 9.1 s with `--max-tokens 8192`). For regular use keep `serve` or `mcp` running.
+For pplx, use `anerun serve --model pplx-embed-v1-0.6b --max-tokens 32768` after installing that model. The 32K path runs attention in tiles and can give short queries time between predictions. Allow several minutes for a full-length request on an M4. One-off commands load and self-test the model each time. For regular use keep `serve` or `mcp` running.
 
 ### MCP
 
 ```json
-{ "mcpServers": { "aneembed": { "command": "aneembed", "args": ["mcp"] } } }
+{ "mcpServers": { "anerun": { "command": "anerun", "args": ["mcp", "--model", "embeddinggemma-2"] } } }
 ```
 
-Tools: `embed_text`, `embed_image`, `similarity`. The same tools are reachable over HTTP as `POST /mcp` and as one-shot `QUERY /{tool}?<options>` with the raw text or image bytes as the body. Over stdio a message (one line) is limited to `--max-body`: a longer one is skipped and answered with a `-32600` error (`id` null). At most 16 messages are handled at once; further input is not read until one finishes. `embed --stdin` and `tokenize --stdin` stop with `line_too_long` (exit 65) at a line over `--max-body`. `embed_image` checks the number of images before decoding any of them, and each image's size before decoding it.
+Tools include `embed_text` and `similarity` for either model and `embed_image` for EmbeddingGemma 2. The text tools expose the context limit in `_meta["aneembed/max_context_length"]` in `tools/list`. The same tools are reachable over HTTP as `POST /mcp` and as one-shot `QUERY /{tool}?<options>` with the raw text or image bytes as the body. Over stdio a message (one line) is limited to `--max-body`: a longer one is skipped and answered with a `-32600` error (`id` null). At most 16 messages are handled at once; further input is not read until one finishes. `embed --stdin` and `tokenize --stdin` stop with `line_too_long` (exit 65) at a line over `--max-body`. `embed_image` checks the number of images before decoding any of them, and each image's size before decoding it.
 
 ## API
 
@@ -123,14 +129,16 @@ Tools: `embed_text`, `embed_image`, `similarity`. The same tools are reachable o
 
 Request fields of `/v1/embeddings`:
 
-- `encoding_format`: `float` (default) or `base64` (little-endian float32).
-- `dimensions`: 768 (default), 512, 256 or 128: the first N values, re-normalized.
-- `input_type` (extension): `query` or `document` adds the model's task prefix (`task: search result | query: ` / `title: none | text: `). Without it texts are embedded as given, like llama-server, and callers add the prefix themselves.
-- `model`, `user`: accepted and ignored; the response names the configured model.
+- `encoding_format` is `float` (a JSON numeric array) or `base64` (little-endian Float32 bytes for both models). With pplx the numeric values are signed int8 coordinates in either encoding.
+- `dimensions` defaults to the model's full output width. EmbeddingGemma 2 normalizes the selected prefix. pplx takes the prefix of the mean-pooled vector, applies `tanh`, scales by 127 and rounds to signed int8 codes. Use cosine similarity to compare quantized vectors.
+- `input_type` accepts `query` and `document`. EmbeddingGemma 2 adds the corresponding prompt prefix. pplx embeds the provided text as-is in either mode. Images require EmbeddingGemma 2.
+- The response names the server's selected model or its `--model-name` alias. The request's `model` and `user` fields are accepted and ignored.
 
-Texts over the configured limit are rejected with `400 context_length_exceeded`, never truncated; a text of more than 93 bytes per allowed token (the longest vocabulary entry) is refused before it is tokenized, as having at least that many tokens. `usage.prompt_tokens` counts real tokens including `<bos>`/`<eos>`; an image counts its soft tokens + 4. Errors use OpenAI's shape: `{"error": {"message", "type", "param", "code"}}`. Server-side failures (`500`, and `503` after a failed load) carry the stable `code` and a generic message; their detail is in the server log. JSON bodies must be UTF-8, like OpenAI's API: invalid bytes are `400 invalid_json` (a raw `QUERY /embed_text` body `400 invalid_utf8`), never replaced with U+FFFD.
+Texts over the configured limit receive `400 context_length_exceeded`. `usage.prompt_tokens` counts model tokens. EmbeddingGemma 2 includes `<bos>` and `<eos>` for text and counts an image as its soft tokens plus four. pplx has no automatic boundary tokens. Errors use OpenAI's shape, `{"error": {"message", "type", "param", "code"}}`. Server-side failures carry a stable code and a generic message, with details in the server log. Invalid UTF-8 in JSON bodies receives `400 invalid_json`; raw `QUERY /embed_text` receives `400 invalid_utf8`.
 
-`/tokenize` and `/detokenize` follow llama-server's tokenizer API, so a client that measures or splits its texts with it works unchanged. `/tokenize` takes `content` (a string of at most 1 MiB) and the options `add_special` (`<bos>`/`<eos>` around the ids, default `false`), `parse_special` (control-token text such as `<bos>` becomes its id, default `true`; `false` encodes it as plain text, while the six user-defined added tokens such as `<|channel>` are still cut out, as llama.cpp does) and `with_pieces` (each token as `{"id", "piece"}`, the piece being the text the token stands for, or a list of its bytes when they are not valid UTF-8 alone). It counts every token, beyond the embedding limit too. `/detokenize` returns the text of `tokens`, special tokens as their text and invalid UTF-8 as U+FFFD, for ids that stand for up to 1 MiB of bytes plus room for `<bos>`/`<eos>`. Longer content or more bytes are `413 content_too_long`; at most `--long-concurrency` of these requests are tokenized or decoded at once (a 1 MiB text takes 1.2–1.4 s end to end over HTTP on an M4).
+`/tokenize` and `/detokenize` use the selected model's vocabulary. For pplx, `add_special` has no effect and `parse_special` controls recognition of the tokenizer's special tokens. `/tokenize` accepts at most 1 MiB of text, counts beyond the embedding limit and can return token pieces via `with_pieces`. `/detokenize` decodes the IDs back to text, including special tokens, and replaces invalid UTF-8 with U+FFFD. The response is capped at 1 MiB plus any boundary token bytes. Content over these limits receives `413 content_too_long`.
+
+For EmbeddingGemma 2, `add_special` defaults to `false` and adds `<bos>` and `<eos>` when enabled. `parse_special` defaults to `true` and recognizes control tokens such as `<bos>`. The six user-defined tokens such as `<|channel>` are always recognized. A token piece contains the ID and its text or, for incomplete UTF-8, its bytes. `--long-concurrency` bounds the number of parallel tokenize and detokenize requests.
 
 For valid requests the responses were compared with llama-server's (b12428 with `ggml-org/embeddinggemma-2-GGUF`) and are identical: every option combination on 16 hand-written texts (spaces, newlines, emoji, CJK compatibility characters, byte-fallback characters, control and user-defined added tokens), default options and `add_special` on 311 texts sampled from the tokenizer golden set, and `/detokenize` of all their ids. Where llama-server is lenient this API is strict, like the rest of it: a missing or non-string `content` (llama-server returns no tokens, and accepts an undocumented list of strings and ids), a missing `tokens` (llama-server returns empty content) and a flag that is not a boolean (llama-server uses the default) are `400`, and an id outside the vocabulary is `400 invalid_token` with `param: tokens[i]` (llama-server answers `500`).
 
@@ -138,44 +146,45 @@ HTTP/1.1 with keep-alive. `HEAD /health` answers with the `GET` response's heade
 
 ## Configuration
 
-Every option is a flag and an environment variable of the same name (flag > environment > default). `aneembed serve --print-config` shows each value and where it came from.
+Every option has a flag and an environment variable. Precedence is flag, then `ANERUN_*`, then the corresponding legacy `ANEEMBED_*`, then the default. Empty environment values are ignored. `anerun serve --print-config` shows each value and where it came from.
 
 | Flag | Environment | Default | |
 |---|---|---|---|
-| `--model-dir` | `ANEEMBED_MODEL_DIR` | `<data-dir>/models/current` | model package directory |
-| `--data-dir` | `ANEEMBED_DATA_DIR` | `~/Library/Application Support/ANEEmbed` | installed models and state |
-| `--host` | `ANEEMBED_HOST` | `127.0.0.1` | anything else exposes an unauthenticated API |
-| `--port` | `ANEEMBED_PORT` | `18180` | |
-| `--max-tokens` | `ANEEMBED_MAX_TOKENS` | `2048` | up to 8192; only functions up to it are loaded and compiled |
-| `--model-name` | `ANEEMBED_MODEL_NAME` | `embeddinggemma-2` | |
-| `--max-body` | `ANEEMBED_MAX_BODY` | `72` (MiB) | 8 image data URLs of up to 8 MiB plus JSON; also what all connections together may buffer of bodies over 1 MiB ([memory](docs/PERFORMANCE.md#memory)) |
-| `--max-connections` | `ANEEMBED_MAX_CONNECTIONS` | `64` | open HTTP connections; more are answered `503 too_many_connections` (`Retry-After: 1`) and closed |
-| `--max-inputs` / `--max-images` | `ANEEMBED_MAX_INPUTS` / `ANEEMBED_MAX_IMAGES` | `2048` / `8` | per request |
-| `--query-concurrency` / `--image-concurrency` / `--long-concurrency` | `ANEEMBED_*_CONCURRENCY` | `8` / `2` / `2` | separate lanes so long documents and images cannot hold short queries back; `--long-concurrency` also bounds concurrent `/tokenize` and `/detokenize` requests |
-| `--runtime` | `ANEEMBED_RUNTIME` | `coreml` | `fake` runs without a model, for testing integrations |
-| `--selftest` | `ANEEMBED_SELFTEST` | `require` | `skip` serves every function without the [self-test](#self-test): **unsafe**, a miscompiled function returns wrong vectors without an error |
+| `--model` | `ANERUN_MODEL` | required unless `--model-dir` is set | model ID |
+| `--model-dir` | `ANERUN_MODEL_DIR` | required unless `--model` is set | local model package directory |
+| `--data-dir` | `ANERUN_DATA_DIR` | `~/Library/Application Support/ANEEmbed` | installed models and state |
+| `--host` | `ANERUN_HOST` | `127.0.0.1` | anything else exposes an unauthenticated API |
+| `--port` | `ANERUN_PORT` | `18180` | |
+| `--max-tokens` | `ANERUN_MAX_TOKENS` | `2048` | 8192 maximum for EmbeddingGemma 2 and 32768 for pplx |
+| `--model-name` | `ANERUN_MODEL_NAME` | selected model ID | response alias |
+| `--max-body` | `ANERUN_MAX_BODY` | `72` (MiB) | 8 image data URLs of up to 8 MiB plus JSON; also what all connections together may buffer of bodies over 1 MiB ([memory](docs/PERFORMANCE.md#memory)) |
+| `--max-connections` | `ANERUN_MAX_CONNECTIONS` | `64` | open HTTP connections; more are answered `503 too_many_connections` (`Retry-After: 1`) and closed |
+| `--max-inputs` / `--max-images` | `ANERUN_MAX_INPUTS` / `ANERUN_MAX_IMAGES` | `2048` / `8` | per request |
+| `--query-concurrency` / `--image-concurrency` / `--long-concurrency` | `ANERUN_*_CONCURRENCY` | `8` / `2` / `2` | separate lanes so long documents and images cannot hold short queries back; `--long-concurrency` also bounds concurrent `/tokenize` and `/detokenize` requests |
+| `--runtime` | `ANERUN_RUNTIME` | `coreml` | `fake` runs without a model, for testing integrations |
+| `--selftest` | `ANERUN_SELFTEST` | `require` | `skip` serves every function without the [self-test](#self-test): **unsafe**, a miscompiled function returns wrong vectors without an error |
 
 
 ## Best practices
 
-- **Use the model's prompts.** Queries as `task: search result | query: …` and documents as `title: none | text: …` (or send `input_type`: `query` / `document`). Without them texts are embedded as given.
-- **Embed an index and its queries with the same runtime.** Vectors from ANEEmbed, llama.cpp, MLX and PyTorch agree to cosine ≈ 0.9999 for text, but not bit for bit, and llama.cpp's image preprocessing differs from the official recipe (cosine ≈ 0.996). Re-embed when you switch.
+- **Use the model's prompts.** For EmbeddingGemma 2, send `input_type` as `query` or `document` to add the model's search prefixes. pplx uses the same unprefixed text for both.
+- **Embed an index and its queries with the same runtime.** Vectors from ANERun, llama.cpp, MLX and PyTorch agree to cosine ≈ 0.9999 for text, but not bit for bit, and llama.cpp's image preprocessing differs from the official recipe (cosine ≈ 0.996). Re-embed when you switch.
 - **Bulk image jobs (backfills): one client, 4–8 images per request.** More clients barely add throughput: the Neural Engine runs one call at a time, and large JPEGs are decoded on the CPU, at most `--image-concurrency` (default 2) at a time. On an M4 with 12–24 MP photos, one client reached 1.19 images/s at 1 image per request, 1.46 at 4 and 1.51 at 8. Two or three clients reached 1.56–1.59 (+3–5 %), but short queries sent meanwhile waited about 2.5 times longer (p90 0.66–0.70 s instead of 0.28 s). If searches run at the same time, prefer one client. Downscaling very large photos on the client speeds up decoding, at the cost of pixels that differ slightly from the official preprocessing.
-- **Long documents: chunk them, or raise `--max-tokens`.** The default 2048 keeps start time and memory low; texts over the limit are rejected (`400 context_length_exceeded`), never truncated. For the most tokens per second, chunks of about 512 tokens are best; an 8192-token text is processed at about a third of that rate ([details](docs/PERFORMANCE.md#aneembed-across-machines)).
+- **Long documents: chunk them, or raise `--max-tokens`.** The default 2048 keeps start time and memory low; texts over the limit are rejected (`400 context_length_exceeded`), never truncated. For the most tokens per second, chunks of about 512 tokens are best; an 8192-token text is processed at about a third of that rate ([details](docs/PERFORMANCE.md#anerun-across-machines)).
 - **Keep `serve` (or `mcp`) running.** One-off CLI commands load and self-test the model each time (about 5 s).
 
 ## Performance and memory
 
-Summary; the measurements, methods and every number are in [docs/PERFORMANCE.md](docs/PERFORMANCE.md).
+The table reports the EmbeddingGemma 2 release baseline. See [performance measurements](docs/PERFORMANCE.md) for the current long-text results and pplx.
 
-| ANEEmbed, warm median | Apple M4 (16 GB) | M5 Max (64 GB) | M5 Ultra (256 GB) |
+| ANERun, warm median | Apple M4 (16 GB) | M5 Max (64 GB) | M5 Ultra (256 GB) |
 |---|---:|---:|---:|
 | short query | 5.1 ms | 3.2 ms | 3.4 ms |
 | 512 / 2048 tokens | 31 / 211 ms | 26 / 167 ms | 27.5 / 168 ms |
 | 4096 / 8192 tokens (`--max-tokens 8192`) | 515 ms / 1.46 s | 410 ms / 1.16 s | 424 ms / 1.19 s |
 | image, 280-token budget | 488 ms | 383 ms | 378 ms |
 
-All three with `aneembed bench` in process. A text runs in the smallest function that holds it, so latency steps at each function size (for example at 769, 1281, 2049, 3073, 4097 and 6145 tokens) and is flat in between.
+All three with `anerun bench` in process. A text runs in the smallest function that holds it, so latency steps at each function size (for example at 769, 1281, 2049, 3073, 4097 and 6145 tokens) and is flat in between.
 
 - **Process memory**: about 140–380 MB, all pageable. A request keeps at most 3 Neural Engine calls of its short texts in flight, so even a batch of 2048 texts holds only a few input buffers (2048 × 512-token texts: 24 MiB).
 - **Neural Engine buffers**: owned by the process but outside its footprint, 5.3 GB at the default settings and 13.3 GB with `--max-tokens 8192`. They are wired only while used: for about a minute after start (the self-test), and during and about 10 s after each call. Idle, none is wired and the OS may discard them; the next call recreates them, which costs up to about 0.1 s once.
@@ -198,13 +207,13 @@ All three with `aneembed bench` in process. A text runs in the smallest function
 
 **Windowed attention, folded.** EmbeddingGemma 2 has 24 layers; 20 of them only look 512 tokens to each side. Full attention over S rows costs S² in those layers for nothing, so the windowed functions split the rows into blocks of 512 and let each block attend to the 1536 rows around it (512 on each side), with the mask passed in as a `[S, 1536]` band. The 4 global layers attend to every row. That keeps one fixed-shape call per text up to 8192 tokens (`winl3072` … `winl8192`) and makes 1281–2048-token calls cheaper (`winp1536`, `winp2048`, which still pack). Attention uses a "fold" layout: the query heads that share a K/V head are folded into the row dimension, because the usual `repeat_interleave` layout is miscompiled (next paragraph).
 
-**Miscompiles, and the self-test.** The Neural Engine compiler runs on your Mac and a wrong graph does not fail, it returns wrong numbers. Converting this model, the usual attention layout came back with three of four query heads zeroed in the global layers, a sliding-window mask built into the graph as a constant was computed wrongly, and padding inside the graph was correct but about 3× slower. Rebuilt with the usual layout, `winp2048`, `winl4096` and `winl8192` score cosine 0.96, 0.95 and 0.89 on the Neural Engine. The package therefore passes every mask as an input, uses the fold layout, and ships one golden test per function that `aneembed` runs before serving (see [Self-test](#self-test)).
+**Miscompiles, and the self-test.** The Neural Engine compiler runs on your Mac and a wrong graph does not fail, it returns wrong numbers. Converting this model, the usual attention layout came back with three of four query heads zeroed in the global layers, a sliding-window mask built into the graph as a constant was computed wrongly, and padding inside the graph was correct but about 3× slower. Rebuilt with the usual layout, `winp2048`, `winl4096` and `winl8192` score cosine 0.96, 0.95 and 0.89 on the Neural Engine. The package therefore passes every mask as an input, uses the fold layout, and ships one golden test per function that `anerun` runs before serving (see [Self-test](#self-test)).
 
-**Compiled at install, per Mac.** The download is the portable `.mlpackage`. `models install` compiles it, then loads each function once so the OS compiles it for the Neural Engine and caches the result. The cache is keyed by the model path, the macOS build and the executable: an upgraded `aneembed`, a macOS update or a moved model directory compiles again (`doctor` says when).
+**Compiled at install, per Mac.** The download is the portable `.mlpackage`. `models install` compiles it, then loads each function once so the OS compiles it for the Neural Engine and caches the result. Changing the model path, executable or macOS build can trigger compilation again. Use the service's intended command and path when warming the model.
 
 ## Accuracy
 
-The reference ("official") is google/embeddinggemma-2 in fp32 through its official `transformers` stack on the CPU (mean pooling over all tokens, L2; identical to `sentence-transformers` at cosine 1.0000000), not another quantized port. Every input went through the release binary over HTTP exactly as a client sends it (`aneembed serve --max-tokens 8192`, texts as strings, images as data URLs) on an M5 Ultra, and the table reports the cosine similarity to the reference per input. Inputs are public: multilingual READMEs (en/ko/ja/zh/fr) of an Apache-2.0 project, the Korean and Japanese constitutions (public domain), MIT-licensed technical documents and Apache-2.0 source code, cut to exact token counts with the document prompt; 13 images bundled with scikit-learn, networkx, llama.cpp and stable-diffusion.cpp plus synthetic ones, at the official 280-token budget. `usage.prompt_tokens` matched the reference token count in all 167 requests.
+The reference is google/embeddinggemma-2 in fp32 through its official `transformers` stack on the CPU. Mean pooling over all tokens followed by L2 normalization matches `sentence-transformers` at cosine 1.0000000. Every input went through the v0.1 release binary over HTTP on an M5 Ultra with the 8,192-token cap. Inputs are public: multilingual READMEs (en/ko/ja/zh/fr) of an Apache-2.0 project, the Korean and Japanese constitutions (public domain), MIT-licensed technical documents and Apache-2.0 source code, cut to exact token counts with the document prompt; 13 images bundled with scikit-learn, networkx, llama.cpp and stable-diffusion.cpp plus synthetic ones, at the official 280-token budget. `usage.prompt_tokens` matched the reference token count in all 167 requests.
 
 | Input | n | min cos | median cos |
 |---|---:|---:|---:|
@@ -216,11 +225,11 @@ The reference ("official") is google/embeddinggemma-2 in fp32 through its offici
 | image, one per request | 13 | 0.999954 | 0.999979 |
 | images, up to 8 per request | 13 | 0.999957 | 0.999979 |
 
-The default `--max-tokens 2048` gives the same numbers for everything up to 2048 tokens (same functions). The model package itself, checked through the Python host contract (`tools/convert/verify.py`), gives the same picture per function: 380 packed and single texts up to 2048 tokens at ≥ 0.999936 and 44 long texts at ≥ 0.999889 (the lowest at 8191–8192 tokens). To reproduce: `tools/convert/fetch.py data`, `corpus.py` and `images.py` rebuild the inputs from pinned public sources, `scripts/accuracy/reference.py` writes the reference vectors (needs PyTorch and the original model), `scripts/accuracy/compare.py` queries a running `aneembed serve` (standard library only).
+The default `--max-tokens 2048` gives the same numbers for everything up to 2048 tokens (same functions). The model package itself, checked through the Python host contract (`tools/convert/verify.py`), gives the same picture per function: 380 packed and single texts up to 2048 tokens at ≥ 0.999936 and 44 long texts at ≥ 0.999889 (the lowest at 8191–8192 tokens). To reproduce: `tools/convert/fetch.py data`, `corpus.py` and `images.py` rebuild the inputs from pinned public sources, `scripts/accuracy/reference.py` writes the reference vectors (needs PyTorch and the original model), `scripts/accuracy/compare.py` queries a running `anerun serve` (standard library only).
 
 ### Image input formats
 
-The official path reads an image with transformers' `load_image` (PIL): RGB, EXIF orientation applied, alpha dropped. `aneembed` decodes JPEG with its own decoder (libjpeg-turbo's algorithms, bit-exact with PIL) and every other format with ImageIO, taking the decoded values without colour management. Measured like the table above (over HTTP, M5 Ultra; JPEG: the 4 JPEG files among the public images), with the 13 public images re-encoded in each format (`scripts/accuracy/formats.py`; 3 files whose data URLs were over the 8 MiB limit are left out; the reference reads the same files with `load_image`, HEIC through `pillow-heif` 1.8.1, libheif 1.23.6):
+The official path reads an image with transformers' `load_image` (PIL): RGB, EXIF orientation applied, alpha dropped. `anerun` decodes JPEG with its own decoder (libjpeg-turbo's algorithms, bit-exact with PIL) and every other format with ImageIO, taking the decoded values without colour management. Measured like the table above (over HTTP, M5 Ultra; JPEG: the 4 JPEG files among the public images), with the 13 public images re-encoded in each format (`scripts/accuracy/formats.py`; 3 files whose data URLs were over the 8 MiB limit are left out; the reference reads the same files with `load_image`, HEIC through `pillow-heif` 1.8.1, libheif 1.23.6):
 
 | Format | Decoder | n | min cos | median cos | Decoded pixels vs PIL |
 |---|---|---:|---:|---:|---|
@@ -234,7 +243,7 @@ The official path reads an image with transformers' `load_image` (PIL): RGB, EXI
 | CMYK / YCCK JPEG | ImageIO | | | | differ: mean 32, max 130 levels (synthetic test image) |
 
 - **Animated images** use the first frame only, as the official transformers path does; other frames are ignored.
-- **HEIC** is the one format that does not match: ImageIO's HEVC decode is about 0.2–0.8 levels darker per channel even on flat areas and differs strongly at sharp colour edges (chroma upsampling), compared with libheif. It is not colour management (both files and decoders are sRGB): the same HEIC pixels decoded by PIL and sent as PNG score min 0.999913. Matching it would need a HEVC decoder in `aneembed`; convert HEIC to PNG or JPEG where this matters. Note that PIL itself reads HEIC only with the `pillow-heif` plugin.
+- **HEIC** is the one format that does not match: ImageIO's HEVC decode is about 0.2–0.8 levels darker per channel even on flat areas and differs strongly at sharp colour edges (chroma upsampling), compared with libheif. It is not colour management (both files and decoders are sRGB): the same HEIC pixels decoded by PIL and sent as PNG score min 0.999913. Matching it would need a HEVC decoder in `anerun`; convert HEIC to PNG or JPEG where this matters. Note that PIL itself reads HEIC only with the `pillow-heif` plugin.
 - **CMYK JPEG** falls back to ImageIO, which converts colours differently from PIL.
 - **Progressive JPEGs** with more than 100 scans, or with scans out of the order the format defines, are refused (`400 image_decode_failed`, "JPEG refused: …") instead of decoded; libjpeg and PIL would decode the latter with a warning. Standard progressive files (10 scans) are unaffected.
 - Images are limited to 40 megapixels and to 8 MiB as a data URL (about 6 MiB of image file); formats ImageIO cannot read return `400 image_decode_failed`.
@@ -243,27 +252,29 @@ The tokenizer is checked token for token against Hugging Face `tokenizers` on 12
 
 ## Self-test
 
-The model package ships one golden test per function (`selftest.json` / `selftest.bin`, 16 tests, expectations from the original model in fp32), and `aneembed` runs the test of every function it loads before serving. Only a function that passes in this run serves (an allowlist): one below the tolerance (cosine 0.999; packing functions also unused rows ≤ 0.001, images relative error 0.05; a package may tighten these, not loosen them), one with a NaN or infinite output, or one the package has no test for is not used. A larger function, a shorter text limit or fewer image sizes take its place, the log gives the limits that remain, `/health` reports `degraded`, and `aneembed doctor` lists it (records of functions a smaller `--max-tokens` did not load are kept). On an M5 Ultra (macOS 27.0.1) every function scores cosine ≥ 0.99990; the same functions rebuilt with the usual attention layout score 0.89–0.96 on the Neural Engine and fail (see [Design](#design)).
+The model package ships one golden test per function (`selftest.json` / `selftest.bin`, 16 tests, expectations from the original model in fp32), and `anerun` runs the test of every function it loads before serving. Only a function that passes in this run serves (an allowlist): one below the tolerance (cosine 0.999; packing functions also unused rows ≤ 0.001, images relative error 0.05; a package may tighten these, not loosen them), one with a NaN or infinite output, or one the package has no test for is not used. A larger function, a shorter text limit or fewer image sizes take its place, the log gives the limits that remain, `/health` reports `degraded`, and `anerun doctor` lists it (records of functions a smaller `--max-tokens` did not load are kept). On an M5 Ultra (macOS 27.0.1) every function scores cosine ≥ 0.99990; the same functions rebuilt with the usual attention layout score 0.89–0.96 on the Neural Engine and fail (see [Design](#design)).
 
-A package without readable self-test data, or without a valid `manifest.json` declaring every function this build loads, does not load (`doctor` shows why). `--selftest skip` serves every function unchecked; it is meant for diagnosing a package, not for use. Each load also checks every file against the manifest's sizes and hashes `tokenizer.json`, `selftest.json` and `selftest.bin`, which the self-test cannot judge (it feeds token ids); `aneembed models verify` hashes everything and reports whether each compiled model is present and complete (a compile is not byte-for-byte reproducible, so its hash is informational).
+A package needs a valid `manifest.json` with its function and file signatures. Normal loads require readable self-test data and serve only validated routes. The diagnostic option `--selftest skip` skips numerical reference checks. pplx still checks tensor signatures and test predictions for availability. Each load checks source sizes and hashes assets such as the tokenizer and the self-test files. `anerun models verify --model ID` hashes all source files and checks that local compiled packages are complete. The self-test verifies what the compiled packages compute.
 
 ## Known pitfalls
 
 - **Graph-constant masks miscompile on the ANE.** The sliding-window mask of Gemma's local layers is an input (`local_bias`, or the `band_bias` of the windowed functions), not a constant in the graph.
 - **Variable shapes fall back to the CPU.** Every function has fixed shapes (64…1280 tokens with full attention, 1536 and 2048 windowed and packable, 3072…8192 windowed for one text); several short texts are packed into one call with block-diagonal attention.
-- **The first compile takes minutes**, and the OS caches it per model path, macOS build and executable (the same binary copied elsewhere compiles again). `models install` does it once; after a macOS update or an upgrade of `aneembed`, `doctor` reports `stale` and `serve` compiles again before it reports healthy. Do not move the model directory.
+- **The first compile takes minutes**, and the OS caches the result. After changing the binary or model path, verify readiness with the same invocation you plan to use for the service. `doctor` reports the recorded warm state, and `serve` loads and self-tests before reporting healthy.
 - **Memory reporting**: the Neural Engine's buffers do not show in the process footprint (`footprint -w` lists them as `(neural)`), and freed malloc pages only become reclaimable about a minute later, so short-lived measurements overstate the process's own memory and miss the Neural Engine's.
 - **llama.cpp GGUF**: text vectors are compatible; image preprocessing in llama.cpp differs from the official recipe, so image vectors are not interchangeable.
 
 ## Running as a service
 
+Set the first `ProgramArguments` entry to the absolute path printed by `command -v anerun` on your Mac.
+
 ```xml
-<!-- ~/Library/LaunchAgents/com.github.junmo-kim.aneembed.plist -->
+<!-- ~/Library/LaunchAgents/com.github.junmo-kim.anerun.plist -->
 <plist version="1.0"><dict>
-  <key>Label</key><string>com.github.junmo-kim.aneembed</string>
-  <key>ProgramArguments</key><array><string>/opt/homebrew/bin/aneembed</string><string>serve</string></array>
+  <key>Label</key><string>com.github.junmo-kim.anerun</string>
+  <key>ProgramArguments</key><array><string>/opt/homebrew/bin/anerun</string><string>serve</string><string>--model</string><string>embeddinggemma-2</string></array>
   <key>RunAtLoad</key><true/><key>KeepAlive</key><true/>
-  <key>StandardErrorPath</key><string>/tmp/aneembed.log</string>
+  <key>StandardErrorPath</key><string>/tmp/anerun.log</string>
 </dict></plist>
 ```
 
@@ -274,17 +285,17 @@ There is no authentication or TLS. To serve other machines, keep `--host 127.0.0
 ```bash
 swift build -c release
 CI=true swift test                           # unit, golden and fake-runtime contract tests
-Tests/Integration/release-binary-launch-smoke.sh .build/release/aneembed
+Tests/Integration/release-binary-launch-smoke.sh .build/release/anerun
 swift run -c release jpeg-fuzz --iterations 200000 Tests/Fixtures/images   # JPEG decoder mutation fuzzing
 ANEEMBED_TEST_MODEL_DIR=/path/to/model swift test --filter ModelTests   # real model, needs the ANE
-aneembed bench --image photo.jpg --buckets --breakdown   # latency, memory, per-bucket costs
+anerun bench --model embeddinggemma-2 --image photo.jpg --buckets --breakdown
 ```
 
 The test binary is another executable, so the first `ModelTests` run compiles the model for the Neural Engine again (minutes).
 
-The model package itself is built by [`tools/convert`](tools/convert/README.md) (Python, CPU only) from the original weights at a pinned revision; a rebuild reproduces its weights, compiled program and self-test byte for byte.
+[`tools/convert`](tools/convert/README.md) builds the packages from pinned model revisions. Its reproducibility checks cover weights, normalized programs and self-test data.
 
 ## License
 
-MIT for this code. The model package is downloaded separately and keeps its own license: EmbeddingGemma 2 by Google DeepMind, Apache-2.0, also subject to the [Gemma Prohibited Use Policy](https://ai.google.dev/gemma/prohibited_use_policy); the vision encoder conversion is from FluidInference/embeddinggemma-2-coreml (Apache-2.0). See [NOTICE](NOTICE).
+MIT for this code. The model packages keep their own licenses. EmbeddingGemma 2 by Google DeepMind is Apache-2.0. The converter builds its text and vision packages from the Google checkpoint. EmbeddingGemma 2 is also subject to the Gemma Prohibited Use Policy. pplx-embed-v1-0.6b by Perplexity AI is MIT. Qwen3-Embedding-0.6B by Qwen is Apache-2.0. See the [Gemma Prohibited Use Policy](https://ai.google.dev/gemma/prohibited_use_policy) and [NOTICE](NOTICE).
 

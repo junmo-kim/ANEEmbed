@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Build the ANEEmbed EmbeddingGemma 2 Core ML release package from the original HF weights.
 
-    python -I build.py --hf-dir <google/embeddinggemma-2 snapshot> --vision-dir <FluidInference package dir> --out <dist>
+    python -I build.py --hf-dir <google/embeddinggemma-2 snapshot> --out <dist>
 
-fetch.py models downloads both inputs at the pinned revisions (see sources.json and README.md).
+    python -I build.py --model pplx-embed-v1-0.6b --hf-dir <pinned pplx snapshot> --out <dist>
+
+fetch.py models downloads the requested model inputs at the pinned revisions (see sources.json and README.md).
 
 Stages (default: all, in order; each is idempotent and skips finished work unless --force):
   convert   one single-function .mlpackage per function into <work>/fn/  (fp16 ML Program, macOS 15):
@@ -11,56 +13,32 @@ Stages (default: all, in order; each is idempotent and skips finished work unles
             winl{3072,4096,6144,8192}_b512 (windowed, one long text per call)
   merge     multifunction merge -> <out>/EmbeddingGemma2Text.mlpackage (coremltools dedups identical weights)
   compile   xcrun coremlcompiler -> <out>/EmbeddingGemma2Text.mlmodelc
-  assets    embeddings.bf16 (from model.safetensors), tokenizer.json, vision package + position table (copied
-            unchanged from the published FluidInference conversion), LICENSE/NOTICE
+  assets    embeddings.bf16 (from model.safetensors), tokenizer.json, vision package + position table (original weights), LICENSE/NOTICE
   selftest  selftest.json + selftest.bin (fp32 torch expectations; see selftest.py)
   manifest  manifest.json (file sha256/sizes, signatures, host contract, token ids, provenance)
+
+PPLX intermediates in <work>/fn are grouped by converter provenance. A merge-only run
+uses the matching traces from an earlier convert stage.
 
 No step uses the GPU; conversion and fp32 references run on the CPU. Requirements: requirements.txt.
 """
 import argparse
-import hashlib
-import json
 import os
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
+from pathlib import Path
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
-MODEL_ID = "google/embeddinggemma-2"
-MODEL_REVISION = "f9972ac22e696a105c482202646979e33e4b5a1e"
-EXPECTED_SAFETENSORS_SHA256 = "197a32965d4b1105faf060417baa899e193fb73cd401f42ec9295234d5553d79"
+from fetch import load_sources, sha256
+
 TEXT_PKG = "EmbeddingGemma2Text"
 VISION_PKG = "EmbeddingGemma2Vision"
-# FluidInference/embeddinggemma-2-coreml @ 3f978ddf92cac9aa07eb2dcf6eb36cf450f3dba4 (HF LFS sha256)
-VISION_SHA256 = {
-    f"{VISION_PKG}.mlpackage/Data/com.apple.CoreML/weights/weight.bin": "5b5b6dd8d80aa438bf91ba143fbe90d56a2e25bfcf685a56b990aad71cf75232",
-    f"{VISION_PKG}.mlpackage/Data/com.apple.CoreML/model.mlmodel": "0085b5e04a13d000fe5969adeaa13d897f5a3cb7be60c76c8685c023747f89ef",
-    "position_embeddings.f16": "17de9480acc23638c0634a97ed89e51ed664433256d7d6f109587dcd91c79124",
-}
-
-
-def sha256(path, bufsize=1 << 24):
-    h = hashlib.sha256()
-    with open(path, "rb") as f:
-        while True:
-            b = f.read(bufsize)
-            if not b:
-                break
-            h.update(b)
-    return h.hexdigest()
-
-
-def hf_revision(hf_dir):
-    """commit sha recorded by `hf download --local-dir` (.cache/huggingface/download/*.metadata, first line)"""
-    p = os.path.join(hf_dir, ".cache/huggingface/download/model.safetensors.metadata")
-    if os.path.exists(p):
-        lines = open(p).read().split()
-        return lines[0], lines[1]
-    return None, None
+VISION_KEY = ".eg2-vision-key"
 
 
 def function_specs():
@@ -169,8 +147,11 @@ def write_apache_license(path):
 
 
 def stage_assets(a):
-    import numpy as np
+    import importlib.metadata as md
+    from eg2_vision import convert
+    from pplx_build import compiled_complete, read_key, replace_package, select_compiler, write_key
     from safetensors import safe_open
+
     emb = f"{a.out}/embeddings.bf16"
     if not os.path.exists(emb) or a.force:
         t = safe_open(f"{a.hf_dir}/model.safetensors", "pt").get_tensor("language_model.embed_tokens.weight")
@@ -179,47 +160,81 @@ def stage_assets(a):
         t.contiguous().view(torch.int16).numpy().astype("<i2").tofile(emb + ".tmp")
         os.replace(emb + ".tmp", emb)
     shutil.copy2(f"{a.hf_dir}/tokenizer.json", f"{a.out}/tokenizer.json")
-    # vision: the published FluidInference package, unchanged (sha256 checked), compiled here
-    vp = f"{a.out}/{VISION_PKG}.mlpackage"
-    if not os.path.exists(vp) or a.force:
-        if os.path.exists(vp):
-            shutil.rmtree(vp)
-        shutil.copytree(os.path.join(a.vision_dir, f"{VISION_PKG}.mlpackage"), vp)
-        shutil.copy2(os.path.join(a.vision_dir, "position_embeddings.f16"), f"{a.out}/position_embeddings.f16")
-        for rel, want in VISION_SHA256.items():
-            got = sha256(os.path.join(a.out, rel))
-            assert got == want, f"{rel}: sha256 {got} != published {want}"
-        if os.path.exists(f"{a.out}/{VISION_PKG}.mlmodelc"):
-            shutil.rmtree(f"{a.out}/{VISION_PKG}.mlmodelc")
-        subprocess.run(["xcrun", "coremlcompiler", "compile", vp, a.out], check=True, capture_output=True)
+
+    out = Path(a.out)
+    # A prebuilt vision package from an older release must never be silently
+    # relabeled. Publish the marker last so an interrupted replacement retries.
+    source = load_sources()["models"][0]["sha256"]["model.safetensors"]
+    graph = [source, sha256(Path(HERE) / "eg2_vision.py")]
+    graph.extend(md.version(p) for p in ("torch", "coremltools", "transformers", "numpy"))
+    compiler, key = select_compiler(" ".join(graph))
+    package = f"{VISION_PKG}.mlpackage"
+    compiled = f"{VISION_PKG}.mlmodelc"
+    marker = out / VISION_KEY
+    reusable = (read_key(marker) == key and compiled_complete(out / compiled) and
+                (out / package / "Manifest.json").is_file() and (out / "position_embeddings.f16").is_file())
+    if a.force or not reusable:
+        with tempfile.TemporaryDirectory(prefix="_tmp_vision_", dir=out) as tmp:
+            stage = Path(tmp)
+            convert(a.hf_dir, stage)
+            subprocess.run([str(compiler), "compile", str(stage / package), str(stage)], check=True)
+            if not compiled_complete(stage / compiled):
+                raise RuntimeError(f"incomplete Core ML compiler output for {VISION_PKG}")
+            write_key(stage, marker, "incomplete")
+            for name in (package, compiled):
+                replace_package(stage / name, out / name)
+            (stage / "position_embeddings.f16").replace(out / "position_embeddings.f16")
+            write_key(stage, marker, key)
     write_apache_license(f"{a.out}/LICENSE")
     shutil.copy2(os.path.join(HERE, "NOTICE"), f"{a.out}/NOTICE")
     print("[assets] done", flush=True)
 
 
 def main():
+    import pplx_build
+
     ap = argparse.ArgumentParser()
-    ap.add_argument("--hf-dir", required=True, help=f"snapshot of {MODEL_ID}@{MODEL_REVISION[:7]} (fetch.py models)")
-    ap.add_argument("--vision-dir", required=True, help="snapshot of FluidInference/embeddinggemma-2-coreml@3f978dd "
-                    "(EmbeddingGemma2Vision.mlpackage, position_embeddings.f16; fetch.py models)")
+    ap.add_argument("--model", choices=("embeddinggemma-2", pplx_build.MODEL, pplx_build.QWEN), default="embeddinggemma-2")
+    ap.add_argument("--hf-dir", required=True, help="pinned weights and configuration for the selected model (fetch.py models)")
+    ap.add_argument("--vision-dir", help="deprecated compatibility argument; vision is built from --hf-dir")
     ap.add_argument("--out", required=True)
-    ap.add_argument("--work", default=None)
+    ap.add_argument("--work", default=None, help="intermediate conversion cache (shared by sibling PPLX outputs)")
     ap.add_argument("--stages", default="convert,merge,compile,assets,selftest,manifest")
     ap.add_argument("--force", action="store_true")
     a = ap.parse_args()
+    stages = set(a.stages.split(","))
+    if stages - set(pplx_build.STAGES):
+        ap.error(f"expected stages from {', '.join(pplx_build.STAGES)}")
+    if a.model in (pplx_build.MODEL, pplx_build.QWEN):
+        if a.vision_dir is not None:
+            ap.error("--vision-dir only applies to embeddinggemma-2")
+        a.work = a.work or os.path.join(os.path.dirname(os.path.abspath(a.out)), "work-qwen" if a.model == pplx_build.QWEN else "work-pplx")
+        pplx_build.run(a)
+        return
+    if a.vision_dir is not None:
+        print("[assets] --vision-dir is deprecated; building from the raw Google weights", flush=True)
     a.work = a.work or os.path.join(os.path.dirname(os.path.abspath(a.out)), "work")
     os.makedirs(a.out, exist_ok=True)
-    rev, etag = hf_revision(a.hf_dir)
-    if rev is None:
-        # no download metadata (e.g. a copied snapshot): the sha256 check below pins the weights instead
-        rev = MODEL_REVISION
-    elif rev != MODEL_REVISION:
-        print(f"[source] warning: snapshot revision {rev} is not the pinned {MODEL_REVISION}", flush=True)
-    print(f"[source] {MODEL_ID} revision {rev}", flush=True)
+    source = load_sources()["models"][0]
+    required = set()
+    if stages & {"convert", "assets", "selftest"}:
+        required.update(("model.safetensors", "config.json"))
+    if "assets" in stages:
+        required.add("tokenizer.json")
+    if "manifest" in stages:
+        required.add("config_sentence_transformers.json")
+    for rel in sorted(required):
+        want = source["sha256"][rel]
+        if sha256(Path(a.hf_dir) / rel) != want:
+            raise SystemExit(f"{rel}: expected pinned SHA-256 {want}")
+    print(f"[source] {source['id']} revision {source['revision']}", flush=True)
+    with pplx_build.build_lock(Path(a.out) / ".eg2-output.lock"):
+        build_eg2(a, source)
+
+
+def build_eg2(a, source):
     stages = a.stages.split(",")
     if "convert" in stages:
-        got = sha256(f"{a.hf_dir}/model.safetensors")
-        assert got == EXPECTED_SAFETENSORS_SHA256, f"model.safetensors sha256 {got} != {EXPECTED_SAFETENSORS_SHA256}"
         stage_convert(a)
     if "merge" in stages:
         stage_merge(a)
@@ -232,7 +247,10 @@ def main():
         selftest.generate(a.hf_dir, a.out)
     if "manifest" in stages:
         import manifest
-        manifest.write(a, rev)
+        from pplx_build import read_key
+        if read_key(Path(a.out) / VISION_KEY) == "incomplete":
+            raise SystemExit("vision replacement was interrupted; rerun --stages assets")
+        manifest.write(a, source["revision"])
 
 
 if __name__ == "__main__":

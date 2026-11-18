@@ -1,10 +1,21 @@
 // A model-free runtime for tests and for running the CLI/HTTP/MCP surface without a model package
-// (ANEEMBED_RUNTIME=fake). It goes through the real planner and buffers, and its "model" reads the
-// inputs the way the contract says the real one does: each output row is the pool-weighted mean of the
-// input rows. So a text gets the same vector alone or packed with others, which tests can rely on.
+// (ANEEMBED_RUNTIME=fake). Gemma uses the real planner and buffers, and both fake models pool
+// deterministic token rows. A text gets the same vector alone or batched with others.
 import Foundation
 
 public enum FakeRuntime {
+    public static func make(maxTokens: Int, modelID: ModelID = .embeddingGemma2) -> any EmbeddingRuntime {
+        switch modelID {
+        case .embeddingGemma2: return make(maxTokens: maxTokens)
+        case .pplx, .qwen3Embedding: return FakePPLXRuntime(maxTokens: maxTokens)
+        }
+    }
+
+    /// Keeps the concrete Gemma runtime available to callers that use its planner.
+    public static func make(maxTokens: Int) -> BucketTextRuntime {
+        make(maxTokens: maxTokens, images: true)
+    }
+
     /// A runtime over the real planner/buffers with deterministic fake token rows and functions.
     public static func make(maxTokens: Int = 2048, images: Bool = true, callDelay: Duration = .zero)
         -> BucketTextRuntime
@@ -15,6 +26,39 @@ public enum FakeRuntime {
             runner: PoolingFakeRunner(lengths: lengths, delay: callDelay),
             rows: HashedTokenRows(), vision: images ? FakeVisionEncoder() : nil, backend: "fake")
     }
+}
+
+private struct FakePPLXRuntime: EmbeddingRuntime {
+    let info: RuntimeInfo
+
+    init(maxTokens: Int) {
+        let range = ModelID.pplx.tokenRange
+        let limit = min(max(maxTokens, range.lowerBound), range.upperBound)
+        info = RuntimeInfo(maxTokens: limit, maxImageTokens: 0, bucketLengths: [], backend: "fake")
+    }
+
+    func embed(tokenized texts: [[Int32]]) async throws -> [[Float]] {
+        for (index, ids) in texts.enumerated() {
+            guard !ids.isEmpty else { throw RuntimeError.unsupported("input[\(index)] has no tokens") }
+            guard ids.count <= info.maxTokens else { throw RuntimeError.tooLong(tokens: ids.count, max: info.maxTokens) }
+        }
+        return try texts.map { ids in
+            try Task.checkCancellation()
+            var pooled = [Float](repeating: 0, count: Vectors.pplxDimension)
+            for id in ids {
+                for column in pooled.indices {
+                    pooled[column] += HashedTokenRows.value(id: id, column: column)
+                }
+            }
+            return pooled.map { $0 / Float(ids.count) }
+        }
+    }
+
+    func embed(images: [PreparedImage]) async throws -> [[Float]] {
+        throw RuntimeError.unsupported("image inputs are not supported: the model has no vision encoder")
+    }
+
+    func warm() async throws {}
 }
 
 /// Pseudo-random but fixed token rows (no 256 MB table needed).
@@ -106,12 +150,24 @@ public struct FakeVisionEncoder: VisionEncoder {
     }
 }
 
-/// Stand-in tokenizer: <bos>, one id per UTF-8 byte, <eos>. Used only when no tokenizer.json exists.
+/// Stand-in tokenizer used when no tokenizer.json exists. Each UTF-8 byte gets one id.
 public struct ByteTokenizer: TextTokenizer {
-    public init() {}
+    private let modelID: ModelID
+
+    public init(modelID: ModelID = .embeddingGemma2) {
+        self.modelID = modelID
+    }
 
     public func encode(_ text: String) -> [Int32] {
-        [SpecialTokens.bos] + text.utf8.map { Int32($0) + 3 } + [SpecialTokens.eos]
+        encode(text, addSpecial: true, parseSpecial: true)
+    }
+
+    public func encodeForEmbedding(_ text: String, limit: Int) -> BoundedTokenization {
+        if modelID != .embeddingGemma2 {
+            let count = text.utf8.count + (modelID == .qwen3Embedding ? 1 : 0)
+            if count > limit { return .tooLong(atLeast: count) }
+        }
+        return .ids(encode(text))
     }
 
     public var maxBytesPerToken: Int? { 1 }
@@ -119,14 +175,16 @@ public struct ByteTokenizer: TextTokenizer {
     /// It has no added tokens, so `parseSpecial` changes nothing.
     public func encode(_ text: String, addSpecial: Bool, parseSpecial: Bool) -> [Int32] {
         let ids = text.utf8.map { Int32($0) + 3 }
-        return addSpecial ? [SpecialTokens.bos] + ids + [SpecialTokens.eos] : ids
+        if addSpecial && modelID == .qwen3Embedding { return ids + [151643] }
+        return addSpecial && modelID == .embeddingGemma2 ? [SpecialTokens.bos] + ids + [SpecialTokens.eos] : ids
     }
 
     public func pieceBytes(_ id: Int32) -> [UInt8]? {
         switch id {
-        case SpecialTokens.pad: return Array("<pad>".utf8)
-        case SpecialTokens.eos: return Array("<eos>".utf8)
-        case SpecialTokens.bos: return Array("<bos>".utf8)
+        case 151643 where modelID == .qwen3Embedding: return Array("<|endoftext|>".utf8)
+        case SpecialTokens.pad where modelID == .embeddingGemma2: return Array("<pad>".utf8)
+        case SpecialTokens.eos where modelID == .embeddingGemma2: return Array("<eos>".utf8)
+        case SpecialTokens.bos where modelID == .embeddingGemma2: return Array("<bos>".utf8)
         case 3..<259: return [UInt8(id - 3)]
         default: return nil
         }

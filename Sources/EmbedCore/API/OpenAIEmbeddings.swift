@@ -4,9 +4,9 @@
 //                    image item = llama-server's {"content": [{"type": "image_url",
 //                                                 "image_url": {"url": "data:image/...;base64,..."}}]}
 //   encoding_format  "float" (default) | "base64" (little-endian float32)
-//   dimensions       768 (default) | 512 | 256 | 128 (Matryoshka prefix, re-normalized)
+//   dimensions       model-specific Matryoshka prefix (full width by default)
 //   input_type       optional extension (Voyage/Cohere style): "query" | "document" adds the model's
-//                    task prefix; without it texts are embedded as given, like llama-server
+//                    task prefix when applicable; without it texts are embedded as given
 //   model, user      accepted and ignored; the response names the configured model
 import Foundation
 
@@ -36,7 +36,9 @@ public struct EmbeddingsRequest: Sendable, Equatable {
     public static let maxImageURLBytes = 8 << 20
 
     /// With `limits`, the number of inputs (texts, or images before any is decoded) is checked while parsing.
-    public static func parse(_ body: Data, limits: ServiceLimits? = nil) throws(ServiceError) -> EmbeddingsRequest {
+    public static func parse(_ body: Data, limits: ServiceLimits? = nil, modelID: ModelID = .embeddingGemma2)
+        throws(ServiceError) -> EmbeddingsRequest
+    {
         let root: JSONValue
         do {
             root = try JSONValue.parse(body)
@@ -45,7 +47,7 @@ public struct EmbeddingsRequest: Sendable, Equatable {
         }
         guard let object = root.objectValue else { throw .badRequest("invalid_json", "expected a JSON object") }
 
-        var request = EmbeddingsRequest(input: .texts([]))
+        var request = EmbeddingsRequest(input: .texts([]), dimensions: Vectors.defaultDimension(for: modelID))
         switch object["input"] {
         case .string(let text)?:
             request.input = .texts([text])
@@ -55,6 +57,10 @@ public struct EmbeddingsRequest: Sendable, Equatable {
             }
             request.input = .texts(items.map { $0.stringValue! })
         case .array(let items)? where !items.isEmpty && items.allSatisfy({ $0.objectValue != nil }):
+            if !modelID.supportsImages {
+                for (index, item) in items.enumerated() { _ = try imageURL(item, index: index) }
+                throw EmbeddingService.imagesUnsupported(modelID)
+            }
             if let limits, items.count > limits.maxImages {
                 throw .badRequest("too_many_images", "at most \(limits.maxImages) image items per request", param: "input")
             }
@@ -86,12 +92,7 @@ public struct EmbeddingsRequest: Sendable, Equatable {
         switch object["dimensions"] {
         case nil, .null?: break
         case let value?:
-            guard let dimensions = value.intValue, Vectors.dimensions.contains(dimensions) else {
-                throw .badRequest("invalid_dimensions",
-                                  "dimensions must be one of \(Vectors.dimensions.map(String.init).joined(separator: ", "))",
-                                  param: "dimensions")
-            }
-            request.dimensions = dimensions
+            request.dimensions = try Vectors.validateDimensions(value.intValue, modelID: modelID)
         }
 
         switch object["input_type"] {
@@ -112,6 +113,15 @@ public struct EmbeddingsRequest: Sendable, Equatable {
 
     /// The image bytes of one llama-server image item.
     static func imageData(_ item: JSONValue, index: Int) throws(ServiceError) -> Data {
+        let url = try imageURL(item, index: index)
+        guard url.utf8.count <= maxImageURLBytes else {
+            throw ServiceError(.payloadTooLarge, "image_too_large", "input[\(index)]: image URLs are limited to 8 MiB",
+                               param: "input")
+        }
+        return try decodeDataURL(url, index: index)
+    }
+
+    private static func imageURL(_ item: JSONValue, index: Int) throws(ServiceError) -> String {
         guard let parts = item["content"]?.arrayValue, parts.count == 1, parts[0]["type"]?.stringValue == "image_url",
             let url = parts[0]["image_url"]?["url"]?.stringValue
         else {
@@ -119,11 +129,7 @@ public struct EmbeddingsRequest: Sendable, Equatable {
                               "input[\(index)]: an image item needs one content part of type image_url",
                               param: "input")
         }
-        guard url.utf8.count <= maxImageURLBytes else {
-            throw ServiceError(.payloadTooLarge, "image_too_large", "input[\(index)]: image URLs are limited to 8 MiB",
-                               param: "input")
-        }
-        return try decodeDataURL(url, index: index)
+        return url
     }
 
     /// `data:image/<type>;base64,<payload>`; remote URLs are not fetched.
@@ -144,17 +150,19 @@ public struct EmbeddingsRequest: Sendable, Equatable {
 
 public enum EmbeddingsResponse {
     /// The OpenAI response body for `result`.
-    public static func body(_ result: EmbeddingResult, request: EmbeddingsRequest, model: String) -> Data {
+    public static func body(_ result: EmbeddingResult, request: EmbeddingsRequest, model: String,
+                            modelID: ModelID = .embeddingGemma2) -> Data
+    {
         var output: [UInt8] = []
         output.reserveCapacity(result.vectors.count * (request.encodingFormat == .float ? request.dimensions * 12 : request.dimensions * 6) + 128)
         output.append(contentsOf: #"{"object":"list","data":["#.utf8)
         for (index, vector) in result.vectors.enumerated() {
             if index > 0 { output.append(UInt8(ascii: ",")) }
             output.append(contentsOf: #"{"object":"embedding","index":\#(index),"embedding":"#.utf8)
-            let truncated = Vectors.truncated(vector, to: request.dimensions)
+            let embedding = Vectors.output(vector, to: request.dimensions, modelID: modelID)
             switch request.encodingFormat {
-            case .float: writeJSONFloats(truncated, to: &output)
-            case .base64: writeJSONString(Vectors.base64(truncated), to: &output)
+            case .float: writeJSONFloats(embedding, to: &output)
+            case .base64: writeJSONString(Vectors.base64(embedding), to: &output)
             }
             output.append(UInt8(ascii: "}"))
         }

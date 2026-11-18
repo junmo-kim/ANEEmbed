@@ -1,7 +1,9 @@
 """Public evaluation corpus (multilingual, long). Writes <out_dir>/corpus.json [{name, lang, license, source, text}].
 Usage: corpus.py <sources_dir> <out_dir>   (sources_dir: the files from `fetch.py data`, pinned in sources.json)
 The document order is fixed: verify.py, verify_hf.py and scripts/accuracy/reference.py pick documents by index."""
+import hashlib
 import json
+from pathlib import Path
 import os
 import re
 import sys
@@ -18,7 +20,6 @@ SRC = [  # (name, lang, license, file in sources_dir, source label)
     ("ggml-gguf-spec", "en", "MIT", "ggml-gguf.md", "github.com/ggml-org/ggml docs/gguf.md"),
     ("llamacpp-server-readme", "en", "MIT", "llamacpp-server-README.md", "github.com/ggml-org/llama.cpp"),
     ("llamacpp-build", "en", "MIT", "llamacpp-build.md", "github.com/ggml-org/llama.cpp"),
-    ("hf-eg2-modeling-code", "code", "Apache-2.0", "modeling_embedding_gemma2.py", "transformers modeling_embedding_gemma2.py"),
 ]
 
 
@@ -35,10 +36,24 @@ def main(src_dir, out):
     docs = []
     for name, lang, lic, file, src in SRC:
         path = os.path.join(src_dir, file)
-        t = open(path, encoding="utf-8").read()
+        with open(path, encoding="utf-8") as source:
+            t = source.read()
         if path.endswith(".wiki"):
             t = clean_wiki(t)
         docs.append({"name": name, "lang": lang, "license": lic, "source": src, "text": t})
+    here = Path(__file__).resolve()
+    corpus = json.loads(here.with_name("sources.json").read_text())["corpus"]
+    code = corpus["code_fixture"]
+    parts = []
+    for entry in code["sources"]:
+        payload = here.with_name(Path(entry["path"]).name).read_bytes()
+        if hashlib.sha256(payload).hexdigest() != entry["sha256"]:
+            raise ValueError(f"{entry['path']} differs from the pinned {corpus['version']} fixture")
+        parts.append(payload.decode("utf-8"))
+    docs.append({"name": code["name"], "lang": "code", "license": code["license"],
+                 "source": " + ".join(entry["path"] for entry in code["sources"]), "text": "\n".join(parts)})
+    for doc in docs:
+        doc["corpus_version"] = corpus["version"]
     os.makedirs(out, exist_ok=True)
     json.dump(docs, open(f"{out}/corpus.json", "w", encoding="utf-8"), ensure_ascii=False)
     print(f"{len(docs)} docs -> {out}/corpus.json")

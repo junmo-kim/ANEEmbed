@@ -69,12 +69,12 @@ def convert(src, out):
 
 def reference(hf_dir, out, target):
     import torch
-    from transformers import AutoModel, AutoProcessor
+    from transformers import EmbeddingGemma2Model, AutoProcessor
     from transformers.image_utils import load_image
     plugin = heif()
     torch.set_num_threads(8)
-    model = AutoModel.from_pretrained(hf_dir, dtype=torch.float32).eval()
-    proc = AutoProcessor.from_pretrained(hf_dir)
+    model = EmbeddingGemma2Model.from_pretrained(hf_dir, dtype=torch.float32, use_safetensors=True, local_files_only=True).eval()
+    proc = AutoProcessor.from_pretrained(hf_dir, local_files_only=True, trust_remote_code=False)
     cases = []
     for path in sorted(glob.glob(f"{out}/*")):
         name = os.path.basename(path)

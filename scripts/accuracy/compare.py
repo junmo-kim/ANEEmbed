@@ -70,7 +70,11 @@ def main():
               f"mean={statistics.fmean(values):.6f}")
     print(f"token count mismatches: {token_mismatches} of {len(rows)} requests; {time.time() - started:.1f}s")
     if args.out:
-        json.dump({"summary": summary, "token_mismatches": token_mismatches, "cases": rows}, open(args.out, "w"))
+        report = {"summary": summary, "token_mismatches": token_mismatches, "cases": rows}
+        if "corpus" in reference:
+            report["corpus"] = reference["corpus"]
+        with open(args.out, "w") as file:
+            json.dump(report, file)
     sys.exit(1 if token_mismatches else 0)
 
 

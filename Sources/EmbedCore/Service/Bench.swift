@@ -1,9 +1,8 @@
 // `aneembed bench`: latency, throughput and memory of this binary on this Mac, in process (no socket).
 //
 // Requests go through the same Router as `serve` (JSON parse, tokenize, schedule, Core ML, JSON encode),
-// so the numbers are what a client sees minus the loopback round trip. Texts are a fixed bilingual
-// sentence cut to the target token count (with <bos>/<eos> and the document prompt), as in the
-// sentence-transformers reference benchmark the README compares with.
+// so the numbers are what a client sees minus the loopback round trip. Texts use a fixed bilingual
+// sentence cut to the target token count, including the document prompt and framing for EmbeddingGemma 2.
 import Darwin
 import Foundation
 
@@ -24,23 +23,49 @@ public enum Bench {
                              count: 900)
     static let prompt = InputType.document
 
-    /// A text of exactly `tokens` tokens (with the document prompt, <bos> and <eos>) when one exists, else
-    /// the longest below it.
-    static func text(tokens: Int, tokenizer: EmbeddingService, offset: Int = 0) -> String {
-        let source = Array(base.dropFirst(offset % 50))
-        var lower = 1, upper = min(source.count, tokens * 4)
+    /// Request text sized with the selected tokenizer, including any model-specific prompt.
+    static func text(tokens: Int, service: EmbeddingService, offset: Int = 0) throws(ServiceError) -> String {
+        let textOnly = !service.modelID.supportsImages
+        let limit = tokens * (textOnly ? 8 : 4)
+        let available = textOnly && limit > base.count ? String(repeating: base, count: (limit + base.count - 1) / base.count) : base
+        let source = Array(available.dropFirst(offset % 50).prefix(limit))
+        var lower = 1, upper = source.count
         while lower < upper {
             let middle = (lower + upper + 1) / 2
-            if tokenizer.tokenize(String(source[..<middle]), inputType: prompt).count <= tokens { lower = middle } else { upper = middle - 1 }
+            if service.tokenize(String(source[..<middle]), inputType: prompt).count <= tokens { lower = middle } else { upper = middle - 1 }
         }
-        return String(source[..<lower])
+        let raw = String(source[..<lower])
+        let input = prompt.apply(raw, modelID: service.modelID)
+        let count = service.tokenize(input).count
+        if textOnly, count != tokens {
+            // These give exact counts with Qwen and the byte tokenizer, respectively.
+            let framing = service.tokenize("").count
+            for unit in [" x", "x"] {
+                let repeated = String(repeating: unit, count: max(0, tokens - framing))
+                if service.tokenize(repeated).count == tokens { return repeated }
+            }
+        }
+        if count > 0, count <= tokens { return input }
+        return try shortInput(service: service, limit: tokens)
+    }
+
+    private static func shortInput(service: EmbeddingService, limit: Int) throws(ServiceError) -> String {
+        for input in ["x", ""] {
+            let count = service.tokenize(input).count
+            if count > 0, count <= limit { return input }
+        }
+        throw ServiceError(.internal, "bench_failed", "cannot create a benchmark input within \(limit) model tokens")
     }
 
     public static func run(_ config: Config, options: Options, log: @Sendable (String) -> Void) async throws(ServiceError) -> JSONValue {
+        let config = try config.selectingModel(for: "bench")
+        if options.image != nil, let model = config.modelID, !model.supportsImages {
+            throw EmbeddingService.imagesUnsupported(model)
+        }
         let loadStarted = Date()
         let (service, report) = try await ModelLoader.load(config, log: log)
         let loadSeconds = Date().timeIntervalSince(loadStarted)
-        let router = Router(state: ServerState(.ready(service)), modelName: service.modelName)
+        let router = Router(state: ServerState(.ready(service)), modelName: service.modelName, modelID: service.modelID)
         var output: JSONObject = [
             "aneembed": .string(aneembedVersion), "macos_build": .string(operatingSystemBuild), "chip": .string(chipName),
             "max_tokens": .int(service.maxTokens), "functions": .int(service.runtime.info.functions.count),
@@ -76,8 +101,9 @@ public enum Bench {
         // Single texts
         var single: JSONObject = [:]
         for size in options.sizes where size <= service.maxTokens {
-            let text = Self.prompt.apply(text(tokens: size, tokenizer: service))
-            let result = try await time(request(["input": .string(text)]), repeats: size > 2048 ? max(3, options.repeats / 3) : options.repeats)
+            let input = try text(tokens: size, service: service)
+            let repeats = service.modelID == .embeddingGemma2 && size > 2048 ? max(3, options.repeats / 3) : options.repeats
+            let result = try await time(request(["input": .string(input)]), repeats: repeats)
             single[String(size)] = ["median_ms": .number(round(result.median, 1)), "p90_ms": .number(round(result.p90, 1)),
                                     "tokens": .int(result.tokens)]
             log("single \(size): \(round(result.median, 1)) ms (\(result.tokens) tokens)")
@@ -87,7 +113,10 @@ public enum Bench {
         // Batches of 10 texts in one request
         var batches: JSONObject = [:]
         for size in [32, 2048] where size <= service.maxTokens {
-            let texts = (0..<10).map { JSONValue.string(Self.prompt.apply(text(tokens: size, tokenizer: service, offset: $0 * 3))) }
+            var texts: [JSONValue] = []
+            for index in 0..<10 {
+                texts.append(.string(try text(tokens: size, service: service, offset: index * 3)))
+            }
             let result = try await time(request(["input": .array(texts)]), repeats: max(3, options.repeats / 2))
             batches[String(size)] = ["median_ms": .number(round(result.median, 1)), "tokens": .int(result.tokens)]
             log("batch of 10 x \(size): \(round(result.median, 1)) ms")
@@ -111,6 +140,19 @@ public enum Bench {
         }
         if options.breakdown, let runtime = service.runtime as? BucketTextRuntime {
             output["breakdown_ms"] = try await breakdown(runtime, service: service, router: router, image: options.image, log: log)
+        } else if !service.modelID.supportsImages {
+            let qwen = service.modelID == .qwen3Embedding
+            let fusedLimit = qwen ? 64 : 8192
+            if options.buckets {
+                output["routes"] = .array(service.runtime.info.bucketLengths.map { length in
+                    let implementation: JSONValue = length > fusedLimit ? "decomposed" : (qwen ? "packed" : "fused")
+                    return ["length": .int(length), "implementation": implementation]
+                })
+            }
+            if options.breakdown, let runtime = service.runtime as? PPLXTextRuntime {
+                output[qwen ? "qwen_breakdown_ms" : "pplx_breakdown_ms"] = .object(
+                    try await textBreakdown(runtime, service: service, sizes: options.sizes, fusedLimit: fusedLimit, log: log))
+            }
         }
 
         output["footprint_mb"] = .number(round(Memory.footprintMB, 1))
@@ -123,43 +165,115 @@ public enum Bench {
         return .object(output)
     }
 
+    static func textBreakdown(_ runtime: PPLXTextRuntime, service: EmbeddingService, sizes: [Int],
+                              fusedLimit: Int, log: @Sendable (String) -> Void) async throws(ServiceError) -> JSONObject
+    {
+        let model = service.modelID.rawValue
+        var profiles = JSONObject()
+        for size in sizes where size > fusedLimit && size <= service.maxTokens {
+            let ids = service.tokenize(try text(tokens: size, service: service))
+            do {
+                let length = try runtime.bucket(for: ids.count)
+                guard length > fusedLimit else { continue }
+                let profile = try await runtime.profile(ids, length: length)
+                let host = profile.layers.reduce(0) { $0 + $1.host } + profile.preparationSeconds + profile.poolingSeconds
+                let attention = profile.layers.reduce(0) { $0 + $1.attention }
+                let prepost = profile.layers.reduce(0) { $0 + $1.pre + $1.post }
+                log("\(model) profile \(ids.count) tokens: host \(round(host, 3))s, attention \(round(attention, 3))s, pre/post \(round(prepost, 3))s")
+                profiles[String(size)] = [
+                    "tokens": .int(ids.count), "shape": .int(length),
+                    "host_ms": .number(round(host * 1000, 3)),
+                    "allocation_rope_ms": .number(round(profile.preparationSeconds * 1000, 3)),
+                    "pool_ms": .number(round(profile.poolingSeconds * 1000, 3)),
+                    "layers": .array(profile.layers.map { layer in
+                        ["pre_ms": .number(round(layer.pre * 1000, 3)),
+                         "attention_ms": .number(round(layer.attention * 1000, 3)),
+                         "post_ms": .number(round(layer.post * 1000, 3)),
+                         "host_ms": .number(round(layer.host * 1000, 3))]
+                    }),
+                ]
+            } catch {
+                throw ServiceError(.internal, "bench_failed", "\(model) profiling \(size) tokens: \(error)")
+            }
+        }
+        return profiles
+    }
+
     /// `clients` concurrent clients, each sending single short queries back to back.
     static func concurrent(router: Router, service: EmbeddingService, clients: Int, log: @Sendable (String) -> Void)
         async throws(ServiceError) -> JSONValue
     {
         let perClient = 32
-        let bodies = (0..<clients).map { client in
-            (0..<perClient).map { index in
-                HTTPRequest(method: "POST", path: "/v1/embeddings", headers: [("Content-Type", "application/json")],
-                            body: (["input": .string("task: search result | query: question \(client * 1000 + index) about embeddings")]
-                                as JSONValue).jsonData())
+        let limit = min(service.maxTokens, service.limits.shortTokens)
+        var fallback: String?
+        var batches: [[HTTPRequest]] = []
+        for client in 0..<clients {
+            var requests: [HTTPRequest] = []
+            for index in 0..<perClient {
+                let question = "question \(client * 1000 + index) about embeddings"
+                var input = InputType.query.apply(question, modelID: service.modelID)
+                let count = service.tokenize(input).count
+                if count == 0 || count > limit {
+                    if let fallback {
+                        input = fallback
+                    } else {
+                        input = try shortInput(service: service, limit: limit)
+                        fallback = input
+                    }
+                }
+                requests.append(HTTPRequest(method: "POST", path: "/v1/embeddings", headers: [("Content-Type", "application/json")],
+                                            body: (["input": .string(input)] as JSONValue).jsonData()))
             }
+            batches.append(requests)
         }
         let started = DispatchTime.now().uptimeNanoseconds
-        let latencies = await withTaskGroup(of: [Double].self) { group in
-            for client in 0..<clients {
+        let measurement = await withTaskGroup(of: Result<[Double], ServiceError>.self) { group -> Result<[Double], ServiceError> in
+            for requests in batches {
                 group.addTask {
                     var samples: [Double] = []
-                    for request in bodies[client] {
+                    samples.reserveCapacity(requests.count)
+                    for request in requests {
+                        guard !Task.isCancelled else {
+                            return .failure(ServiceError(.internal, "bench_failed", "concurrent benchmark cancelled"))
+                        }
                         let begin = DispatchTime.now().uptimeNanoseconds
-                        _ = await router.handle(request)
-                        samples.append(Double(DispatchTime.now().uptimeNanoseconds - begin) / 1e6)
+                        let response = await router.handle(request)
+                        let elapsed = Double(DispatchTime.now().uptimeNanoseconds - begin) / 1e6
+                        guard response.status == 200 else {
+                            let detail = String(decoding: response.body, as: UTF8.self)
+                            return .failure(ServiceError(.internal, "bench_failed",
+                                                         "concurrent embedding returned HTTP \(response.status) (\(detail))"))
+                        }
+                        samples.append(elapsed)
                     }
-                    return samples
+                    return .success(samples)
                 }
             }
             var all: [Double] = []
-            for await samples in group { all += samples }
-            return all.sorted()
+            for await result in group {
+                switch result {
+                case .success(let samples):
+                    all += samples
+                case .failure(let error):
+                    group.cancelAll()
+                    return .failure(error)
+                }
+            }
+            return .success(all.sorted())
         }
+        let latencies = try measurement.get()
         let seconds = Double(DispatchTime.now().uptimeNanoseconds - started) / 1e9
+        guard !latencies.isEmpty, seconds > 0 else {
+            throw ServiceError(.internal, "bench_failed", "no concurrent embedding throughput could be measured")
+        }
+        let rate = round(Double(latencies.count) / seconds, 1)
         let result: JSONValue = [
             "clients": .int(clients), "requests": .int(latencies.count),
-            "requests_per_s": .number(round(Double(latencies.count) / seconds, 1)),
+            "requests_per_s": .number(rate),
             "median_ms": .number(round(latencies[latencies.count / 2], 1)),
             "p99_ms": .number(round(latencies[min(latencies.count - 1, latencies.count * 99 / 100)], 1)),
         ]
-        log("concurrent \(clients) clients: \(round(Double(latencies.count) / seconds, 1)) req/s")
+        log("concurrent \(clients) clients: \(rate) req/s")
         return result
     }
 
@@ -209,9 +323,9 @@ public enum Bench {
     {
         guard let runner = runtime.runner as? CoreMLBucketRunner else { return .null }
         var result: JSONObject = [:]
-        for size in [32, 512, 2048] where size <= runtime.planner.maxLength {
-            let text = Self.prompt.apply(text(tokens: size, tokenizer: service))
-            let body = (["input": .string(text)] as JSONValue).jsonData()
+        for size in [32, 512, 2048] where size <= min(service.maxTokens, runtime.planner.maxLength) {
+            let input = try text(tokens: size, service: service)
+            let body = (["input": .string(input)] as JSONValue).jsonData()
             var stages: [String: [Double]] = [:]
             func measure<T>(_ name: String, _ work: () throws -> T) rethrows -> T {
                 let started = DispatchTime.now().uptimeNanoseconds
@@ -222,7 +336,7 @@ public enum Bench {
             for _ in 0..<21 {
                 do {
                     let parsed = try measure("parse_request") { try EmbeddingsRequest.parse(body) }
-                    let ids = measure("tokenize") { service.tokenize(text) }
+                    let ids = measure("tokenize") { service.tokenize(input) }
                     let call = measure("plan") { runtime.planner.plan([ids.count])[0] }
                     let buffers = runtime.buffers.checkout(length: call.length)
                     defer { runtime.buffers.checkin(buffers) }
@@ -234,9 +348,11 @@ public enum Bench {
                     let rows = try measure("read_output") { try runner.embeddings(output, buffers) }
                     let embedding = EmbeddingResult(vectors: [rows[0]], tokenCounts: [ids.count])
                     _ = measure("encode_json_float") { EmbeddingsResponse.body(embedding, request: parsed, model: service.modelName) }
-                    var base64 = parsed
-                    base64.encodingFormat = .base64
-                    _ = measure("encode_json_base64") { EmbeddingsResponse.body(embedding, request: base64, model: service.modelName) }
+                    var base64Request = parsed
+                    base64Request.encodingFormat = .base64
+                    _ = measure("encode_json_base64") {
+                        EmbeddingsResponse.body(embedding, request: base64Request, model: service.modelName)
+                    }
                 } catch {
                     throw ServiceError(.internal, "bench_failed", "\(error)")
                 }

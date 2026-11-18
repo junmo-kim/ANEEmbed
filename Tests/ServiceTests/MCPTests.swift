@@ -24,6 +24,22 @@ struct MCPTests {
         #expect(await handler.handle(raw: Data("{".utf8))?["error"]?["code"] == -32700)
     }
 
+    @Test func gemmaCatalogPreservesToolInputsAndPublishesTheTextLimit() async throws {
+        let state = ServerState()
+        let handler = MCPHandler(state: state, allowPaths: true, waitForModel: true, configuredMaxTokens: 1024)
+        let request: JSONValue = ["jsonrpc": "2.0", "id": 1, "method": "tools/list"]
+        for cap in [1024, 64] {
+            if cap == 64 { state.set(.ready(TestSupport.service(maxTokens: cap))) }
+            let response = await handler.handle(request)
+            let tools = try #require(response?["result"]?["tools"]?.arrayValue)
+            #expect(tools.compactMap { $0["name"]?.stringValue } == ["embed_text", "embed_image", "similarity"])
+            #expect(tools.map { $0["inputSchema"] } == Tools.definitions.map { $0["inputSchema"] })
+            #expect(tools[0]["_meta"]?["aneembed/max_context_length"] == .int(cap))
+            #expect(tools[1] == Tools.definitions[1])
+            #expect(tools[2]["_meta"]?["aneembed/max_context_length"] == .int(cap))
+        }
+    }
+
     @Test func toolsEmbedAndCompare() async throws {
         let handler = MCPHandler(state: ServerState(.ready(TestSupport.service())), allowPaths: true, waitForModel: true)
         let (failed, output) = try await call(handler, "embed_text", ["texts": ["a", "b"], "input_type": "document", "dimensions": 512])

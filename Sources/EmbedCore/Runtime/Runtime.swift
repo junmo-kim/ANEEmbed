@@ -50,9 +50,17 @@ public protocol EmbeddingRuntime: Sendable {
     func warm() async throws
 }
 
-/// Text to token ids. `GemmaTokenizer` is the real one; tests and the fake runtime may use others.
+/// A successful encoding, or a safe lower bound that already exceeds the request's cap.
+public enum BoundedTokenization: Sendable, Equatable {
+    case ids([Int32])
+    case tooLong(atLeast: Int)
+}
+
+/// Text to model-specific token ids and bytes.
 public protocol TextTokenizer: Sendable {
     func encode(_ text: String) -> [Int32]
+    func encodeForEmbedding(_ text: String, limit: Int) -> BoundedTokenization
+    func tokenLabel(_ id: Int32) -> String
     /// The most UTF-8 bytes of input text that one token can stand for; nil when there is no such bound. With it, a
     /// text of more than `limit × maxBytesPerToken` bytes is known to have more than `limit` tokens without
     /// encoding it.
@@ -67,9 +75,18 @@ public protocol TextTokenizer: Sendable {
 
 extension TextTokenizer {
     public var maxBytesPerToken: Int? { nil }
+
+    public func encodeForEmbedding(_ text: String, limit: Int) -> BoundedTokenization {
+        .ids(encode(text))
+    }
+
+    public func tokenLabel(_ id: Int32) -> String {
+        pieceBytes(id).map { String(decoding: $0, as: UTF8.self) } ?? ""
+    }
 }
 
 extension GemmaTokenizer: TextTokenizer {
+    public func tokenLabel(_ id: Int32) -> String { tokens([id]).first ?? "" }
     public func encode(_ text: String) -> [Int32] { encode(text, addSpecialTokens: true) }
 
     public func encode(_ text: String, addSpecial: Bool, parseSpecial: Bool) -> [Int32] {

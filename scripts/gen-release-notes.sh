@@ -17,7 +17,7 @@ RANGE="${TAG}"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CHANGELOG="${REPO_ROOT}/CHANGELOG.md"
 
-echo "## aneembed ${TAG}"
+echo "## anerun ${TAG}"
 echo
 
 if [ -f "$CHANGELOG" ]; then

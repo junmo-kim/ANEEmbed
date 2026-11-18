@@ -34,18 +34,20 @@ jobs:
       - name: Build (release, stripped) + package
         run: |
           swift build -c release -Xlinker -s
-          BIN=.build/release/aneembed
+          BIN=.build/release/anerun
           codesign --verify --strict "$BIN"
           Tests/Integration/release-binary-launch-smoke.sh "$BIN"
-          EXPECTED_VERSION="aneembed ${GITHUB_REF_NAME#v}"
+          EXPECTED_VERSION="anerun ${GITHUB_REF_NAME#v}"
           ACTUAL_VERSION="$("$BIN" --version)"
           if [ "$ACTUAL_VERSION" != "$EXPECTED_VERSION" ]; then
             echo "::error::tag/binary version mismatch: expected '$EXPECTED_VERSION', got '$ACTUAL_VERSION'"
             exit 1
           fi
-          TARBALL="aneembed-${GITHUB_REF_NAME}-macos-arm64.tar.gz"
+          TARBALL="anerun-${GITHUB_REF_NAME}-macos-arm64.tar.gz"
           mkdir -p dist
-          tar -C "$(dirname "$BIN")" -czf "dist/${TARBALL}" "$(basename "$BIN")"
+          mkdir package
+          install -m 755 "$BIN" package/anerun
+          tar -C package -czf "dist/${TARBALL}" anerun
           ( cd dist && shasum -a 256 "${TARBALL}" > "${TARBALL}.sha256" )
 
       - name: Generate release notes
@@ -54,7 +56,7 @@ jobs:
       - name: Upload release candidate
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: aneembed-release-candidate
+          name: anerun-release-candidate
           path: dist/
           if-no-files-found: error
           retention-days: 1
@@ -70,19 +72,19 @@ jobs:
       - name: Download release candidate
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          name: aneembed-release-candidate
+          name: anerun-release-candidate
           path: dist
 
       - name: Verify checksum, package, signature, and launch
         run: |
-          TARBALL="aneembed-${GITHUB_REF_NAME}-macos-arm64.tar.gz"
+          TARBALL="anerun-${GITHUB_REF_NAME}-macos-arm64.tar.gz"
           ( cd dist && shasum -a 256 -c "${TARBALL}.sha256" )
-          test "$(tar -tzf "dist/${TARBALL}")" = aneembed
+          test "$(tar -tzf "dist/${TARBALL}")" = anerun
           mkdir verify
           tar -xzf "dist/${TARBALL}" -C verify
-          codesign --verify --strict verify/aneembed
-          test "$(verify/aneembed --version)" = "aneembed ${GITHUB_REF_NAME#v}"
-          Tests/Integration/release-binary-launch-smoke.sh verify/aneembed
+          codesign --verify --strict verify/anerun
+          test "$(verify/anerun --version)" = "anerun ${GITHUB_REF_NAME#v}"
+          Tests/Integration/release-binary-launch-smoke.sh verify/anerun
 
   publish:
     name: publish verified release
@@ -94,7 +96,7 @@ jobs:
       - name: Download verified release candidate
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          name: aneembed-release-candidate
+          name: anerun-release-candidate
           path: dist
 
       - name: Publish release

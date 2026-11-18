@@ -1,17 +1,22 @@
-"""HTTP contract of a running `aneembed serve`, stdlib only. Works against the fake runtime (CI) and a
+"""HTTP contract of a running `anerun serve`, stdlib only. Works against the fake runtime (CI) and a
 real model; with a real model, pass --reference <json> ({"texts": [...], "vectors": [...]}, e.g. from Hugging
-Face fp32) to also check accuracy.
+Face) to also check accuracy. Reference vectors should be full-width model outputs, including tanh
+quantization for pplx. --model selects a contract independently of the server's advertised alias.
 
-Usage: python3 -I serve-contract.py http://127.0.0.1:18180 [--reference ref.json] [--min-cosine 0.9999]
+Usage: python3 -I serve-contract.py URL [--model ID] [--reference ref.json] [--min-cosine 0.9999]
 """
 import argparse, base64, concurrent.futures, http.client, json, math, socket, struct, sys, urllib.error, urllib.request, zlib
 
 parser = argparse.ArgumentParser()
 parser.add_argument("base")
+parser.add_argument("--model", choices=("embeddinggemma-2", "pplx-embed-v1-0.6b"), default="embeddinggemma-2")
 parser.add_argument("--reference")
 parser.add_argument("--min-cosine", type=float, default=0.9999)
 args = parser.parse_args()
 BASE = args.base.rstrip("/")
+pplx = args.model == "pplx-embed-v1-0.6b"
+width = 1024 if pplx else 768
+dimensions = list(range(width, 0, -1)) if pplx else [768, 512, 256, 128]
 failures = []
 
 
@@ -60,31 +65,59 @@ check("health 200", s == 200 and b == {"status": "ok"}, b)
 s, b = call("/v1/models")
 model = b["data"][0] if s == 200 and len(b.get("data", [])) == 1 else {}
 max_tokens = model.get("max_context_length", 0)
-check("models lists one id with limits", max_tokens >= 512 and model.get("dimensions") == [768, 512, 256, 128], b)
+check("models lists one id with limits", max_tokens >= 512 and model.get("dimensions") == dimensions, model.get("id"))
+if pplx:
+    check("models reports text-only capabilities",
+          model.get("max_image_tokens") == 0 and "image_preprocessing" not in model, model.get("id"))
 check("model object has OpenAI's fields", model.get("object") == "model" and isinstance(model.get("created"), int)
       and isinstance(model.get("owned_by"), str), b)
 
-s, b = call("/v1/embeddings", {"input": "task: search result | query: hello"})
+sample = "hello world for the embedding contract" if pplx else "task: search result | query: hello"
+s, b = call("/v1/embeddings", {"input": sample})
 v = b["data"][0]["embedding"] if s == 200 else []
-check("single string -> 768 unit floats", len(v) == 768 and abs(norm(v) - 1) < 1e-3, s)
+if pplx:
+    check("single string -> 1024 unnormalized quantized values",
+          len(v) == width and norm(v) > 1 and all(-128 <= x <= 127 and x == int(x) for x in v), s)
+    for input_type in ("query", "document"):
+        prompted_status, prompted = call("/v1/embeddings", {"input": sample, "input_type": input_type})
+        check(f"pplx accepts {input_type} without a prefix", prompted_status == 200 and prompted == b, prompted_status)
+else:
+    check("single string -> 768 unit floats", len(v) == 768 and abs(norm(v) - 1) < 1e-3, s)
 check("usage reports tokens", b.get("usage", {}).get("prompt_tokens", 0) > 2, b.get("usage"))
 
 batch = [f"query number {i} " + "word " * (i * 3) for i in range(20)]
 s, b = call("/v1/embeddings", {"input": batch, "model": "anything"})
 check("batch keeps order and count", s == 200 and [d["index"] for d in b["data"]] == list(range(len(batch))))
+check("body model does not select the runtime", s == 200 and b.get("model") == model.get("id"))
 singles = [call("/v1/embeddings", {"input": t})[1]["data"][0]["embedding"] for t in batch[:5]]
 sims = [cos(singles[i], b["data"][i]["embedding"]) for i in range(5)]
 check("packed batch matches single calls", min(sims) > 0.999, f"min cos {min(sims):.6f}")
 
 s, b64 = call("/v1/embeddings", {"input": batch[0], "encoding_format": "base64"})
-vec = struct.unpack("<768f", base64.b64decode(b64["data"][0]["embedding"]))
+vec = struct.unpack(f"<{width}f", base64.b64decode(b64["data"][0]["embedding"]))
 check("base64 decodes to the float vector", max(abs(x - y) for x, y in zip(vec, singles[0])) < 1e-6)
 s, d = call("/v1/embeddings", {"input": batch[0], "dimensions": 256})
 v = d["data"][0]["embedding"]
 head = singles[0][:256]
-check("dimensions=256 is the renormalized prefix", len(v) == 256 and abs(norm(v) - 1) < 1e-5 and cos(v, head) > 0.99999)
+if pplx:
+    check("dimensions=256 keeps exactly the first 256 quantized values", v == head)
+    for requested in (1, 300, 1024):
+        s, d = call("/v1/embeddings", {"input": batch[0], "dimensions": requested})
+        check(f"dimensions={requested} is an exact prefix",
+              s == 200 and d["data"][0]["embedding"] == singles[0][:requested], s)
+    for requested in (0, 1025, 1.5):
+        s, d = call("/v1/embeddings", {"input": "x", "dimensions": requested})
+        check(f"pplx dimensions={requested} -> invalid_dimensions",
+              s == 400 and d["error"].get("code") == "invalid_dimensions" and d["error"].get("param") == "dimensions", d)
+    s, d = call("/v1/embeddings", {"input": ["ok", ""]})
+    check("pplx empty sequence reports index 1", s == 400 and d["error"].get("code") == "empty_sequence"
+          and "input[1]" in d["error"]["message"], d)
+    s, d = call("/v1/embeddings", {"input": " "})
+    check("pplx can embed tokenized whitespace", s == 200 and d["usage"]["prompt_tokens"] > 0, s)
+else:
+    check("dimensions=256 is the renormalized prefix", len(v) == 256 and abs(norm(v) - 1) < 1e-5 and cos(v, head) > 0.99999)
 
-for name, payload in [("bad dimensions", {"input": "x", "dimensions": 300}), ("token-id input", {"input": [1, 2, 3]}),
+for name, payload in [("bad dimensions", {"input": "x", "dimensions": 1025 if pplx else 300}), ("token-id input", {"input": [1, 2, 3]}),
                       ("empty list", {"input": []}), ("bad encoding", {"input": "x", "encoding_format": "int8"})]:
     s, b = call("/v1/embeddings", payload)
     check(f"{name} -> 400 OpenAI error", s == 400 and b.get("error", {}).get("type") == "invalid_request_error", b)
@@ -104,7 +137,10 @@ if max_tokens > 600:
     s, b = call("/v1/embeddings", {"input": ["short", long_text, "short too"]})
     check("mixed short + long batch keeps order", s == 200 and [d["index"] for d in b["data"]] == [0, 1, 2], s)
 
-if model.get("max_image_tokens", 0) > 0:
+if pplx:
+    s, b = call("/v1/embeddings", {"input": [image_item("data:image/png;base64,!!!!")]})
+    check("pplx rejects images before base64 decoding", s == 400 and b["error"].get("code") == "images_unsupported", b)
+elif model.get("max_image_tokens", 0) > 0:
     small, big, tiny, strip = png_url(320, 240), png_url(1600, 1200), png_url(1, 1), png_url(3000, 10)
     s, b = call("/v1/embeddings", {"input": [image_item(small)]})
     v = b["data"][0]["embedding"] if s == 200 else []
@@ -124,8 +160,13 @@ if model.get("max_image_tokens", 0) > 0:
 text = "tokenize me, détokenize me"
 s, plain = call("/tokenize", {"content": text})
 s2, framed = call("/tokenize", {"content": text, "add_special": True})
-check("POST /tokenize: add_special off by default, on adds <bos>/<eos> (the usage count)",
-      s == 200 and s2 == 200 and len(framed["tokens"]) == len(plain["tokens"]) + 2 == tokens(text), (plain, framed))
+if pplx:
+    check("POST /tokenize: pplx add_special leaves IDs and usage unchanged",
+          s == 200 and s2 == 200 and framed["tokens"] == plain["tokens"] and len(plain["tokens"]) == tokens(text),
+          (plain, framed))
+else:
+    check("POST /tokenize: add_special off by default, on adds <bos>/<eos> (the usage count)",
+          s == 200 and s2 == 200 and len(framed["tokens"]) == len(plain["tokens"]) + 2 == tokens(text), (plain, framed))
 s, b = call("/detokenize", {"tokens": plain.get("tokens", [])})
 check("POST /detokenize gives the text back", s == 200 and b.get("content") == text, b)
 s, b = call("/tokenize", {"content": "é\u0ff0", "with_pieces": True})  # U+0FF0: byte tokens for EmbeddingGemma 2
@@ -140,7 +181,28 @@ check("detokenize of a non-id -> 400 invalid_token", s == 400 and b["error"].get
 s, b = call("/embed_text?format=json&dimensions=128", method="QUERY", raw=b"hello", headers={"Content-Type": "text/plain"})
 check("QUERY /embed_text raw body", s == 200 and len(b["data"][0]["embedding"]) == 128, s)
 s, b = call("/mcp", {"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
-check("POST /mcp tools/list", s == 200 and len(b["result"]["tools"]) == 3, s)
+if pplx:
+    tools = b.get("result", {}).get("tools", [])
+    check("POST /mcp advertises only pplx text tools", s == 200 and [t["name"] for t in tools] == ["embed_text", "similarity"], b)
+    for tool in tools:
+        properties = tool["inputSchema"]["properties"]
+        schema = properties["dimensions"]
+        check(f'{tool["name"]} has a text-only schema with bounded integer dimensions',
+              all(k not in properties for k in ("a_image", "b_image", "a_path", "b_path"))
+              and schema.get("type") == "integer" and schema.get("minimum") == 1 and schema.get("maximum") == 1024
+              and "enum" not in schema, schema)
+    for tool, arguments, reason in [
+        ("embed_image", {"path": "/does/not/exist/aneembed.png"}, "images_unsupported"),
+        ("similarity", {"a": "hello", "b_image": "!!!!"}, "images_unsupported"),
+        ("embed_text", {"text": "hello", "dimensions": 1025}, "invalid_dimensions"),
+    ]:
+        s, b = call("/mcp", {"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                             "params": {"name": tool, "arguments": arguments}})
+        result = b.get("result", {})
+        check(f"POST /mcp {tool} returns {reason}", s == 200 and result.get("isError") is True
+              and json.loads(result["content"][0]["text"]).get("reason") == reason, b)
+else:
+    check("POST /mcp tools/list", s == 200 and len(b["result"]["tools"]) == 3, s)
 s, _ = call("/nope")
 check("unknown route -> 404", s == 404)
 
@@ -193,11 +255,19 @@ with concurrent.futures.ThreadPoolExecutor(32) as pool:
 check("64 concurrent requests all 200", statuses.count(200) == 64, statuses.count(200))
 
 if args.reference:
-    ref = json.load(open(args.reference))
+    with open(args.reference, encoding="utf-8") as file:
+        ref = json.load(file)
     s, b = call("/v1/embeddings", {"input": ref["texts"]})
-    sims = [cos(d["embedding"], r) for d, r in zip(b["data"], ref["vectors"])]
-    check(f"accuracy vs reference (min cos > {args.min_cosine})", min(sims) > args.min_cosine,
-          f"min {min(sims):.6f} mean {sum(sims) / len(sims):.6f}")
+    vectors = ref["vectors"]
+    data = b.get("data", [])
+    aligned = (s == 200 and len(data) == len(ref["texts"]) == len(vectors) > 0
+               and all(d["index"] == i and len(d["embedding"]) == len(r) == width
+                       for i, (d, r) in enumerate(zip(data, vectors))))
+    check(f"reference aligns with the {width}-wide model outputs", aligned, s)
+    if aligned:
+        sims = [cos(d["embedding"], r) for d, r in zip(data, vectors)]
+        check(f"accuracy vs reference (min cos > {args.min_cosine})", min(sims) > args.min_cosine,
+              f"min {min(sims):.6f} mean {sum(sims) / len(sims):.6f}")
 
 print("FAILED:", failures if failures else "none")
 sys.exit(1 if failures else 0)

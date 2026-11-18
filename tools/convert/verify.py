@@ -6,7 +6,9 @@ Usage: verify.py text <dist> <corpus.json> --hf-dir <snapshot>    embed_S and wi
                                                                   mixed long + short, two long
        verify.py long <dist> <corpus.json> --hf-dir <snapshot>    winl: one text of 2049..8192 tokens per call,
                                                                   incl. the lengths at and just over each size
-corpus.json comes from corpus.py, the snapshot from fetch.py models.
+       verify.py pplx <dist> <corpus.json> --hf-dir <snapshot> [--binary PATH]
+                Swift HTTP output vs quantized fp32 means (corpus entries supply raw vectors or text for HF).
+corpus.json comes from corpus.py or a list of evaluation documents, and the snapshot from fetch.py models.
 Prints one line per case and a final SUMMARY json {category: {n, min, median}}."""
 import argparse
 import json
@@ -14,20 +16,29 @@ import os
 import sys
 import time
 
-import coremltools as ct
-import numpy as np
-import torch
-
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+ap = argparse.ArgumentParser()
+ap.add_argument("mode", choices=("text", "long", "pplx"))
+ap.add_argument("dist")
+ap.add_argument("corpus")
+ap.add_argument("--hf-dir", required=True, help="pinned snapshot for the selected model")
+ap.add_argument("--binary", help="anerun Swift executable (pplx)")
+ap.add_argument("--timeout", type=float, default=1800, help="seconds to wait for Swift readiness or one HTTP call (pplx)")
+args = ap.parse_args()
+if args.mode == "pplx":
+    import math
+    from pplx_verify import run
+
+    if not math.isfinite(args.timeout) or args.timeout <= 0:
+        ap.error("--timeout must be a finite positive number")
+    sys.exit(run(args.dist, args.corpus, args.hf_dir, args.binary, args.timeout))
+
+import coremltools as ct  # noqa: E402
+import numpy as np  # noqa: E402
+import torch  # noqa: E402
 import host  # noqa: E402
 from eg2 import Weights, ref_embed  # noqa: E402
 
-ap = argparse.ArgumentParser()
-ap.add_argument("mode", choices=("text", "long"))
-ap.add_argument("dist")
-ap.add_argument("corpus")
-ap.add_argument("--hf-dir", required=True, help="google/embeddinggemma-2 snapshot (fp32 reference weights)")
-args = ap.parse_args()
 torch.set_num_threads(8)
 mode, dist, corpus = args.mode, args.dist, args.corpus
 W = Weights(args.hf_dir)

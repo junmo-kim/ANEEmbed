@@ -7,9 +7,6 @@ import os
 
 import host
 
-VISION_SOURCE = {"id": "FluidInference/embeddinggemma-2-coreml", "revision": "3f978ddf92cac9aa07eb2dcf6eb36cf450f3dba4",
-                 "license": "Apache-2.0", "note": "EmbeddingGemma2Vision.mlpackage and position_embeddings.f16 copied unchanged "
-                 "(sha256 equal to the HF LFS objects at this revision)"}
 DTYPES = {65552: "float16", 65568: "float32", 131104: "int32"}
 
 
@@ -49,7 +46,13 @@ def signatures(pkg):
 def write(a, revision):
     out = a.out
     text_sigs = signatures(f"{out}/EmbeddingGemma2Text.mlpackage")
-    vis_sigs = signatures(f"{out}/EmbeddingGemma2Vision.mlpackage")
+    import coremltools as ct
+    from eg2_vision import CONVERTER
+
+    vision_path = f"{out}/EmbeddingGemma2Vision.mlpackage"
+    vis_sigs = signatures(vision_path)
+    if ct.utils.load_spec(vision_path).description.metadata.userDefined.get("anerun.converter") != CONVERTER:
+        raise ValueError("vision package provenance differs; rebuild it with --force --stages assets")
     st = json.load(open(f"{out}/selftest.json")) if os.path.exists(f"{out}/selftest.json") else {}
     pkgs = {p: md.version(p) for p in ("coremltools", "torch", "numpy", "safetensors", "tokenizers", "transformers",
                                          "sentence-transformers", "pillow", "torchvision")}
@@ -62,7 +65,9 @@ def write(a, revision):
                          "model.safetensors_sha256": "197a32965d4b1105faf060417baa899e193fb73cd401f42ec9295234d5553d79",
                          "use_policy": "https://ai.google.dev/gemma/prohibited_use_policy",
                          "attribution": "EmbeddingGemma 2 by Google DeepMind"},
-        "vision_source": VISION_SOURCE,
+        "vision_source": {"id": "google/embeddinggemma-2", "revision": revision, "license": "Apache-2.0",
+                          "converter": CONVERTER,
+                          "position_table": "first 1024 rows per axis of the checkpoint position table as fp16"},
         "converter": {"script": "tools/convert/build.py", "python_packages": pkgs,
                       "precision": "fp16 ML Program (compute_precision FLOAT16), minimum macOS 15",
                       "compute_units": "cpuAndNeuralEngine (the package is tuned and verified for the ANE only)"},
@@ -76,7 +81,7 @@ def write(a, revision):
         "prompts": prompts,
         "token_table": {"file": "embeddings.bf16", "dtype": "bfloat16", "byte_order": "little", "shape": [262144, 512],
                         "row_to_input": "fp32(bf16 row) * sqrt(512) (= 22.627417), then cast to fp16",
-                        "sha256_equals": "FluidInference/embeddinggemma-2-coreml embeddings.bf16 (same bytes)"},
+                        "sha256_equals": "raw little-endian BF16 bytes of language_model.embed_tokens.weight in google/embeddinggemma-2 model.safetensors"},
         "packages": {
             "EmbeddingGemma2Text": {"mlpackage": "EmbeddingGemma2Text.mlpackage", "mlmodelc": "EmbeddingGemma2Text.mlmodelc",
                                     "compute_units": "cpuAndNeuralEngine", "functions": text_sigs},
@@ -134,3 +139,96 @@ def write(a, revision):
     }
     json.dump(m, open(f"{out}/manifest.json", "w"), indent=1, ensure_ascii=False)
     print(f"[manifest] {len(m['files'])} files", flush=True)
+
+
+def check_pplx_spec(spec, expected, *, merged):
+    """Compare a saved Core ML spec with the fixed Swift contract before publishing its metadata."""
+    if spec.WhichOneof("Type") != "mlProgram" or spec.specificationVersion != 9:
+        raise ValueError("pplx requires a macOS 15 ML Program")
+    description = spec.description
+    if merged:
+        actual = {f.name: f for f in description.functions}
+        names = {entry["function"] for entry in expected}
+        if (len(actual) != len(description.functions) or set(actual) != names
+                or set(spec.mlProgram.functions) != names
+                or description.defaultFunctionName != "embed_64"):
+            raise ValueError("invalid PPLXText multifunction names or default")
+    else:
+        if description.functions or set(spec.mlProgram.functions) != {"main"}:
+            raise ValueError("pplx single-function package must use Core ML's main function")
+        actual = {expected[0]["function"]: description}
+
+    def signature(features):
+        dtypes = {65552: "fp16", 65568: "fp32"}
+        return {v.name: (dtypes.get(v.type.multiArrayType.dataType), list(v.type.multiArrayType.shape))
+                for v in features if v.type.WhichOneof("Type") == "multiArrayType"}
+
+    for entry in expected:
+        name = entry["function"]
+        for direction, features in (("inputs", actual[name].input), ("outputs", actual[name].output)):
+            wanted = {t["name"]: (t["dtype"], t["shape"]) for t in entry[direction]}
+            got = signature(features)
+            if len(features) != len(wanted) or got != wanted:
+                raise ValueError(f"{name} {direction}: expected {wanted}, got {got}")
+
+
+def write_pplx(out, source):
+    from pathlib import Path
+    from tempfile import TemporaryDirectory
+
+    import coremltools as ct
+    from pplx_build import MODEL, QWEN, TEXT_PACKAGE, function_specs, package_names
+
+    out = Path(out)
+    causal = source["id"] == "Qwen/Qwen3-Embedding-0.6B"
+    functions = list(function_specs(causal=causal))
+    packages = package_names(causal=causal)
+    files = []
+    for name in packages:
+        package = out / f"{name}.mlpackage"
+        spec = ct.utils.load_spec(str(package))
+        check_pplx_spec(spec, [f for f in functions if f["package"] == name], merged=name == TEXT_PACKAGE)
+        if not (package / "Manifest.json").stat().st_size:
+            raise ValueError(f"{package}/Manifest.json is empty")
+        payload = package / "Data/com.apple.CoreML"
+        if not any(p.is_file() for p in payload.rglob("*")):
+            raise ValueError(f"{package} has no Core ML payload")
+        for directory in (package, out / f"{name}.mlmodelc"):
+            files.extend(p for p in directory.rglob("*") if p.is_file() and not p.name.startswith("."))
+    assets = (
+        "tokenizer.json", "tokenizer_config.json", "config.json", "embeddings.f32", "final_norm.f32",
+        "selftest.json", "selftest.bin", "LICENSE", "NOTICE",
+    )
+    files.extend(out / name for name in assets)
+    for name, expected in (("embeddings.f32", (151669 if causal else 151936) * 4096), ("final_norm.f32", 4096)):
+        if (out / name).stat().st_size != expected:
+            raise ValueError(f"{name} must be {expected} bytes")
+    for name in ("tokenizer.json", "tokenizer_config.json", "config.json"):
+        if sha256(out / name) != source["sha256"][name]:
+            raise ValueError(f"{name} differs from the pinned source")
+    m = {
+        "contract_version": 1,
+        "model": QWEN if causal else MODEL,
+        "revision": source["revision"],
+        "created": datetime.date.today().isoformat(),
+        "packages": packages,
+        "functions": functions,
+        "files": [{"path": p.relative_to(out).as_posix(), "size": p.stat().st_size, "sha256": sha256(p)}
+                  for p in sorted(files)],
+        "source_model": {
+            "id": source["id"], "revision": source["revision"], "license": source["license"],
+            "sha256": source["sha256"],
+        },
+        "converter": {
+            "script": "tools/convert/build.py",
+            "python_packages": {p: md.version(p) for p in (
+                "coremltools", "torch", "numpy", "safetensors", "tokenizers", "transformers",
+            )},
+            "precision": "fp16 ML Program, macOS 15",
+        },
+    }
+    with TemporaryDirectory(prefix="_tmp_", dir=out) as tmp:
+        staged = Path(tmp) / "manifest.json"
+        staged.write_text(json.dumps(m, indent=1) + "\n", encoding="utf-8")
+        staged.replace(out / staged.name)
+    print(f"[manifest] {len(files)} files, {len(packages)} packages, {len(functions)} functions", flush=True)

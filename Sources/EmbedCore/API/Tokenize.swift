@@ -2,7 +2,7 @@
 // llama-server's tokenizer API work unchanged:
 //
 //   /tokenize    content        string (required), at most 1 MiB of UTF-8
-//                add_special    <bos>/<eos> around the ids (default false, as in llama-server)
+//                add_special    use the loaded tokenizer’s automatic special tokens (default false)
 //                parse_special  control-token text such as "<bos>" becomes its id (default true); false encodes it as
 //                               ordinary text (the user-defined added tokens are still cut out, as in llama.cpp)
 //                with_pieces    each token as {"id", "piece"}: the text it stands for, or a list of its bytes when
@@ -11,7 +11,7 @@
 //   /detokenize  tokens         [ids] -> {"content": text}; special tokens appear as their text, and bytes that do
 //                               not form valid UTF-8 become U+FFFD
 //
-// The ids are the model's own (the same as Hugging Face `tokenizers` and llama.cpp for EmbeddingGemma 2). /tokenize
+// The ids are the loaded model’s own. /tokenize
 // counts every token, beyond the embedding limit too: a client measures texts longer than that limit to split them.
 // Where llama-server is lenient this is strict, like the rest of the API: a missing or non-string `content`, missing
 // `tokens`, a flag that is not a boolean and an id outside the vocabulary are 400s.

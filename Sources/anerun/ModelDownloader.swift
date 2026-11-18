@@ -8,7 +8,7 @@ import Foundation
 struct ModelDownloader {
     let source: ModelSource
 
-    func install(into target: URL, store: ModelStore) async throws(ServiceError) {
+    func install(into target: URL, store: ModelStore) async throws(ServiceError) -> URL {
         try await ModelInstaller.download(source, into: target, store: store, log: { Log.info($0) }) {
             path, directory, size throws(ServiceError) in
             try await fetch(path, to: directory, size: size)
@@ -43,6 +43,7 @@ private final class CappedDownload: NSObject, URLSessionDownloadDelegate, @unche
     private let lock = NSLock()
     private var continuation: CheckedContinuation<Void, Error>?
     private var failure: Error?
+    private var completion: Result<Void, Error>?
 
     init(destination: URL, declaredSize: Int?) {
         self.destination = destination
@@ -50,9 +51,17 @@ private final class CappedDownload: NSObject, URLSessionDownloadDelegate, @unche
     }
 
     func run(_ task: URLSessionDownloadTask) async throws {
-        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-            lock.withLock { self.continuation = continuation }
-            task.resume()
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                let finished: Result<Void, Error>? = lock.withLock {
+                    if let completion { return completion }
+                    self.continuation = continuation
+                    return nil
+                }
+                if let finished { continuation.resume(with: finished) } else { task.resume() }
+            }
+        } onCancel: {
+            task.cancel()
         }
     }
 
@@ -94,16 +103,19 @@ private final class CappedDownload: NSObject, URLSessionDownloadDelegate, @unche
     }
 
     func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
-        let (continuation, failure) = lock.withLock { () -> (CheckedContinuation<Void, Error>?, Error?) in
+        let completed = lock.withLock { () -> (CheckedContinuation<Void, Error>?, Result<Void, Error>) in
+            let outcome: Result<Void, Error>
+            if let failure = failure ?? error {
+                outcome = .failure(failure)
+            } else if FileManager.default.fileExists(atPath: destination.path) {
+                outcome = .success(())
+            } else {
+                outcome = .failure(ServiceError(.unavailable, "download_failed", "\(destination.lastPathComponent): no data"))
+            }
+            completion = outcome
             defer { self.continuation = nil }
-            return (self.continuation, self.failure)
+            return (continuation, outcome)
         }
-        if let failure = failure ?? error {
-            continuation?.resume(throwing: failure)
-        } else if FileManager.default.fileExists(atPath: destination.path) {
-            continuation?.resume()
-        } else {
-            continuation?.resume(throwing: ServiceError(.unavailable, "download_failed", "\(destination.lastPathComponent): no data"))
-        }
+        completed.0?.resume(with: completed.1)
     }
 }

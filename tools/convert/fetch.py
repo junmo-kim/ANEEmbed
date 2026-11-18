@@ -1,7 +1,8 @@
 """Download the pinned public inputs listed in sources.json and check their sha256.
 
     python -I fetch.py models --dest DIR   DIR/embeddinggemma-2        google/embeddinggemma-2 snapshot (build, references)
-                                           DIR/embeddinggemma-2-coreml  FluidInference vision package (build)
+    python -I fetch.py models --model pplx-embed-v1-0.6b --dest DIR   DIR/pplx-embed-v1-0.6b
+    python -I fetch.py models --model qwen3-embedding-0.6b --dest DIR   DIR/Qwen3-Embedding-0.6B
     python -I fetch.py data --dest DIR     DIR/<file>                   evaluation texts and images (corpus.py, images.py)
 
 `models` uses huggingface_hub at the pinned revisions (no token needed). `data` downloads raw files from GitHub at
@@ -19,7 +20,8 @@ import sys
 import urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-USER_AGENT = "ANEEmbed-fetch/1 (https://github.com/junmo-kim/ANEEmbed)"
+USER_AGENT = "ANERun-fetch/1 (https://github.com/junmo-kim/ANERun)"
+OPTIONAL_MODELS = {"pplx-embed-v1-0.6b": "pplx", "qwen3-embedding-0.6b": "qwen"}
 
 
 def sha256(path):
@@ -37,14 +39,28 @@ def check(path, want):
     return ok
 
 
-def models(sources, dest):
-    from huggingface_hub import snapshot_download
+def load_sources():
+    with open(os.path.join(HERE, "sources.json"), encoding="utf-8") as source:
+        return json.load(source)
+
+
+def models(sources, dest, model="embeddinggemma-2"):
+    from huggingface_hub import hf_hub_download
     ok = True
-    for m in sources["models"]:
+    if model == "embeddinggemma-2":
+        entries = sources["models"]
+    else:
+        entries = [sources[OPTIONAL_MODELS[model]]]
+    for m in entries:
         target = os.path.join(dest, m["dir"])
-        snapshot_download(repo_id=m["id"], revision=m["revision"], local_dir=target, allow_patterns=m["allow_patterns"])
         for rel, want in m["sha256"].items():
-            ok &= check(os.path.join(target, rel), want)
+            path = os.path.join(target, rel)
+            if not os.path.isfile(path) or sha256(path) != want:
+                hf_hub_download(m["id"], rel, revision=m["revision"], local_dir=target,
+                                force_download=os.path.isfile(path))
+                ok &= check(path, want)
+            else:
+                print(f"ok  {path}", flush=True)
     return ok
 
 
@@ -82,9 +98,12 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("what", choices=("models", "data"))
     ap.add_argument("--dest", required=True)
+    ap.add_argument("--model", choices=("embeddinggemma-2", *OPTIONAL_MODELS))
     a = ap.parse_args()
-    sources = json.load(open(os.path.join(HERE, "sources.json"), encoding="utf-8"))
-    ok = (models if a.what == "models" else data)(sources, a.dest)
+    if a.what == "data" and a.model is not None:
+        ap.error("--model applies to models")
+    sources = load_sources()
+    ok = models(sources, a.dest, a.model or "embeddinggemma-2") if a.what == "models" else data(sources, a.dest)
     print("FETCH OK" if ok else "FETCH FAILED", flush=True)
     sys.exit(0 if ok else 1)
 

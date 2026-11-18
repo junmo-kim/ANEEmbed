@@ -5,6 +5,31 @@ import Testing
 
 @Suite("Vectors")
 struct VectorTests {
+    @Test func pplxQuantizesWithTiesToEvenAndKeepsThePrefix() {
+        // These are Float32 inputs for which tanh(x) * 127 lands on exact half-integers.
+        let firstTie = atanh(Float(2.5) / 127)
+        let secondTie = atanh(Float(3.5) / 127)
+        let vector: [Float] = [firstTie, secondTie, -firstTie, -secondTie, 100, -100, 0]
+        let full = Vectors.output(vector, to: 7, modelID: .pplx)
+        #expect(full == [2, 4, -2, -4, 127, -127, 0])
+        #expect(Vectors.output(vector, to: 3, modelID: .pplx) == Array(full.prefix(3)))
+        #expect(Vectors.output([3, 4, 5], to: 2, modelID: .embeddingGemma2) == [0.6, 0.8])
+    }
+
+    @Test func pplxSerializesAQuantizedZeroAsPositiveFloat32Zero() {
+        let output = Vectors.output([-0.001], to: 1, modelID: .pplx)
+        #expect(Vectors.base64(output) == "AAAAAA==")
+    }
+
+    @Test func pplxMatchesThePinnedTorchBoundaryWhereDarwinTanhDiffers() {
+        let below = Float(bitPattern: 0x3dea_d9ce)
+        let boundary = Float(bitPattern: 0x3dea_d9cf)
+        let expected: [Float] = [14, 15, -14, -15]
+        let output = Vectors.output([below, boundary, -below, -boundary], to: 4, modelID: .pplx)
+        #expect(output == expected)
+        #expect(Vectors.decodeBase64(Vectors.base64(output)) == expected)
+    }
+
     @Test func truncationIsTheRenormalizedPrefix() {
         let vector = Vectors.l2Normalized((0..<768).map { Float(($0 * 37) % 101) - 50 })
         for dimensions in Vectors.dimensions {

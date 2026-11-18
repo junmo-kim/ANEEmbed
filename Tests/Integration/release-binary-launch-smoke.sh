@@ -5,11 +5,12 @@ set -euo pipefail
 # doctor output, structured errors and exit codes, stdio MCP, and the HTTP listener lifecycle.
 # Uses the fake runtime, so it needs neither a model nor a Neural Engine (CI runners have neither).
 #
-# Usage: Tests/Integration/release-binary-launch-smoke.sh [path-to-aneembed]
+# Usage: Tests/Integration/release-binary-launch-smoke.sh [path-to-binary]
 
-binary=${1:-.build/release/aneembed}
+binary=${1:-.build/release/anerun}
 binary=$(cd "$(dirname "$binary")" && pwd)/$(basename "$binary")
-tmpdir=$(mktemp -d "${TMPDIR:-/tmp}/aneembed-smoke.XXXXXX")
+temp_root=${TMPDIR:-/tmp}
+tmpdir=$(mktemp -d "${temp_root%/}/anerun-smoke.XXXXXX")
 pid=""
 cleanup() {
   if [ -n "$pid" ]; then kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true; fi
@@ -17,11 +18,129 @@ cleanup() {
 }
 trap cleanup EXIT
 fail() { echo "smoke test failed: $*" >&2; exit 1; }
-export ANEEMBED_RUNTIME=fake ANEEMBED_DATA_DIR="$tmpdir/data"
+unset ANERUN_MODEL ANERUN_MODEL_DIR ANEEMBED_MODEL ANEEMBED_MODEL_DIR
+unset ANERUN_RUNTIME ANERUN_DATA_DIR ANEEMBED_RUNTIME ANEEMBED_DATA_DIR
+data_dir="$tmpdir/data"
+export ANERUN_RUNTIME=fake ANERUN_DATA_DIR="$data_dir"
 
 version=$("$binary" --version)
-[[ "$version" =~ ^aneembed\ [0-9]+\.[0-9]+\.[0-9]+$ ]] || fail "unexpected version output: $version"
-"$binary" --help >/dev/null
+[[ "$version" =~ ^anerun\ [0-9]+\.[0-9]+\.[0-9]+$ ]] || fail "unexpected version output: $version"
+"$binary" --help > "$tmpdir/help"
+grep -q "^anerun " "$tmpdir/help" || fail "unexpected help heading"
+grep -q "models install --model ID" "$tmpdir/help" || fail "install model selector missing from help"
+for invocation in "embed x" "serve" "mcp" "similarity a b" "tokenize x" "bench" "models path" "models verify" "models warm" "models install" "doctor --verify"; do
+  read -r -a command <<< "$invocation"
+  set +e
+  if [[ "${command[0]}" == serve ]]; then
+    # A selection regression can start listening. Isolate its port and bound the check.
+    python3 - "$binary" "$tmpdir/missing.out" "$tmpdir/missing.err" <<'PYSERVE'
+import socket, subprocess, sys
+with socket.socket() as sock:
+    sock.bind(("127.0.0.1", 0))
+    port = str(sock.getsockname()[1])
+with open(sys.argv[2], "wb") as out, open(sys.argv[3], "wb") as err:
+    try:
+        result = subprocess.run([sys.argv[1], "serve", "--port", port, "--format", "json"],
+                                stdout=out, stderr=err, timeout=5)
+    except subprocess.TimeoutExpired:
+        sys.exit(124)
+sys.exit(result.returncode)
+PYSERVE
+    code=$?
+  elif [[ "${command[0]}" == mcp ]]; then
+    "$binary" mcp </dev/null >"$tmpdir/missing.out" 2>"$tmpdir/missing.err"; code=$?
+  else
+    "$binary" "${command[@]}" --format json </dev/null >"$tmpdir/missing.out" 2>"$tmpdir/missing.err"; code=$?
+  fi
+  set -e
+  [ "$code" -eq 64 ] && [ ! -s "$tmpdir/missing.out" ] || fail "$invocation without a model: exit $code"
+  if [[ "${command[0]}" == mcp ]]; then
+    grep -q 'bad_request' "$tmpdir/missing.err" && grep -q 'missing_model' "$tmpdir/missing.err" &&
+      grep -q 'pplx-embed-v1-0.6b' "$tmpdir/missing.err" || fail "mcp missing model YAML"
+    continue
+  fi
+  python3 - "$tmpdir/missing.err" <<'PYERR'
+import json, sys
+error = json.load(open(sys.argv[1]))
+assert error["error"] == "bad_request" and error["reason"] == "missing_model", error
+assert "embeddinggemma-2" in error["detail"] and "pplx-embed-v1-0.6b" in error["detail"], error
+assert "--model" in error["hint"], error
+PYERR
+done
+
+"$binary" serve --print-config --format json >"$tmpdir/config.json"
+python3 - "$tmpdir/config.json" <<'PYCONFIG'
+import json, sys
+config = json.load(open(sys.argv[1]))
+for name in ["model", "model-dir", "model-name"]:
+    assert config[name]["value"] == "", config[name]
+PYCONFIG
+"$binary" models install --runtime coreml --print-config --format json >"$tmpdir/config.json"
+python3 - "$tmpdir/config.json" <<'PYCONFIG'
+import json, sys
+config = json.load(open(sys.argv[1]))
+assert config["model"]["value"] == "", config["model"]
+PYCONFIG
+"$binary" models install --model embeddinggemma-2 --runtime coreml --print-config --format json >"$tmpdir/config.json"
+python3 - "$tmpdir/config.json" <<'PYCONFIG'
+import json, sys
+config = json.load(open(sys.argv[1]))
+assert config["model"]["value"] == "embeddinggemma-2", config["model"]
+assert config["model-name"]["value"] == "embeddinggemma-2", config["model-name"]
+assert config["model-dir"]["value"] == "", config["model-dir"]
+PYCONFIG
+code=0
+"$binary" models install --model-dir "$tmpdir/absent-package" --runtime coreml --print-config --format json \
+  >"$tmpdir/config.json" 2>"$tmpdir/config.err" || code=$?
+[ "$code" -eq 64 ] && [ ! -s "$tmpdir/config.json" ] && grep -q 'missing_model' "$tmpdir/config.err" ||
+  fail "print-config install with a directory selector: exit $code"
+[ ! -e "$data_dir" ] || fail "printing install configuration created the data directory"
+for bad in unknown_model conflicting_options; do
+  case "$bad" in
+    unknown_model) flags=(--model unknown);;
+    conflicting_options) flags=(--model embeddinggemma-2 --model-dir "$tmpdir/other");;
+  esac
+  set +e
+  "$binary" serve --print-config "${flags[@]}" --format json >"$tmpdir/config.json" 2>"$tmpdir/config.err"
+  code=$?
+  set -e
+  [ "$code" -eq 64 ] && [ ! -s "$tmpdir/config.json" ] && grep -q "$bad" "$tmpdir/config.err" ||
+    fail "print-config $bad: exit $code"
+done
+export ANERUN_MODEL=embeddinggemma-2
+
+"$binary" serve --print-config --format json >"$tmpdir/config.json"
+python3 - "$tmpdir/config.json" <<'PYCONFIG'
+import json, sys
+config = json.load(open(sys.argv[1]))
+assert config["model-name"]["value"] == "embeddinggemma-2", config["model-name"]
+assert config["model-dir"]["value"] == "", config["model-dir"]
+PYCONFIG
+
+legacy="$data_dir/models/legacy-revision"
+mkdir -p "$legacy"
+printf '%s\n' '{"name":"embeddinggemma-2-ane","files":[]}' >"$legacy/manifest.json"
+printf '%s\n' legacy-revision >"$data_dir/models/current"
+model_path=$("$binary" models path --runtime coreml)
+[[ "$model_path" == */models/legacy-revision ]] || fail "unexpected legacy model path: $model_path"
+
+package="$data_dir/models/embeddinggemma-2/selection-fixture"
+mkdir -p "$package"
+printf '%s\n' '{"name":"embeddinggemma-2-ane","files":[]}' >"$package/manifest.json"
+printf '%s\n' selection-fixture >"$(dirname "$package")/current"
+"$binary" serve --runtime coreml --print-config --format json >"$tmpdir/config.json"
+python3 - "$tmpdir/config.json" <<'PYCONFIG'
+import json, sys
+config = json.load(open(sys.argv[1]))
+assert config["model-name"]["value"] == "embeddinggemma-2", config["model-name"]
+assert config["model-dir"]["value"].endswith("/models/embeddinggemma-2/selection-fixture"), config["model-dir"]
+PYCONFIG
+
+code=0
+"$binary" bench --model pplx-embed-v1-0.6b --image "$tmpdir/absent.jpg" --format json \
+  >"$tmpdir/bench.out" 2>"$tmpdir/bench.err" || code=$?
+[ "$code" -eq 65 ] && [ ! -s "$tmpdir/bench.out" ] && grep -q 'images_unsupported' "$tmpdir/bench.err" ||
+  fail "pplx benchmark with an image: exit $code"
 
 "$binary" doctor --format json >"$tmpdir/doctor.json" 2>"$tmpdir/doctor.err" || fail "doctor exited nonzero"
 python3 - "$tmpdir/doctor.json" <<'PY' || fail "doctor output failed validation"
@@ -49,16 +168,16 @@ set +e
 set -e
 [ "$code" -eq 65 ] && grep -q 'context_length_exceeded' "$tmpdir/err" || fail "over-long text: exit $code"
 
-# models install never runs on the fake runtime, and a revision must be one plain name (checked before any network use).
+# models install never runs on the fake runtime, and an override must pin a full commit (checked before any network use).
 set +e
 "$binary" models install >/dev/null 2>"$tmpdir/err"; code=$?
 set -e
 [ "$code" -eq 64 ] && grep -q 'fake_runtime' "$tmpdir/err" || fail "models install with the fake runtime: exit $code"
 for revision in .. ../x a/b; do
   set +e
-  "$binary" models install --runtime coreml --revision "$revision" >/dev/null 2>"$tmpdir/err"; code=$?
+  "$binary" models install --runtime coreml --repo junmo-k/embeddinggemma-2-ane --revision "$revision" >/dev/null 2>"$tmpdir/err"; code=$?
   set -e
-  [ "$code" -eq 64 ] && grep -q 'invalid_revision' "$tmpdir/err" || fail "models install --revision $revision: exit $code"
+  [ "$code" -eq 64 ] && grep -q 'invalid_model_source' "$tmpdir/err" || fail "models install --revision $revision: exit $code"
 done
 
 printf '%s\n' \
@@ -135,4 +254,29 @@ assert reply.startswith(b"HTTP/1.1 200"), reply[:120]
 print("PASS connection limit: 503 beyond --max-connections, served again after one closed")
 PY
 kill "$pid"; wait "$pid" 2>/dev/null || true; pid=""
+# The second model has its own vector, image and tokenizer contract under the same transport.
+"$binary" serve --model pplx-embed-v1-0.6b --max-tokens 32768 --port "$port" 2>"$tmpdir/pplx.err" &
+pid=$!
+for _ in $(seq 1 100); do
+  curl -sf "http://127.0.0.1:$port/health" >/dev/null 2>&1 && break
+  sleep 0.1
+done
+curl -sf "http://127.0.0.1:$port/health" | grep -q '"ok"' || { cat "$tmpdir/pplx.err" >&2; fail "pplx serve did not become healthy"; }
+python3 "$(dirname "${BASH_SOURCE[0]}")/serve-contract.py" "http://127.0.0.1:$port" --model pplx-embed-v1-0.6b ||
+  fail "pplx serve contract"
+kill "$pid"; wait "$pid" 2>/dev/null || true; pid=""
+printf '%s\n' '{"text":"stdin example","id":"one"}' |
+  "$binary" embed --model pplx-embed-v1-0.6b --stdin --dimensions 17 --encoding base64 >"$tmpdir/pplx.jsonl"
+python3 - "$tmpdir/pplx.jsonl" <<'PYTEST'
+import base64, json, struct, sys
+data = json.load(open(sys.argv[1]))
+values = struct.unpack("<17f", base64.b64decode(data["embedding"]))
+assert data["id"] == "one" and data["tokens"] == len("stdin example".encode())
+assert all(v == round(v) and -128 <= v <= 127 for v in values), values
+PYTEST
+set +e
+"$binary" embed --model pplx-embed-v1-0.6b --image "$tmpdir/does-not-exist" >"$tmpdir/pplx.out" 2>"$tmpdir/err"; code=$?
+set -e
+[ "$code" -eq 65 ] && grep -q 'images_unsupported' "$tmpdir/err" || fail "pplx image rejection before file read: exit $code"
+
 echo "release binary smoke test passed"

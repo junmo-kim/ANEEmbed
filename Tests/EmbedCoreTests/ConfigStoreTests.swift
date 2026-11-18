@@ -13,18 +13,22 @@ struct ConfigTests {
         let env = try Config(environment: ["ANEEMBED_PORT": "9000", "ANEEMBED_MAX_TOKENS": "8192"])
         #expect(env.port == 9000 && env.maxTokens == 8192 && env.sources["port"] == .environment)
 
-        let flag = try Config(flags: ["port": "9001"], environment: ["ANEEMBED_PORT": "9000"])
+        let both = ["ANERUN_PORT": "9002", "ANEEMBED_PORT": "9000", "ANERUN_MAX_TOKENS": "", "ANEEMBED_MAX_TOKENS": "8192"]
+        let branded = try Config(environment: both)
+        #expect(branded.port == 9002 && branded.maxTokens == 8192 && branded.sources["port"] == .environment)
+
+        let flag = try Config(flags: ["port": "9001"], environment: both)
         #expect(flag.port == 9001 && flag.sources["port"] == .flag)
     }
 
     @Test func everyOptionHasTheSameNameAsFlagAndEnvironmentVariable() {
         for option in Config.options {
-            #expect(option.environmentName == "ANEEMBED_" + option.name.uppercased().replacingOccurrences(of: "-", with: "_"))
+            #expect(option.environmentName == "ANERUN_" + option.name.uppercased().replacingOccurrences(of: "-", with: "_"))
         }
     }
 
     @Test func rejectsInvalidValues() {
-        #expect(throws: ServiceError.self) { try Config(flags: ["max-tokens": "9000"], environment: [:]) }
+        #expect(throws: ServiceError.self) { try Config(flags: ["max-tokens": "32769"], environment: [:]) }
         #expect(throws: ServiceError.self) { try Config(flags: ["port": "x"], environment: [:]) }
         #expect(throws: ServiceError.self) { try Config(flags: ["nope": "1"], environment: [:]) }
         #expect(throws: ServiceError.self) { try Config(environment: ["ANEEMBED_RUNTIME": "gpu"]) }
@@ -42,8 +46,78 @@ struct ConfigTests {
         let explicit = try Config(flags: ["model-dir": "/opt/m"], environment: [:])
         #expect(explicit.modelDirectory.path == "/opt/m")
         #expect(config.printable["port"]?["source"] == "default")
-        #expect(config.printable["data-dir"]?["env"] == "ANEEMBED_DATA_DIR")
+        #expect(config.printable["data-dir"]?["env"] == "ANERUN_DATA_DIR")
     }
+
+    @Test func defaultStoreStillUsesTheLegacyPath() throws {
+        let config = try Config(environment: [:])
+        let expected = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Application Support/ANEEmbed", isDirectory: true)
+        #expect(config.dataDirectory.path == expected.path)
+    }
+
+    @Test func modelSelectionResolvesPrecedenceAndCaps() throws {
+        let dataDirectory = FileManager.default.temporaryDirectory.appendingPathComponent("aneembed-selection-\(UUID().uuidString)")
+        let candidate = try Config(
+            flags: ["model": "pplx-embed-v1-0.6b", "runtime": "fake", "max-tokens": "32768", "data-dir": dataDirectory.path],
+            environment: ["ANEEMBED_MODEL": "embeddinggemma-2"])
+        let selected = try candidate.selectingModel(for: "serve")
+        #expect(selected.modelID == .pplx)
+        #expect(selected.modelName == "pplx-embed-v1-0.6b")
+        #expect(selected.sources["model"] == .flag)
+        #expect(selected.maxTokens == 32768)
+        #expect(selected.modelDirectory == ModelStore(dataDirectory: dataDirectory, model: .pplx).modelsDirectory)
+        #expect(try selected.selectingModel(for: "load") == selected)
+
+        let install = try Config(
+            flags: ["model-name": "demo", "data-dir": dataDirectory.path],
+            environment: ["ANEEMBED_MODEL": "pplx-embed-v1-0.6b", "ANEEMBED_MAX_TOKENS": "1"])
+        let target = try install.selectingModel(for: "models install", requiresName: true)
+        #expect(target.modelID == .pplx && target.modelName == "demo")
+        let installed = target.withModelDirectory(URL(fileURLWithPath: "/tmp/aneembed-test/revision"))
+        #expect(installed.modelID == .pplx)
+        #expect(try installed.selectingModel(for: "models warm") == installed)
+        #expect(!FileManager.default.fileExists(atPath: dataDirectory.path))
+
+        for cap in ["1", "8193"] {
+            let eg2 = try Config(flags: ["model": "embeddinggemma-2", "max-tokens": cap, "runtime": "fake"], environment: [:])
+            let error = #expect(throws: ServiceError.self) { try eg2.selectingModel(for: "embed") }
+            #expect(error?.reason == "invalid_option" && error?.param == "max-tokens")
+        }
+    }
+
+    @Test func missingUnknownAndConflictingSelectionsAreStructuredErrors() throws {
+        let unselected = try Config(flags: ["runtime": "fake"], environment: [:])
+        let missing = #expect(throws: ServiceError.self) { try unselected.selectingModel(for: "serve") }
+        #expect(missing?.exitCode == .usage && missing?.reason == "missing_model")
+        #expect(missing?.message.contains("serve") == true && missing?.message.contains(ModelID.catalog) == true)
+        let printed = try unselected.selectingModel(for: "--print-config", required: false)
+        #expect(printed.modelID == nil && printed.printable["model-dir"]?["value"] == "")
+
+        let unknown = try Config(environment: ["ANEEMBED_MODEL": "other"])
+        let invalid = #expect(throws: ServiceError.self) { try unknown.selectingModel(for: "embed") }
+        #expect(invalid?.reason == "unknown_model" && invalid?.message.contains("other") == true)
+        let conflict = try Config(flags: ["model": "embeddinggemma-2"], environment: ["ANEEMBED_MODEL_DIR": "/tmp/package"])
+        let conflicting = #expect(throws: ServiceError.self) { try conflict.selectingModel(for: "serve") }
+        #expect(conflicting?.reason == "conflicting_options" && conflicting?.exitCode == .usage)
+
+        let pathOnly = try Config(flags: ["model-dir": "/tmp/package"], environment: [:])
+        let requiresName = #expect(throws: ServiceError.self) {
+            try pathOnly.selectingModel(for: "models install", requiresName: true)
+        }
+        #expect(requiresName?.reason == "missing_model")
+    }
+
+    @Test func explicitDirectoryInfersTheLegacyPackageID() throws {
+        let directory = try DoctorTests.modelDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let config = try Config(flags: ["model-dir": directory.path], environment: ["ANEEMBED_MODEL_DIR": "/tmp/other"])
+        let selected = try config.selectingModel(for: "models verify")
+        #expect(selected.modelID == .embeddingGemma2 && selected.modelName == "embeddinggemma-2")
+        #expect(selected.modelDirectory.path == directory.resolvingSymlinksInPath().path)
+        #expect(selected.pinnedManifestSHA256 == nil)
+    }
+
 }
 
 @Suite("Model store")
@@ -52,6 +126,90 @@ struct ModelStoreTests {
         let url = FileManager.default.temporaryDirectory.appendingPathComponent("aneembed-store-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
         return url
+    }
+
+    @Test func namedStoresKeepIndependentPointersAndSnapshotTheResolvedRevision() throws {
+        let directory = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let legacy = ModelStore(dataDirectory: directory)
+        let eg2 = ModelStore(dataDirectory: directory, model: .embeddingGemma2)
+        let pplx = ModelStore(dataDirectory: directory, model: .pplx)
+        let package = try DoctorTests.modelDirectory()
+        let legacyPath = try legacy.directory(for: "legacy")
+        try legacy.activate(revision: "legacy")
+        try FileManager.default.moveItem(at: package, to: legacyPath)
+        #expect(try eg2.resolveDirectory().path == legacyPath.path)
+        #expect(!eg2.isActive(legacyPath))
+        let missing = #expect(throws: ServiceError.self) { try pplx.resolveDirectory() }
+        #expect(missing?.reason == "model_missing")
+
+        let raw = try Config(flags: ["data-dir": directory.path, "model": "embeddinggemma-2"], environment: [:])
+        let selected = try raw.selectingModel(for: "serve")
+        let eg2Path = try eg2.directory(for: "v2")
+        let pplxPath = try pplx.directory(for: "v2")
+        for path in [eg2Path, pplxPath] {
+            try FileManager.default.createDirectory(at: path.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try FileManager.default.copyItem(at: legacyPath, to: path)
+        }
+        try eg2.activate(revision: "v2")
+        try pplx.activate(revision: "v2")
+        #expect(try eg2.resolveDirectory().path == eg2Path.path)
+        #expect(try pplx.resolveDirectory().path == pplxPath.path)
+        #expect(eg2.isActive(eg2Path) && pplx.isActive(pplxPath) && !pplx.isActive(eg2Path))
+        #expect(legacy.currentDirectory.path == legacyPath.path)
+        #expect(selected.modelDirectory.path == legacyPath.resolvingSymlinksInPath().path)
+        #expect(try raw.selectingModel(for: "serve").modelDirectory.path == eg2Path.resolvingSymlinksInPath().path)
+
+        let wrongModel = try Config(flags: ["data-dir": directory.path, "model": "pplx-embed-v1-0.6b"], environment: [:])
+        let mismatch = #expect(throws: ServiceError.self) { try wrongModel.selectingModel(for: "serve") }
+        #expect(mismatch?.reason == "model_mismatch" && mismatch?.exitCode == .dataError)
+        #expect(mismatch?.message.contains(pplxPath.resolvingSymlinksInPath().path) == true)
+
+        try "absent\n".write(to: eg2.currentPointer, atomically: true, encoding: .utf8)
+        let broken = #expect(throws: ServiceError.self) { try eg2.resolveDirectory() }
+        #expect(broken?.reason == "model_missing")
+        try "../legacy\n".write(to: eg2.currentPointer, atomically: true, encoding: .utf8)
+        #expect(throws: ServiceError.self) { try eg2.resolveDirectory() }
+    }
+
+    @Test func namedStoreRejectsSymlinksAtTheNamespacePointerAndRevision() throws {
+        let directory = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = ModelStore(dataDirectory: directory, model: .embeddingGemma2)
+        let models = store.modelsDirectory.deletingLastPathComponent()
+        let external = directory.appendingPathComponent("elsewhere")
+        try FileManager.default.createDirectory(at: external, withIntermediateDirectories: true)
+        try FileManager.default.createSymbolicLink(at: models, withDestinationURL: external)
+        #expect(throws: ServiceError.self) { try store.checkNamespace() }
+        #expect(throws: ServiceError.self) { try store.directory(for: "v1") }
+
+        try FileManager.default.removeItem(at: models)
+        try FileManager.default.createDirectory(at: models, withIntermediateDirectories: true)
+        try FileManager.default.createSymbolicLink(at: store.modelsDirectory, withDestinationURL: external)
+        #expect(throws: ServiceError.self) { try store.checkNamespace() }
+
+        try FileManager.default.removeItem(at: store.modelsDirectory)
+        try Data().write(to: store.modelsDirectory)
+        #expect(throws: ServiceError.self) { try store.checkNamespace() }
+        try FileManager.default.removeItem(at: store.modelsDirectory)
+        try FileManager.default.createDirectory(at: store.modelsDirectory, withIntermediateDirectories: true)
+        try FileManager.default.createSymbolicLink(at: store.currentPointer, withDestinationURL: external.appendingPathComponent("absent"))
+        #expect(throws: ServiceError.self) { try store.resolveDirectory() }
+        try FileManager.default.removeItem(at: store.currentPointer)
+
+        let revision = store.modelsDirectory.appendingPathComponent("v1")
+        try FileManager.default.createSymbolicLink(at: revision, withDestinationURL: external)
+        try "v1\n".write(to: store.currentPointer, atomically: true, encoding: .utf8)
+        #expect(throws: ServiceError.self) { try store.directory(for: "v1") }
+        #expect(throws: ServiceError.self) { try store.resolveDirectory() }
+        #expect(!store.isActive(revision))
+    }
+
+    @Test func duplicateManifestPathsAreRejected() {
+        let entry: JSONValue = ["path": "tokenizer.json", "size": 1, "sha256": .string(String(repeating: "a", count: 64))]
+        let manifest: JSONValue = ["files": .array([entry, entry])]
+        let error = #expect(throws: ServiceError.self) { try Manifest.parse(manifest.jsonData()) }
+        #expect(error?.reason == "invalid_manifest")
     }
 
     @Test func verifiesFilesAgainstTheManifest() throws {
@@ -277,7 +435,7 @@ struct ModelStoreTests {
         #expect(throws: ServiceError.self) { try InstallLock.acquire(in: store, wait: false) }
         first.release()
         let second = try InstallLock.acquire(in: store, wait: false)
-        second.release()
+        defer { second.release() }
 
         let target = try store.directory(for: "r1")
         let staging = ModelInstaller.stagingDirectory(for: target)
@@ -289,9 +447,11 @@ struct ModelStoreTests {
         let payload = Data("new".utf8)
         try FileManager.default.createDirectory(at: staging, withIntermediateDirectories: true)
         try payload.write(to: staging.appendingPathComponent("a.bin"))
-        let manifest = try Manifest.parse(JSONValue.object(["files": [
+        let descriptor = JSONValue.object(["files": [
             ["path": "a.bin", "size": .int(payload.count), "sha256": .string(SHA256Hasher.hex(payload))],
-        ]]).jsonData())
+        ]]).jsonData()
+        try descriptor.write(to: staging.appendingPathComponent(ModelLayout.manifest))
+        let manifest = try Manifest.parse(descriptor)
         try ModelInstaller.finish(staging: staging, into: target, store: store, manifest: manifest, log: { _ in })
         #expect(try Data(contentsOf: target.appendingPathComponent("a.bin")) == payload)
         #expect(!FileManager.default.fileExists(atPath: staging.path))
@@ -378,6 +538,31 @@ struct ModelStoreTests {
         try Data("w".utf8).write(to: compiled.appendingPathComponent("weights/weight.bin"))
         status = manifest.compiledStatus(in: directory)
         #expect(!status[0].problem && status[0].status.hasPrefix("compiled"))
+    }
+
+    @Test(arguments: [false, true])
+    func completeCacheReclaimsAbandonedStagingWithoutCompiling(symlink: Bool) async throws {
+        let directory = try temporaryDirectory()
+        let files = FileManager.default
+        defer { try? files.removeItem(at: directory) }
+        let compiled = directory.appendingPathComponent("Fixture.mlmodelc")
+        try files.createDirectory(at: compiled.appendingPathComponent("weights"), withIntermediateDirectories: true)
+        for path in Manifest.compiledCoreFiles {
+            try Data([1]).write(to: compiled.appendingPathComponent(path))
+        }
+        let lock = directory.appendingPathComponent(".Fixture" + ModelLayout.compileLockSuffix)
+        #expect(try await compiledModelURL(compiled).path == compiled.path)
+        #expect(!files.fileExists(atPath: lock.path))
+
+        let stage = directory.appendingPathComponent(".Fixture" + ModelLayout.compileStageSuffix)
+        if symlink {
+            try files.createSymbolicLink(at: stage, withDestinationURL: compiled)
+        } else {
+            try files.createDirectory(at: stage, withIntermediateDirectories: false)
+        }
+        #expect(try await compiledModelURL(compiled).path == compiled.path)
+        #expect(!files.fileExists(atPath: stage.path))
+        #expect(try Data(contentsOf: compiled.appendingPathComponent("weights/weight.bin")) == Data([1]))
     }
 
     @Test func readsThePackageManifest() throws {
@@ -469,12 +654,44 @@ struct ModelStoreTests {
         #expect(!operatingSystemBuild.isEmpty)
     }
 
+    @Test func warmCapabilityDemotesOnFailureAndPreservesHealthyBroaderCoverage() throws {
+        let directory = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let passed = SelfTestResult(function: "short", kind: "test", passed: true, cosine: 1)
+        let failed = SelfTestResult(function: "wide", kind: "test", passed: false, cosine: 0)
+        func record(_ effective: Int, requested: Int, functions: [String], results: [SelfTestResult]? = nil) throws {
+            let report = results.map {
+                SelfTestReport(osBuild: "macOS", ranAt: Date(), seconds: 0, results: $0, binary: "binary")
+            }
+            let warm = WarmState(osBuild: "macOS", binaryVersion: "test", binary: "binary", manifestSHA256: "manifest",
+                                 maxTokens: effective, functions: functions, warmedAt: Date(), seconds: 1, selfTest: report)
+            try warm.recordCapability(requestedMaxTokens: requested, in: directory)
+        }
+        try record(32768, requested: 32768, functions: ["short", "wide"])
+        try record(2048, requested: 2048, functions: ["short"], results: [passed])
+        #expect(WarmState.load(from: directory)?.maxTokens == 32768)
+        #expect(WarmState.load(from: directory)?.selfTest?.results == [passed])
+        try record(2048, requested: 32768, functions: ["short"], results: [passed, failed])
+        try record(2048, requested: 2048, functions: ["short"], results: [passed])
+        let snapshot = try #require(WarmState.load(from: directory))
+        #expect(snapshot.functions == ["short"] && snapshot.maxTokens == 2048)
+        #expect(snapshot.selfTest?.results == [passed, failed])
+        #expect(SelfTestReport.load(from: directory) == nil)
+        try record(0, requested: 32768, functions: [])
+        #expect(WarmState.load(from: directory)?.maxTokens == 0)
+        #expect(WarmState.load(from: directory)?.functions == [])
+        #expect(WarmState.load(from: directory)?.selfTest == nil)
+        try record(2048, requested: 2048, functions: ["short"])
+        #expect(WarmState.load(from: directory)?.maxTokens == 2048)
+    }
+
     /// The data directory's pinned revision loads only with the manifest pinned in this build; another installed
     /// revision and --model-dir are checked against their own manifest.
     @Test func thePinnedRevisionLoadsOnlyWithThePinnedManifest() throws {
         let (dataDirectory, revision) = try DoctorTests.replacedPinnedRevision()
         defer { try? FileManager.default.removeItem(at: dataDirectory) }
-        let config = try Config(flags: ["data-dir": dataDirectory.path], environment: [:])
+        let raw = try Config(flags: ["data-dir": dataDirectory.path, "model": "embeddinggemma-2"], environment: [:])
+        let config = try raw.selectingModel(for: "serve")
         #expect(config.pinnedManifestSHA256 == ModelSource.pinned.manifestSHA256)
         let error = #expect(throws: ServiceError.self) { try ModelLoader.checkPackage(config) }
         #expect(error?.reason == "pinned_manifest_mismatch" && error?.hint?.contains("aneembed models install") == true)
@@ -485,8 +702,19 @@ struct ModelStoreTests {
         let store = ModelStore(dataDirectory: dataDirectory)
         try FileManager.default.moveItem(at: revision, to: store.modelsDirectory.appendingPathComponent("local-0123456789ab"))
         try store.activate(revision: "local-0123456789ab")
-        #expect(config.pinnedManifestSHA256 == nil)
-        #expect(throws: Never.self) { try ModelLoader.checkPackage(config) }
+        #expect(config.pinnedManifestSHA256 == ModelSource.pinned.manifestSHA256)
+        let selected = try raw.selectingModel(for: "serve")
+        #expect(selected.pinnedManifestSHA256 == nil)
+        #expect(throws: Never.self) { try ModelLoader.checkPackage(selected) }
+
+        let named = ModelStore(dataDirectory: dataDirectory, model: .embeddingGemma2)
+        let restored = try named.directory(for: ModelSource.pinned.revision + "-r-0123abcd")
+        try FileManager.default.createDirectory(at: named.modelsDirectory, withIntermediateDirectories: true)
+        try FileManager.default.copyItem(at: selected.modelDirectory, to: restored)
+        try named.activate(revision: restored.lastPathComponent)
+        let repaired = try raw.selectingModel(for: "serve")
+        #expect(repaired.pinnedManifestSHA256 == ModelSource.pinned.manifestSHA256)
+        #expect(repaired.withModelDirectory(restored).pinnedManifestSHA256 == ModelSource.pinned.manifestSHA256)
     }
 
     @Test func pinnedSourceIsAPublishedCommit() throws {

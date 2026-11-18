@@ -91,6 +91,59 @@ public enum Tools {
         ],
     ]
 
+    private static let pplxDefinitions = textOnlyDefinitions(for: .pplx)
+    private static let qwenDefinitions = textOnlyDefinitions(for: .qwen3Embedding)
+
+    private static func textOnlyDefinitions(for modelID: ModelID) -> [JSONValue] {
+        let range = modelID == .pplx ? Vectors.pplxDimensionRange : Vectors.qwenDimensionRange
+        return definitions.compactMap { definition in
+            guard var tool = definition.objectValue, let name = tool["name"]?.stringValue, name != "embed_image",
+                  var schema = tool["inputSchema"]?.objectValue, var properties = schema["properties"]?.objectValue
+            else { return nil }
+            properties["dimensions"] = [
+                "type": "integer", "minimum": .int(range.lowerBound), "maximum": .int(range.upperBound),
+                "description": .string("Number of prefix values to return. Default \(range.upperBound)."),
+            ]
+            let prompt: JSONValue = [
+                "type": "string", "enum": ["query", "document"],
+                "description": modelID == .pplx ? "Optional compatibility field. The text is embedded as given."
+                    : "Query adds Qwen3’s retrieval instruction. Document and omitted types use the original text.",
+            ]
+            if name == "embed_text" {
+                properties["input_type"] = prompt
+                tool["description"] = modelID == .pplx ? "Embed one text or a batch as quantized pplx-embed-v1-0.6b vectors."
+                    : "Embed one text or a batch as normalized Qwen3 vectors."
+            } else {
+                for side in ["a", "b"] {
+                    properties["\(side)_image"] = nil
+                    properties["\(side)_path"] = nil
+                    properties["\(side)_input_type"] = prompt
+                }
+                tool["description"] = "Cosine similarity of two text embeddings."
+            }
+            schema["properties"] = .object(properties)
+            tool["inputSchema"] = .object(schema)
+            return .object(tool)
+        }
+    }
+
+    public static func definitions(for modelID: ModelID, maxContextLength: Int? = nil) -> [JSONValue] {
+        let catalog: [JSONValue]
+        switch modelID {
+        case .embeddingGemma2: catalog = definitions
+        case .pplx: catalog = pplxDefinitions
+        case .qwen3Embedding: catalog = qwenDefinitions
+        }
+        guard let maxContextLength else { return catalog }
+        return catalog.map { definition in
+            guard var tool = definition.objectValue, tool["name"]?.stringValue != "embed_image" else { return definition }
+            var metadata = tool["_meta"]?.objectValue ?? JSONObject()
+            metadata["aneembed/max_context_length"] = .int(maxContextLength)
+            tool["_meta"] = .object(metadata)
+            return .object(tool)
+        }
+    }
+
     public static func call(_ name: String, arguments: JSONObject, context: ToolContext) async throws(ServiceError)
         -> JSONValue
     {
@@ -113,13 +166,14 @@ public enum Tools {
         } else {
             throw .badRequest("missing_input", "pass `text` (string) or `texts` (list of strings)", param: "text")
         }
-        let options = try outputOptions(arguments)
+        let options = try outputOptions(arguments, modelID: context.service.modelID)
         let inputType = try self.inputType(arguments["input_type"], param: "input_type")
         let result = try await context.service.embedTexts(texts, inputType: inputType)
-        return embeddingOutput(result, options: options, model: context.service.modelName)
+        return embeddingOutput(result, options: options, model: context.service.modelName, modelID: context.service.modelID)
     }
 
     static func embedImage(_ arguments: JSONObject, context: ToolContext) async throws(ServiceError) -> JSONValue {
+        if !context.service.modelID.supportsImages { throw EmbeddingService.imagesUnsupported(context.service.modelID) }
         var images: [Data] = []
         let limits = context.service.limits
         if let data = arguments["data"]?.stringValue {
@@ -137,13 +191,17 @@ public enum Tools {
         } else {
             throw .badRequest("missing_input", "pass `data` (base64 image), `images` or `path`", param: "data")
         }
-        let options = try outputOptions(arguments)
+        let options = try outputOptions(arguments, modelID: context.service.modelID)
         let result = try await context.service.embedImages(images)
-        return embeddingOutput(result, options: options, model: context.service.modelName)
+        return embeddingOutput(result, options: options, model: context.service.modelName, modelID: context.service.modelID)
     }
 
     static func similarity(_ arguments: JSONObject, context: ToolContext) async throws(ServiceError) -> JSONValue {
-        let dimensions = try outputOptions(arguments).dimensions
+        let service = context.service
+        let dimensions = try outputOptions(arguments, modelID: service.modelID).dimensions
+        if !service.modelID.supportsImages {
+            return try await textSimilarity(arguments, service: service, dimensions: dimensions)
+        }
         var vectors: [[Float]] = []
         var tokens: [Int] = []
         for side in ["a", "b"] {
@@ -160,12 +218,37 @@ public enum Tools {
                 throw .badRequest("missing_input", "pass `\(side)` (text), `\(side)_image` (base64) or `\(side)_path`",
                                   param: side)
             }
-            vectors.append(Vectors.truncated(result.vectors[0], to: dimensions))
+            vectors.append(result.vectors[0])
             tokens.append(result.tokenCounts[0])
         }
+        return similarityOutput(vectors, tokens: tokens, dimensions: dimensions, service: service)
+    }
+
+    private static func textSimilarity(_ arguments: JSONObject, service: EmbeddingService, dimensions: Int)
+        async throws(ServiceError) -> JSONValue
+    {
+        var texts: [String] = []
+        for side in ["a", "b"] {
+            if let text = arguments[side]?.stringValue {
+                let type = try inputType(arguments["\(side)_input_type"], param: "\(side)_input_type")
+                texts.append(type?.apply(text, modelID: service.modelID) ?? text)
+            } else if arguments["\(side)_image"]?.stringValue != nil || arguments["\(side)_path"]?.stringValue != nil {
+                throw EmbeddingService.imagesUnsupported(service.modelID)
+            } else {
+                throw .badRequest("missing_input", "pass `\(side)` (text)", param: side)
+            }
+        }
+        let result = try await service.embedTextBatch(texts)
+        return similarityOutput(result.vectors, tokens: result.tokenCounts, dimensions: dimensions, service: service)
+    }
+
+    private static func similarityOutput(_ vectors: [[Float]], tokens: [Int], dimensions: Int, service: EmbeddingService)
+        -> JSONValue
+    {
+        let output = vectors.map { Vectors.output($0, to: dimensions, modelID: service.modelID) }
         return [
-            "cosine": .number(Double(Vectors.cosine(vectors[0], vectors[1]))), "dimensions": .int(dimensions),
-            "tokens": [.int(tokens[0]), .int(tokens[1])], "model": .string(context.service.modelName),
+            "cosine": .number(Double(Vectors.cosine(output[0], output[1]))), "dimensions": .int(dimensions),
+            "tokens": [.int(tokens[0]), .int(tokens[1])], "model": .string(service.modelName),
         ]
     }
 
@@ -181,15 +264,13 @@ public enum Tools {
         }
     }
 
-    public static func outputOptions(_ arguments: JSONObject) throws(ServiceError) -> OutputOptions {
-        var options = OutputOptions()
+    public static func outputOptions(_ arguments: JSONObject, modelID: ModelID = .embeddingGemma2)
+        throws(ServiceError) -> OutputOptions
+    {
+        var options = OutputOptions(dimensions: Vectors.defaultDimension(for: modelID))
         if let value = arguments["dimensions"], !value.isNull {
-            guard let dimensions = value.intValue ?? value.stringValue.flatMap({ Int($0) }),
-                Vectors.dimensions.contains(dimensions)
-            else {
-                throw .badRequest("invalid_dimensions", "dimensions must be one of 768, 512, 256, 128", param: "dimensions")
-            }
-            options.dimensions = dimensions
+            let dimensions = value.intValue ?? value.stringValue.flatMap { Int($0) }
+            options.dimensions = try Vectors.validateDimensions(dimensions, modelID: modelID)
         }
         if let value = arguments["encoding_format"], !value.isNull {
             guard let format = value.stringValue.flatMap(EncodingFormat.init(rawValue:)) else {
@@ -252,10 +333,12 @@ public enum Tools {
     }
 
     /// The common embedding output of every surface except the OpenAI endpoint.
-    public static func embeddingOutput(_ result: EmbeddingResult, options: OutputOptions, model: String) -> JSONValue {
+    public static func embeddingOutput(_ result: EmbeddingResult, options: OutputOptions, model: String,
+                                       modelID: ModelID = .embeddingGemma2) -> JSONValue
+    {
         let data: [JSONValue] = result.vectors.enumerated().map { index, vector in
-            let truncated = Vectors.truncated(vector, to: options.dimensions)
-            let embedding: JSONValue = options.encoding == .base64 ? .string(Vectors.base64(truncated)) : .floats(truncated)
+            let output = Vectors.output(vector, to: options.dimensions, modelID: modelID)
+            let embedding: JSONValue = options.encoding == .base64 ? .string(Vectors.base64(output)) : .floats(output)
             return ["index": .int(index), "tokens": .int(result.tokenCounts[index]), "embedding": embedding]
         }
         return [

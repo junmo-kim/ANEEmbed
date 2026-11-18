@@ -1,8 +1,8 @@
 // Model files on disk.
 //
-//   <data-dir>/models/<revision>/          one directory per installed revision, never moved: the OS keys its
+//   <data-dir>/models/<id>/<revision>/          one directory per installed revision, never moved: the OS keys its
 //                                          ANE compile cache on the model path, so a moved model recompiles
-//   <data-dir>/models/current              text file naming the active revision directory; switched
+//   <data-dir>/models/<id>/current              text file naming the active revision directory; switched
 //                                          atomically after a new revision is downloaded, verified and warmed
 //   <model-dir>/manifest.json              files with sizes and SHA-256 (written by the packaging tools)
 //   <model-dir>/.aneembed-warm.json        what was last warmed, on which OS build (doctor, serve)
@@ -90,7 +90,18 @@ public enum ModelLayout {
     public static let selfTestData = "selftest.bin"
     public static let warmState = ".aneembed-warm.json"
     public static let selfTestState = ".aneembed-selftest.json"
+    static let warmLock = ".aneembed-warm.lock"
+    static let compileLockSuffix = ".compile.lock"
+    static let compileStageSuffix = ".compile.partial"
     public static let packages = [textModel, visionModel]
+
+    static func isReservedManifestRoot(_ root: Substring) -> Bool {
+        if [manifest, warmState, selfTestState, warmLock].contains(where: { root.compare($0, options: .caseInsensitive) == .orderedSame }) {
+            return true
+        }
+        let name = root.folding(options: .caseInsensitive, locale: nil)
+        return name.hasPrefix(".") && (name.hasSuffix(compileLockSuffix) || name.hasSuffix(compileStageSuffix))
+    }
 
     /// Caps on the files read whole, far above their real size (the published package's in brackets), so that only
     /// a file that is not what it should be reaches them: manifest.json the cap of its download, 4 MiB
@@ -125,6 +136,10 @@ public struct ManifestEntry: Sendable, Equatable {
 public struct Manifest: Sendable, Equatable {
     /// Package name (`name`; older drafts used `model`).
     public var model: String
+    public var modelID: ModelID? {
+        model == "embeddinggemma-2-ane" ? .embeddingGemma2 : ModelID(rawValue: model)
+    }
+    public private(set) var pplxContract: PPLXPackageContract?
     /// Revision recorded in the manifest, if any (the published one is pinned by commit, not by this field).
     public var revision: String
     public var created: String
@@ -160,10 +175,18 @@ public struct Manifest: Sendable, Equatable {
             throw ServiceError(.unavailable, "invalid_manifest", "manifest.json has no files list")
         }
         var entries: [ManifestEntry] = []
+        var paths: Set<String> = []
         for file in files {
             guard let path = file["path"]?.stringValue, let size = file["size"]?.intValue, size >= 0,
                 let sha = file["sha256"]?.stringValue, sha.count == 64, sha.allSatisfy(\.isHexDigit), isValidPath(path)
             else { throw ServiceError(.unavailable, "invalid_manifest", "manifest.json has an invalid file entry") }
+            let root = path.prefix { $0 != "/" }
+            guard !ModelLayout.isReservedManifestRoot(root) else {
+                throw ServiceError(.unavailable, "invalid_manifest", "\(path) uses the reserved root name \(root)")
+            }
+            guard paths.insert(path).inserted else {
+                throw ServiceError(.unavailable, "invalid_manifest", "manifest.json lists \(path) more than once")
+            }
             entries.append(ManifestEntry(path: path, size: size, sha256: sha.lowercased()))
         }
         var buckets: [Int: Int] = [:]
@@ -180,7 +203,18 @@ public struct Manifest: Sendable, Equatable {
                                      bandColumns: declared["band_columns"]?.intValue ?? 0, packing: packing,
                                      long: (declared["long"]?.arrayValue ?? []).compactMap { $0["tokens"]?.intValue })
         }
-        return Manifest(model: root["name"]?.stringValue ?? root["model"]?.stringValue ?? "",
+        let name = root["name"]?.stringValue
+        let declaredModel = root["model"]?.stringValue
+        let model = name ?? declaredModel ?? ""
+        var pplx: PPLXPackageContract?
+        let textModels = [ModelID.pplx.rawValue, ModelID.qwen3Embedding.rawValue]
+        if textModels.contains(model) || declaredModel.map(textModels.contains) == true {
+            guard model == declaredModel else {
+                throw ServiceError(.unavailable, "invalid_manifest", "manifest.json has inconsistent pplx model identifiers")
+            }
+            pplx = try PPLXPackageContract.parse(root, files: entries)
+        }
+        return Manifest(model: model, pplxContract: pplx,
                         revision: root["revision"]?.stringValue ?? "", created: root["created"]?.stringValue ?? "",
                         files: entries, sha256: SHA256Hasher.hex(data), buckets: buckets, window: window,
                         legacyLongPath: root["long_path"] != nil)
@@ -190,7 +224,7 @@ public struct Manifest: Sendable, Equatable {
     public static func isValidPath(_ path: String) -> Bool {
         let components = path.split(separator: "/", omittingEmptySubsequences: false)
         return !path.hasPrefix("/") && components.allSatisfy { !$0.isEmpty && $0 != "." && $0 != ".." }
-            && !path.unicodeScalars.contains { $0.properties.generalCategory == .control }
+            && !path.contains("\\") && !path.unicodeScalars.contains { $0.properties.generalCategory == .control }
     }
 
     public static func load(from directory: URL) throws(ServiceError) -> Manifest {
@@ -198,7 +232,7 @@ public struct Manifest: Sendable, Equatable {
         do { data = try SmallFile.read(directory.appendingPathComponent(ModelLayout.manifest), limit: ModelLayout.manifestLimit) } catch {
             guard error != .missing else {
                 throw ServiceError(.unavailable, "manifest_missing", "no manifest.json in \(directory.path)",
-                                   hint: "install with `aneembed models install` or point --model-dir at a model package")
+                                   hint: "install with `aneembed models install --model ID` or point --model-dir at a model package")
             }
             throw ServiceError(.unavailable, "invalid_manifest", "\(directory.path): \(error.describe(ModelLayout.manifest))")
         }
@@ -215,9 +249,29 @@ public struct Manifest: Sendable, Equatable {
                            hint: "reinstall it with `aneembed models install`")
     }
 
+    /// Checks the package identity before a named load or install uses any of its files.
+    public func checkModel(_ expected: ModelID, directory: URL) throws(ServiceError) {
+        guard let modelID else { throw unsupportedModel(in: directory) }
+        guard modelID == expected else {
+            throw ServiceError(.invalidInput, "model_mismatch", "expected \(expected.rawValue) but found \(modelID.rawValue) in \(directory.path)",
+                               hint: "use the matching package with `aneembed models install --model \(expected.rawValue) --from DIR` "
+                               + "or point --model-dir at the package you want to load")
+        }
+    }
+
+    func unsupportedModel(in directory: URL) -> ServiceError {
+        let declared = model.isEmpty ? "(missing model identifier)" : model
+        return ServiceError(.unavailable, "unsupported_model", "unsupported model \(declared) in \(directory.path)",
+                            hint: "point --model-dir at a supported model package")
+    }
+
     /// Fails unless the package declares exactly the contract this build implements: every packing bucket and
     /// windowed function the runtime may load, with their slots and window sizes.
     public func checkContract() throws(ServiceError) {
+        if pplxContract != nil { return }
+        guard modelID == .embeddingGemma2 else {
+            throw ServiceError(.unavailable, "unsupported_model", "manifest.json does not declare a supported model (\(model))")
+        }
         if legacyLongPath {
             throw ServiceError(.unavailable, "unsupported_model",
                                "the package has the per-layer long path of the first model layout; this aneembed runs the "
@@ -250,7 +304,7 @@ public struct Manifest: Sendable, Equatable {
         }
     }
 
-    /// Files every compiled model (`.mlmodelc`) has; one missing or empty means an interrupted or damaged compile.
+    /// Required files in each compiled model. Attention graphs also use weight.bin for constants.
     public static let compiledCoreFiles = ["model.mil", "coremldata.bin", "weights/weight.bin"]
 
     /// State of each compiled model whose package is present or listed: compiled (and whether it matches the
@@ -258,23 +312,29 @@ public struct Manifest: Sendable, Equatable {
     /// A compile is not byte-for-byte reproducible across Core ML compilers, so its SHA-256 is not a check;
     /// the load-time self-test is what decides whether it computes correctly.
     /// `hash` compares the compiled files with the packager's (informational; reads every compiled file).
-    public func compiledStatus(in directory: URL, hash: Bool = false) -> [(package: String, status: String, problem: Bool)] {
-        let compiledOnly = Manifest(model: model, revision: revision, created: created,
-                                    files: files.filter { ModelLayout.isCompiled($0.path) }, sha256: sha256, buckets: buckets,
-                                    window: window, legacyLongPath: legacyLongPath)
+    public func compiledStatus(in directory: URL, hash: Bool = false, maxTokens: Int? = nil)
+        -> [(package: String, status: String, problem: Bool)]
+    {
+        let packages = pplxContract?.requiredPackages(for: maxTokens ?? ModelID.pplx.tokenRange.upperBound) ?? ModelLayout.packages
+        let compiledNames = Set(packages.map { $0 + ".mlmodelc" })
+        var compiledOnly = self
+        compiledOnly.files = files.filter { file in
+            guard let root = file.path.split(separator: "/").first else { return false }
+            return compiledNames.contains(String(root))
+        }
         let differing = Set(compiledOnly.verifyAll(in: directory, hash: hash).compiled.map { String($0.path.split(separator: "/")[0]) })
-        return ModelLayout.packages.compactMap { name in
+        return packages.compactMap { name in
             let compiledName = name + ".mlmodelc"
-            let listed = files.contains { $0.path.hasPrefix(name + ".mlpackage/") || $0.path.hasPrefix(compiledName + "/") }
+            let listed = pplxContract != nil
+                || files.contains { $0.path.hasPrefix(name + ".mlpackage/") || $0.path.hasPrefix(compiledName + "/") }
             let compiled = directory.appendingPathComponent(compiledName)
             guard listed || FileManager.default.fileExists(atPath: compiled.path) else { return nil }
             guard FileManager.default.fileExists(atPath: compiled.path) else {
                 return (name, "not compiled: run `aneembed models warm`", true)
             }
             let damaged = Self.compiledCoreFiles.filter { file in
-                let url = compiled.appendingPathComponent(file)
-                let size = ((try? FileManager.default.attributesOfItem(atPath: url.path))?[.size] as? NSNumber)?.intValue ?? 0
-                return !Self.isRegularFile(url) || size == 0
+                guard case .success(let size) = Self.regularFileSize("\(compiledName)/\(file)", in: directory) else { return true }
+                return size == 0
             }
             guard damaged.isEmpty else {
                 return (name, "incomplete: \(damaged.joined(separator: ", ")) missing or empty; reinstall, or remove "
@@ -296,24 +356,23 @@ public struct Manifest: Sendable, Equatable {
     public func checkForLoad(in directory: URL) -> [Problem] {
         var problems: [Problem] = []
         let listed = Set(files.map(\.path))
-        let selfTestFiles = [ModelLayout.selfTest, ModelLayout.selfTestData].filter {
-            FileManager.default.fileExists(atPath: directory.appendingPathComponent($0).path)
+        let required: [String]
+        var hashed = Self.hashedAtLoad
+        if pplxContract != nil {
+            hashed += ["tokenizer_config.json", "final_norm.f32"]
+            required = PPLXPackageContract.requiredAssets
+        } else {
+            let selfTestFiles = [ModelLayout.selfTest, ModelLayout.selfTestData].filter {
+                FileManager.default.fileExists(atPath: directory.appendingPathComponent($0).path)
+            }
+            required = [ModelLayout.tokenizer, ModelLayout.tokenTable] + selfTestFiles
         }
-        for path in [ModelLayout.tokenizer, ModelLayout.tokenTable] + selfTestFiles where !listed.contains(path) {
+        for path in required where !listed.contains(path) {
             problems.append(Problem(path: path, issue: "not_in_manifest"))
         }
         for file in sourceFiles {
-            let url = directory.appendingPathComponent(file.path)
-            guard let size = (try? FileManager.default.attributesOfItem(atPath: url.path))?[.size] as? NSNumber else {
-                problems.append(Problem(path: file.path, issue: "missing"))
-                continue
-            }
-            if !Self.isRegularFile(url) {
-                problems.append(Problem(path: file.path, issue: "not_regular_file"))
-            } else if size.intValue != file.size {
-                problems.append(Problem(path: file.path, issue: "size_mismatch"))
-            } else if Self.hashedAtLoad.contains(file.path), (try? SHA256Hasher.hex(fileAt: url)) != file.sha256 {
-                problems.append(Problem(path: file.path, issue: "sha256_mismatch"))
+            if let problem = Self.fileProblem(file, in: directory, hash: hashed.contains(file.path)) {
+                problems.append(problem)
             }
         }
         return problems
@@ -330,16 +389,54 @@ public struct Manifest: Sendable, Equatable {
         return lstat(url.path, &info) == 0 && SmallFile.isRegular(info)
     }
 
-    /// Checks every file; `hash: false` only checks presence and size (fast, for doctor).
+    enum FileCheck: String, Error {
+        case missing
+        case notRegular = "not_regular_file"
+    }
+
+    /// The package root may be an explicitly selected symlink. Below it, each parent must be a real directory.
+    static func regularFileSize(_ path: String, in directory: URL) -> Result<Int64, FileCheck> {
+        guard isValidPath(path) else { return .failure(.notRegular) }
+        var info = stat()
+        var parent = directory
+        for component in path.split(separator: "/").dropLast() {
+            parent.appendPathComponent(String(component), isDirectory: false)
+            guard lstat(parent.path, &info) == 0 else { return .failure(.missing) }
+            guard (info.st_mode & S_IFMT) == S_IFDIR else { return .failure(.notRegular) }
+        }
+        let file = directory.appendingPathComponent(path)
+        guard lstat(file.path, &info) == 0 else { return .failure(.missing) }
+        guard SmallFile.isRegular(info) else { return .failure(.notRegular) }
+        return .success(info.st_size)
+    }
+
+    private static func fileProblem(_ file: ManifestEntry, in directory: URL, hash: Bool, progress: ((String) -> Void)? = nil)
+        -> Problem?
+    {
+        switch regularFileSize(file.path, in: directory) {
+        case .failure(let error):
+            return Problem(path: file.path, issue: error.rawValue)
+        case .success(let size) where size != Int64(file.size):
+            return Problem(path: file.path, issue: "size_mismatch")
+        case .success:
+            guard hash else { return nil }
+            progress?(file.path)
+            let url = directory.appendingPathComponent(file.path)
+            return (try? SHA256Hasher.hex(fileAt: url)) == file.sha256 ? nil : Problem(path: file.path, issue: "sha256_mismatch")
+        }
+    }
+
+    /// Checks source files; `hash: false` only checks presence, type and size.
+    public func verify(in directory: URL, hash: Bool, progress: ((String) -> Void)? = nil) -> [Problem] {
+        sourceFiles.compactMap { Self.fileProblem($0, in: directory, hash: hash, progress: progress) }
+    }
+
+    /// Checks source and compiled files.
     ///
     /// Files of a compiled model (`X.mlmodelc/...`) are checked only when that compiled model exists:
     /// they are built on this Mac from `X.mlpackage`, and the Core ML compiler of another macOS release
     /// may produce different bytes (the load-time self-test is what decides whether they compute correctly).
     /// Their problems come back separately in `compiled`.
-    public func verify(in directory: URL, hash: Bool, progress: ((String) -> Void)? = nil) -> [Problem] {
-        verifyAll(in: directory, hash: hash, progress: progress).source
-    }
-
     public func verifyAll(in directory: URL, hash: Bool, progress: ((String) -> Void)? = nil)
         -> (source: [Problem], compiled: [Problem])
     {
@@ -349,27 +446,10 @@ public struct Manifest: Sendable, Equatable {
             let isCompiled = ModelLayout.isCompiled(file.path)
             if isCompiled {
                 let root = String(file.path.split(separator: "/")[0])
-                guard FileManager.default.fileExists(atPath: directory.appendingPathComponent(root).path) else { continue }
+                var info = stat()
+                guard lstat(directory.appendingPathComponent(root).path, &info) == 0 else { continue }
             }
-            let url = directory.appendingPathComponent(file.path)
-            var problem: Problem?
-            if let attributes = try? FileManager.default.attributesOfItem(atPath: url.path),
-                let size = (attributes[.size] as? NSNumber)?.intValue
-            {
-                if !Self.isRegularFile(url) {
-                    problem = Problem(path: file.path, issue: "not_regular_file")
-                } else if size != file.size {
-                    problem = Problem(path: file.path, issue: "size_mismatch")
-                } else if hash {
-                    progress?(file.path)
-                    if (try? SHA256Hasher.hex(fileAt: url)) != file.sha256 {
-                        problem = Problem(path: file.path, issue: "sha256_mismatch")
-                    }
-                }
-            } else {
-                problem = Problem(path: file.path, issue: "missing")
-            }
-            if let problem {
+            if let problem = Self.fileProblem(file, in: directory, hash: hash, progress: progress) {
                 if isCompiled { compiled.append(problem) } else { source.append(problem) }
             }
         }
@@ -392,9 +472,10 @@ public struct WarmState: Sendable, Equatable {
     public var functions: [String]
     public var warmedAt: Date
     public var seconds: Double
+    public var selfTest: SelfTestReport?
 
     public init(osBuild: String, binaryVersion: String, binary: String = Executable.identity, manifestSHA256: String,
-                maxTokens: Int, functions: [String], warmedAt: Date, seconds: Double)
+                maxTokens: Int, functions: [String], warmedAt: Date, seconds: Double, selfTest: SelfTestReport? = nil)
     {
         self.osBuild = osBuild
         self.binaryVersion = binaryVersion
@@ -404,14 +485,17 @@ public struct WarmState: Sendable, Equatable {
         self.functions = functions
         self.warmedAt = warmedAt
         self.seconds = seconds
+        self.selfTest = selfTest
     }
 
     public var json: JSONValue {
-        [
+        var object: JSONObject = [
             "os_build": .string(osBuild), "binary_version": .string(binaryVersion), "binary_sha256": .string(binary),
             "manifest_sha256": .string(manifestSHA256), "max_tokens": .int(maxTokens), "functions": .array(functions.map(JSONValue.string)),
             "warmed_at": .string(ISO8601DateFormatter().string(from: warmedAt)), "seconds": .number(seconds),
         ]
+        if let selfTest { object["selftest"] = selfTest.json }
+        return .object(object)
     }
 
     public static func load(from directory: URL) -> WarmState? {
@@ -425,7 +509,7 @@ public struct WarmState: Sendable, Equatable {
             maxTokens: maxTokens,
             functions: root["functions"]?.arrayValue?.compactMap(\.stringValue) ?? [],
             warmedAt: root["warmed_at"]?.stringValue.flatMap { ISO8601DateFormatter().date(from: $0) } ?? .distantPast,
-            seconds: root["seconds"]?.doubleValue ?? 0)
+            seconds: root["seconds"]?.doubleValue ?? 0, selfTest: root["selftest"].flatMap(SelfTestReport.parse))
     }
 
     public func save(to directory: URL) throws {
@@ -433,9 +517,37 @@ public struct WarmState: Sendable, Equatable {
                                                   atomically: true, encoding: .utf8)
     }
 
+    /// Publish a pplx load's validated capability. A healthy shorter load preserves broader coverage.
+    func recordCapability(requestedMaxTokens: Int, in directory: URL) throws {
+        let path = directory.appendingPathComponent(ModelLayout.warmLock).path
+        let descriptor = open(path, O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK, 0o644)
+        guard descriptor >= 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+        defer { close(descriptor) }
+        var info = stat()
+        guard fstat(descriptor, &info) == 0, SmallFile.isRegular(info) else {
+            throw CocoaError(.fileWriteUnknown, userInfo: [NSFilePathErrorKey: path])
+        }
+        while flock(descriptor, LOCK_EX) != 0 {
+            if errno != EINTR { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+        }
+        var snapshot = self
+        if maxTokens == requestedMaxTokens, let previous = Self.load(from: directory),
+           previous.covers(osBuild: osBuild, maxTokens: maxTokens, binary: binary,
+                           manifestSHA256: manifestSHA256, requiredFunctions: functions)
+        {
+            guard let selfTest else { return }
+            snapshot = previous
+            snapshot.selfTest = selfTest.merged(with: previous.selfTest)
+        }
+        try snapshot.save(to: directory)
+    }
+
     /// Fresh when this executable warmed this package on this OS build for at least `maxTokens`.
-    public func covers(osBuild: String, maxTokens: Int, binary: String = Executable.identity, manifestSHA256: String) -> Bool {
+    public func covers(osBuild: String, maxTokens: Int, binary: String = Executable.identity, manifestSHA256: String,
+                       requiredFunctions: [String] = []) -> Bool
+    {
         self.osBuild == osBuild && self.maxTokens >= maxTokens && self.binary == binary && self.manifestSHA256 == manifestSHA256
+            && Set(requiredFunctions).isSubset(of: functions)
     }
 }
 
@@ -494,29 +606,103 @@ public enum Executable {
 
 public struct ModelStore: Sendable {
     public let dataDirectory: URL
+    let model: ModelID?
 
-    public init(dataDirectory: URL) {
+    public init(dataDirectory: URL, model: ModelID? = nil) {
         self.dataDirectory = dataDirectory
+        self.model = model
     }
 
-    public var modelsDirectory: URL { dataDirectory.appendingPathComponent("models", isDirectory: true) }
+    private var namespace: URL { dataDirectory.appendingPathComponent("models", isDirectory: true) }
+
+    public var modelsDirectory: URL {
+        guard let model else { return namespace }
+        return namespace.appendingPathComponent(model.rawValue, isDirectory: true)
+    }
+
     var currentPointer: URL { modelsDirectory.appendingPathComponent("current") }
 
-    /// The active revision directory (may not exist yet). `current` counts only as a regular file (or a symlink to
-    /// one) holding a valid revision name; anything else is ignored.
+    /// For a named store, resolveDirectory() reports invalid or missing revisions.
     public var currentDirectory: URL {
-        if let data = try? SmallFile.read(currentPointer, limit: ModelLayout.stateLimit, followSymlink: true),
-            case let name = String(decoding: data, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines),
-            ModelSource.isValidRevision(name)
-        {
-            return modelsDirectory.appendingPathComponent(name, isDirectory: true)
-        }
-        return modelsDirectory.appendingPathComponent(ModelSource.pinned.revision, isDirectory: true)
+        guard model == nil else { return (try? resolveDirectory()) ?? modelsDirectory }
+        return legacyActiveDirectory() ?? modelsDirectory.appendingPathComponent(ModelSource.pinned.revision, isDirectory: true)
     }
 
-    /// The directory of `revision`, which must be a valid revision name (it is removed and replaced on install).
+    private func legacyActiveDirectory() -> URL? {
+        guard let data = try? SmallFile.read(currentPointer, limit: ModelLayout.stateLimit, followSymlink: true) else { return nil }
+        let revision = String(decoding: data, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+        guard ModelSource.isValidRevision(revision) else { return nil }
+        return modelsDirectory.appendingPathComponent(revision, isDirectory: true)
+    }
+
+    /// Resolves a single named revision. EG2 can read the old namespace when its own pointer is absent.
+    public func resolveDirectory() throws(ServiceError) -> URL {
+        guard let model else { return currentDirectory }
+        if let directory = try activeDirectory() { return directory }
+        guard model == .embeddingGemma2 else { throw missingModel("no active revision at \(currentPointer.path)") }
+
+        let legacy = ModelStore(dataDirectory: dataDirectory).currentDirectory
+        let revision = legacy.lastPathComponent.lowercased()
+        guard revision != "current", ModelID(rawValue: revision) == nil, try isDirectory(legacy) else {
+            throw missingModel("no active revision at \(currentPointer.path) or legacy package at \(legacy.path)")
+        }
+        return legacy
+    }
+
+    /// Reports whether the store's own pointer names this directory.
+    public func isActive(_ directory: URL) -> Bool {
+        let active = model == nil ? legacyActiveDirectory() : try? activeDirectory()
+        return active?.standardizedFileURL.resolvingSymlinksInPath().path
+            == directory.standardizedFileURL.resolvingSymlinksInPath().path
+    }
+
+    func activeDirectory() throws(ServiceError) -> URL? {
+        try checkNamespace()
+        let data: Data
+        do { data = try SmallFile.read(currentPointer, limit: ModelLayout.stateLimit) } catch {
+            if error == .missing { return nil }
+            throw missingModel(error.describe(currentPointer.path))
+        }
+        let revision = String(decoding: data, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+        guard ModelSource.isValidRevision(revision), revision.lowercased() != "current" else {
+            throw missingModel("\(currentPointer.path) does not name a valid revision")
+        }
+        let directory = modelsDirectory.appendingPathComponent(revision, isDirectory: true)
+        guard try isDirectory(directory) else {
+            throw missingModel("\(currentPointer.path) points to missing revision \(directory.path)")
+        }
+        return directory
+    }
+
+    private func missingModel(_ detail: String) -> ServiceError {
+        let id = model?.rawValue ?? ModelID.embeddingGemma2.rawValue
+        return ServiceError(.unavailable, "model_missing", "\(id): \(detail)",
+                            hint: "install with `aneembed models install --model \(id)` or set --model-dir to an existing package")
+    }
+
+    /// Validates the directories that hold a named install lock, allowing a new store to be created.
+    public func checkNamespace() throws(ServiceError) {
+        guard model != nil else { return }
+        if try isDirectory(namespace) { _ = try isDirectory(modelsDirectory) }
+    }
+
+    /// Checks an existing named store component without following symbolic links.
+    private func isDirectory(_ url: URL) throws(ServiceError) -> Bool {
+        var info = stat()
+        if lstat(url.path, &info) != 0 {
+            let error = errno
+            if error == ENOENT { return false }
+            throw ServiceError(.unavailable, "invalid_model_store", "cannot inspect \(url.path): \(String(cString: strerror(error)))")
+        }
+        guard (info.st_mode & S_IFMT) == S_IFDIR else {
+            throw ServiceError(.unavailable, "invalid_model_store", "\(url.path) must be a directory and cannot be a symbolic link")
+        }
+        return true
+    }
+
+    /// The directory of a validated revision name.
     public func directory(for revision: String) throws(ServiceError) -> URL {
-        guard ModelSource.isValidRevision(revision) else {
+        guard ModelSource.isValidRevision(revision), model == nil || revision.lowercased() != "current" else {
             throw .badRequest("invalid_revision", "\(revision) is not a valid revision name", param: "revision")
         }
         let url = modelsDirectory.appendingPathComponent(revision, isDirectory: true)
@@ -524,24 +710,32 @@ public struct ModelStore: Sendable {
         return url
     }
 
-    /// Fails unless `url` is a direct child of the models directory once symlinks and `..` are resolved: the
-    /// installer removes and moves such paths.
+    /// Checks that the installer is operating on a direct child of the models directory.
     public func checkInside(_ url: URL) throws(ServiceError) {
-        let parent = url.deletingLastPathComponent().standardizedFileURL.resolvingSymlinksInPath().path
-        let models = modelsDirectory.standardizedFileURL.resolvingSymlinksInPath().path
-        guard parent == models, ModelSource.isName(String(url.lastPathComponent.drop { $0 == "." }), maxLength: 160) else {
-            throw ServiceError(.internal, "outside_models_directory", "refusing to replace \(url.path): not inside \(models)")
+        let parent = url.deletingLastPathComponent()
+        let name = url.lastPathComponent
+        let isInside: Bool
+        if model == nil {
+            isInside = parent.standardizedFileURL.resolvingSymlinksInPath().path
+                == modelsDirectory.standardizedFileURL.resolvingSymlinksInPath().path
+        } else {
+            try checkNamespace()
+            isInside = parent.path == modelsDirectory.path && name.lowercased() != "current"
         }
+        guard isInside, ModelSource.isName(String(name.drop { $0 == "." }), maxLength: 160) else {
+            throw ServiceError(.internal, "outside_models_directory", "refusing to replace \(url.path): not inside \(modelsDirectory.path)")
+        }
+        if model != nil { _ = try isDirectory(url) }
     }
 
-    /// Points `current` at `revision` (write to a temporary file, then rename: atomic).
+    /// Points `current` at a revision by writing a temporary file and atomically renaming it.
     public func activate(revision: String) throws {
-        guard ModelSource.isValidRevision(revision) else {
-            throw ServiceError.badRequest("invalid_revision", "\(revision) is not a valid revision name", param: "revision")
-        }
+        let directory = try directory(for: revision)
+        if model != nil, try !isDirectory(directory) { throw missingModel("revision \(directory.path) does not exist") }
         try FileManager.default.createDirectory(at: modelsDirectory, withIntermediateDirectories: true)
-        let temporary = modelsDirectory.appendingPathComponent(".current.\(ProcessInfo.processInfo.processIdentifier)")
-        try (revision + "\n").write(to: temporary, atomically: false, encoding: .utf8)
+        let temporary = modelsDirectory.appendingPathComponent(".current.\(UUID().uuidString)")
+        try Data((revision + "\n").utf8).write(to: temporary, options: [.withoutOverwriting])
+        defer { _ = unlink(temporary.path) }
         if rename(temporary.path, currentPointer.path) != 0 {
             throw CocoaError(.fileWriteUnknown, userInfo: [NSFilePathErrorKey: currentPointer.path])
         }

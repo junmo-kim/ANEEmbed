@@ -1,7 +1,7 @@
 // swift-tools-version: 6.0
 import PackageDescription
 
-// ANEEmbed: an EmbeddingGemma 2 embedding server and CLI that runs only on the Apple Neural Engine.
+// ANERun: an EmbeddingGemma 2 embedding server and CLI that runs only on the Apple Neural Engine.
 // 100% Swift, single binary, no third-party dependencies (Foundation, Network, CoreML, ImageIO,
 // Accelerate and libSystem only). Deployment target macOS 15: the first release with multifunction
 // Core ML models.
@@ -11,10 +11,10 @@ import PackageDescription
 // the default; -Osize is to be measured against it before changing.
 
 let package = Package(
-    name: "ANEEmbed",
+    name: "ANERun",
     platforms: [.macOS(.v15)],
     products: [
-        .executable(name: "aneembed", targets: ["aneembed"]),
+        .executable(name: "anerun", targets: ["anerun"]),
         .library(name: "EmbedCore", targets: ["EmbedCore"]),
     ],
     targets: [
@@ -22,7 +22,7 @@ let package = Package(
         // runtime protocols, API and MCP logic. Everything that does not open a socket.
         .target(name: "EmbedCore"),
         // CLI, HTTP listener (Network.framework) and stdio MCP loop.
-        .executableTarget(name: "aneembed", dependencies: ["EmbedCore"]),
+        .executableTarget(name: "anerun", dependencies: ["EmbedCore"]),
         // Development tool, not a product: deterministic mutation fuzzing of the JPEG decoder. Tests run it as a
         // child process, because a trap cannot be caught in process.
         .executableTarget(name: "jpeg-fuzz", dependencies: ["EmbedCore"]),

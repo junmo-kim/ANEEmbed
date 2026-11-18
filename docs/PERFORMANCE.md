@@ -1,6 +1,45 @@
 # Performance and memory
 
-## ANEEmbed across machines
+## pplx-embed-v1-0.6b on Apple M4
+
+Measured with the Swift release build on a 16 GiB Mac mini, macOS 27.0.1.
+The model defaults to 2,048 tokens. With `--max-tokens 32768`, fused functions
+serve through 8,192 tokens and the long path uses one workspace for tiled attention.
+The table gives warm inference times on fixed token IDs.
+
+| Input | Swift | Python ANE prototype | Swift int8 cosine to fp32 |
+|---|---:|---:|---:|
+| 8,180 tokens | 13.26 s | 11.1 s, fused | 0.999747 |
+| 16,380 tokens | 48.24 s | 50.7 s | 0.999729 |
+| 32,760 tokens | 178.06 s | 226.7 s | 0.999707 |
+| 32,768 tokens, synthetic code, Korean and mixed Unicode | 165.79–184.06 s | | 0.999037–0.999585 |
+
+At 32,760 tokens, Swift spent 163.15 s in attention, 8.97 s in pre/post
+predictions and 5.93 s on the host critical path. The prototype spent 199.6 s
+in attention and 15.7 s on the host. The Swift hardware suite peaked at
+2.24 GiB physical footprint and 1.25 GiB RSS, including load and subsequent
+inference. The prototype suite across three long texts peaked at 4.78 GiB
+footprint and 3.07 GiB RSS. These process measurements exclude system-wide
+wired memory. The MLX bf16 comparison took 86.9 s at 32K on the same M4.
+
+The uncompiled source package is 2.41 GB. The local package with all
+compiled functions uses about 3.9 GiB. Neural Engine preparation depends
+on the cap, macOS build, executable and package path. At the default cap
+a first local install took about 1.5 minutes. At the 32K cap a new server
+binary became ready in 426 s and a cached warmup took 39 s.
+
+In a mixed loopback run with the 32K cap, one 32,768-token request took
+151.4 s. All 30 concurrent 32-token requests completed before it, and a
+second long request queued behind it. Short-request p50/p95 was
+16.5/17.8 ms alone and 112.5/241.8 ms beside the long request. The
+server process peaked at 2.15 GiB footprint. System-wide wired memory
+peaked at 8.69 GiB during the changing fused lengths and reached
+2.46 GiB after 12 s idle. Swap peaked 508 MiB above the starting level
+and finished 124 MiB below it. A client with a 60 s read timeout timed
+out on a full-length request. Set the response timeout above the
+expected inference time for long requests.
+
+## ANERun across machines
 
 | | Apple M4 (16 GB) | M5 Max (64 GB) | M5 Ultra (256 GB) |
 |---|---:|---:|---:|
@@ -19,7 +58,7 @@
 | first install, compile included (default / `+ --max-tokens 8192`) | 260 s / + 389 s | 331 s / + 349 s | 242 s / + 383 s |
 | process memory, idle | 140–270 MB | 186 MB | 155–166 MB |
 
-- **How measured.** Every column is `aneembed bench`, which sends its requests through the same router as `serve` in process, so only the loopback round trip is missing. Each cell is a warm median on texts of exactly N tokens including `<bos>`/`<eos>` and the prompt, at the default `--max-tokens 2048` unless the row says otherwise: 10 runs, 3 above 2048 tokens, 5 for the batches. Process memory is `serve`'s, idle after load.
+- **How measured.** Every column is `anerun bench`, which sends its requests through the same router as `serve` in process, so only the loopback round trip is missing. Each cell is a warm median on texts of exactly N tokens including `<bos>`/`<eos>` and the prompt, at the default `--max-tokens 2048` unless the row says otherwise: 10 runs, 3 above 2048 tokens, 5 for the batches. Process memory is `serve`'s, idle after load.
 - **What differs.** Single texts take about the same time on an M5 Max and an M5 Ultra: one request runs on one Neural Engine. The M5 Ultra's second Neural Engine shows in concurrent and batched work: 8 clients, 10 × 32 tokens and 10 × 2048 tokens, where it took about half the M5 Max's time. From 512 tokens up the M4 took 1.17–1.26 times as long as the M5 Max (1.6 times for a 32-token query), and served two thirds of its requests per second with 8 clients.
 - **Throughput by length.** In tokens per second a single text is processed fastest at about 512 tokens: 16.7k on the M4, 19.5k on the M5 Max and 18.6k on the M5 Ultra. Shorter texts pay the fixed cost of a call (a 32-token query runs in the 64-token function, 6–10k), longer ones the attention, which grows with the square of the length: 12–17k from 768 to 1024 tokens, 8–10k at 4096 and 5.6–7.1k at 8192. A text just past a function's size runs in the next one (see [Latency steps](#latency-steps-m5-ultra)). Several texts in one request, or concurrent requests, raise the total, most on the M5 Ultra: 36k tokens/s for 10 × 32 tokens and 24k for 10 × 2048.
 - **M4.** Measured on 2026-11-16 with the v0.1.0 release binary in a fresh data directory, while other work ran on the machine (swap 5.7–6.4 GB in use). The comparison with the GPU runtimes below was measured over loopback HTTP on a quiet machine the day before. Every function passed its self-test (12/12, and 16/16 with `--max-tokens 8192`). With 8 clients the median query took 15.8 ms.
@@ -27,17 +66,17 @@
 - **M5 Max.** Every function passed its self-test on macOS 26.7's Neural Engine compiler. The memory is after 2 minutes idle, when wired memory was 72 MB above where it was before start.
 - **M5 Ultra.** The numbers were taken while another Neural Engine embedding service was running on the same machine. With 8 clients the median query took 5.9 ms. Its memory is idle under `serve`; `bench` ends at 221 MB after 150 s.
 
-## Apple M4 (16 GB): ANEEmbed and the GPU runtimes
+## Apple M4 (16 GB): ANERun and the GPU runtimes
 
-Measured on 2026-11-15 on one Mac mini M4 (16 GB, macOS 27). Browsers and other heavy apps were closed, swap was under 4 GB at each start, and the 8192-token cases ran with the user logged out. Every runtime runs the official google/embeddinggemma-2 weights. The inputs are synthetic and public texts cut to exactly N tokens with the official tokenizer (prompt, `<bos>` and `<eos>` included), plus a 640×480 gradient PNG. Each cell is the warm median of 10 runs (3 for 8192 tokens). ANEEmbed and llama.cpp were measured as servers over loopback HTTP, client-side time including JSON. MLX and PyTorch have no embedding server here and were measured in process.
+Measured on 2026-11-15 on one Mac mini M4 (16 GB, macOS 27). Browsers and other heavy apps were closed, swap was under 4 GB at each start, and the 8192-token cases ran with the user logged out. Every runtime runs the official google/embeddinggemma-2 weights. The inputs are synthetic and public texts cut to exactly N tokens with the official tokenizer (prompt, `<bos>` and `<eos>` included), plus a 640×480 gradient PNG. Each cell is the warm median of 10 runs (3 for 8192 tokens). ANERun and llama.cpp were measured as servers over loopback HTTP, client-side time including JSON. MLX and PyTorch have no embedding server here and were measured in process.
 
 Versions:
-- ANEEmbed: this repository, `--max-tokens 2048` (8192 for the 8192-token row).
+- ANERun: this repository, `--max-tokens 2048` (8192 for the 8192-token row).
 - llama.cpp: b12387 Metal, `ggml-org/embeddinggemma-2-GGUF` BF16 and Q8_0, `--pooling mean -ngl 99`.
 - MLX: 0.32.4 with mlx-vlm at the commit its model card names, `mlx-community/embeddinggemma-2-bf16` and `-8bit`.
 - PyTorch: 2.7.1 with sentence-transformers 6.3.0, `google/embeddinggemma-2`.
 
-| | ANEEmbed | llama.cpp BF16 | llama.cpp Q8_0 | MLX bf16 | MLX 8bit | PyTorch fp32 MPS | PyTorch bf16 MPS | PyTorch fp32 CPU |
+| | ANERun | llama.cpp BF16 | llama.cpp Q8_0 | MLX bf16 | MLX 8bit | PyTorch fp32 MPS | PyTorch bf16 MPS | PyTorch fp32 CPU |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
 | 32-token query | 7.0 ms | 14.3 ms | 14.1 ms | 17 ms | 15 ms | 59–72 ms | 76 ms | 47 ms |
 | 512 tokens | 34.8 ms | | | | | 116 ms | 167 ms | 327 ms |
@@ -56,17 +95,17 @@ Versions:
 
 Memory:
 
-| | ANEEmbed | llama.cpp | MLX | PyTorch MPS |
+| | ANERun | llama.cpp | MLX | PyTorch MPS |
 |---|---|---|---|---|
 | process memory, idle after load | 140–270 MB | 0.8 GB (Q8_0) / 1.2 GB (BF16) | 5.1–5.7 GB held | 6.7 GB |
 | wired while idle | none: Neural Engine buffers (4.7 GB after start) are released 5–10 s after the last call | 2.1 GB (Q8_0) / 2.6 GB (BF16) of Metal buffers, wired through 120 s idle | none | none (Metal memory allocated, not wired) |
 | uses the GPU | no (0 bytes of Metal memory) | yes | yes | yes |
 
-**Start time:** llama.cpp is ready in 2–8 s and MLX in 3.5 s. ANEEmbed starts in 8.5 s with its Neural Engine compile cached. The first start after installing a new binary takes 2.5 minutes (6.5 more for `--max-tokens 8192`).
+**Start time:** llama.cpp is ready in 2–8 s and MLX in 3.5 s. ANERun starts in 8.5 s with its Neural Engine compile cached. The first start after installing a new binary takes 2.5 minutes (6.5 more for `--max-tokens 8192`).
 
 **`--max-tokens 8192` on 16 GB:** at start the self-test wired 9.4 GB of Neural Engine buffers. They fell to 6.7 GB while running 8192-token texts and to 3.0 GB 30 s later. The process itself peaked at 2.0 GB.
 
-**Bulk images with queries alongside (ANEEmbed, M4).** Synthetic 12–24 MP JPEGs (2–4 MB each), 32 per run, sent to `aneembed serve`, while one client sends a short query every 100 ms:
+**Bulk images with queries alongside (ANERun, M4).** Synthetic 12–24 MP JPEGs (2–4 MB each), 32 per run, sent to `anerun serve`, while one client sends a short query every 100 ms:
 
 | image clients × images per request | images/s | query median | query p90 | query p99 |
 |---|---:|---:|---:|---:|
@@ -81,7 +120,7 @@ Decoding a large JPEG on the CPU (about 1.8 s for 24 MP) dominates; more clients
 
 ## Latency steps (M5 Ultra)
 
-`aneembed bench` on the M5 Ultra as in the table above. A text runs in the smallest function that holds it, so latency steps at each function size and stays flat in between:
+`anerun bench` on the M5 Ultra as in the table above. A text runs in the smallest function that holds it, so latency steps at each function size and stays flat in between:
 
 | tokens | latency |
 |---|---:|
@@ -115,7 +154,7 @@ Functions load four at a time: one by one, a cached start took 10.5 s instead of
 
 ## Memory
 
-Measured on an M5 Ultra with `footprint -w` and `vmmap`, macOS 27.0.1, `aneembed serve` with the release binary. An `aneembed` process has two kinds of memory.
+Measured on an M5 Ultra with `footprint -w` and `vmmap`, macOS 27.0.1, `anerun serve` with the release binary. An `anerun` process has two kinds of memory.
 
 **Its own memory** (`phys_footprint`, what Activity Monitor shows): at the default `--max-tokens 2048`, 155–166 MB idle and 267–383 MB five seconds after a mix of 200 requests (221 MB in `bench` after 150 s); with `--max-tokens 8192`, 210–243 MB idle and 283–599 MB after the mix (444 MB in `bench`). It is malloc memory (190–240 MB after the mix at the default settings), the Core ML input/output surfaces (`IOSurface`, 62 MB / 147 MB) and memory-mapped files, mostly the 256 MB token table, of which 9–31 MB was resident, all clean. All of it is pageable: with `memory_pressure -p 12` pushing the system to 12 % available memory, 292 of the process's 294 MB of dirty memory, the IOSurfaces included, was compressed or swapped out; once the pressure was gone, the first requests took 47 / 62 / 143 ms (query / 500 / 1500 tokens; 5 / 47 / 117 ms before), then warm again. Starting needs more for a moment: loading peaks at about 1.4 GB, which falls back within one to two minutes.
 

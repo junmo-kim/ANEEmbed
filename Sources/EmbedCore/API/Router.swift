@@ -14,12 +14,19 @@ import Foundation
 public struct Router: Sendable {
     public let state: ServerState
     public let modelName: String
+    public let modelID: ModelID
+    private let configuredMaxTokens: Int
     /// Server log: the details of internal errors, which responses do not carry.
     public let log: @Sendable (String) -> Void
 
-    public init(state: ServerState, modelName: String, log: @escaping @Sendable (String) -> Void = { _ in }) {
+    public init(state: ServerState, modelName: String, modelID: ModelID = .embeddingGemma2,
+                configuredMaxTokens: Int = ServiceLimits().maxTokens,
+                log: @escaping @Sendable (String) -> Void = { _ in })
+    {
         self.state = state
         self.modelName = modelName
+        self.modelID = modelID
+        self.configuredMaxTokens = configuredMaxTokens
         self.log = log
     }
 
@@ -43,7 +50,8 @@ public struct Router: Sendable {
         case ("POST", "/detokenize"):
             return await detokenize(consume request)
         case ("POST", "/mcp"):
-            let handler = MCPHandler(state: state, allowPaths: false, waitForModel: false, publicErrors: true, log: log)
+            let handler = MCPHandler(state: state, allowPaths: false, waitForModel: false, publicErrors: true,
+                                     modelID: modelID, configuredMaxTokens: configuredMaxTokens, log: log)
             guard let response = await handler.handle(raw: request.body) else { return HTTPResponse(status: 202) }
             return .json(200, response)
         case ("QUERY", let path):
@@ -80,13 +88,19 @@ public struct Router: Sendable {
     func models() -> HTTPResponse {
         var model: JSONObject = [
             "id": .string(modelName), "object": "model", "created": .int(Self.modelCreated), "owned_by": "local",
-            "dimensions": .array(Vectors.dimensions.map { .int($0) }), "image_preprocessing": "hf-gemma4-280",
+            "dimensions": .array(Vectors.supportedDimensions(for: modelID).map { .int($0) }),
+            "max_context_length": .int(configuredMaxTokens),
         ]
+        if !modelID.supportsImages {
+            model["max_image_tokens"] = 0
+        } else {
+            model["image_preprocessing"] = "hf-gemma4-280"
+        }
         if case .ready(let service) = state.status {
             model["max_context_length"] = .int(service.maxTokens)
-            model["max_image_tokens"] = .int(service.maxImageTokens)
+            if modelID == .embeddingGemma2 { model["max_image_tokens"] = .int(service.maxImageTokens) }
             model["max_inputs"] = .int(service.limits.maxInputs)
-            model["max_images"] = .int(service.limits.maxImages)
+            model["max_images"] = .int(modelID == .qwen3Embedding ? 0 : service.limits.maxImages)
         }
         return .json(200, ["object": "list", "data": [.object(model)]])
     }
@@ -98,13 +112,13 @@ public struct Router: Sendable {
             let service = try state.service()
             // The raw body (up to --max-body) is freed once parsed: only the decoded images stay while they are
             // embedded.
-            let parsed = try EmbeddingsRequest.parse(request.takeBody(), limits: service.limits)
+            let parsed = try EmbeddingsRequest.parse(request.takeBody(), limits: service.limits, modelID: modelID)
             let result: EmbeddingResult
             switch parsed.input {
             case .texts(let texts): result = try await service.embedTexts(texts, inputType: parsed.inputType)
             case .images(let images): result = try await service.embedImages(images)
             }
-            return .json(200, raw: EmbeddingsResponse.body(result, request: parsed, model: modelName))
+            return .json(200, raw: EmbeddingsResponse.body(result, request: parsed, model: modelName, modelID: modelID))
         } catch {
             return .openAIError(published(error, request))
         }
@@ -174,7 +188,12 @@ public struct Router: Sendable {
                         throw ServiceError.badRequest("invalid_utf8", "the embed_text body must be UTF-8 text")
                     }
                     arguments["text"] = .string(text)
-                case "embed_image": arguments["data"] = .string(request.body.base64EncodedString())
+                case "embed_image":
+                    if !modelID.supportsImages {
+                        _ = try state.service()
+                        throw EmbeddingService.imagesUnsupported(modelID)
+                    }
+                    arguments["data"] = .string(request.body.base64EncodedString())
                 default:
                     throw ServiceError.badRequest("json_required", "\(tool) takes its arguments as a JSON body")
                 }

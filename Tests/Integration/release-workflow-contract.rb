@@ -45,7 +45,7 @@ class ReleaseWorkflowContract < Minitest::Test
     assert_includes commands, "shasum -a 256 -c"
     assert_includes commands, "tar -xzf"
     assert_includes commands, "codesign --verify --strict"
-    assert_includes commands, "release-binary-launch-smoke.sh verify/aneembed"
+    assert_includes commands, "release-binary-launch-smoke.sh verify/anerun"
   end
 
   def test_one_asset_per_platform
@@ -53,7 +53,7 @@ class ReleaseWorkflowContract < Minitest::Test
                       .fetch("with").fetch("files")
     assert_equal ["dist/*.tar.gz", "dist/*.tar.gz.sha256"], files.split("\n").map(&:strip).reject(&:empty?)
     build = @jobs.fetch("build").fetch("steps").map { |step| step.fetch("run", "") }.join("\n")
-    assert_includes build, 'TARBALL="aneembed-${GITHUB_REF_NAME}-macos-arm64.tar.gz"'
+    assert_includes build, 'TARBALL="anerun-${GITHUB_REF_NAME}-macos-arm64.tar.gz"'
   end
 
   def test_third_party_actions_are_pinned_to_commits

@@ -15,6 +15,25 @@ struct OpenAIRequestTests {
         #expect(request == EmbeddingsRequest(input: .texts(["a", "b"]), encodingFormat: .base64, dimensions: 256, inputType: .document))
     }
 
+    @Test func pplxDefaultsToFullWidthAndAcceptsEveryIntegerPrefix() throws {
+        let request = try EmbeddingsRequest.parse(Data(#"{"input":"x","model":"embeddinggemma-2","input_type":"query"}"#.utf8),
+                                                  modelID: .pplx)
+        #expect(request.dimensions == 1024 && request.inputType == .query)
+        for width in [1, 300, 1024] {
+            let body = Data(#"{"input":"x","dimensions":\#(width)}"#.utf8)
+            #expect(try EmbeddingsRequest.parse(body, modelID: .pplx).dimensions == width)
+        }
+        for width in ["0", "1025", "1.5", #""300""#] {
+            let body = Data(#"{"input":"x","dimensions":\#(width)}"#.utf8)
+            do {
+                _ = try EmbeddingsRequest.parse(body, modelID: .pplx)
+                Issue.record("accepted dimensions \(width)")
+            } catch {
+                #expect(error.reason == "invalid_dimensions" && error.param == "dimensions")
+            }
+        }
+    }
+
     @Test func keepsALeadingByteOrderMark() throws {
         #expect(try parse("{\"input\": \"\u{FEFF}x\"}").input == .texts(["\u{FEFF}x"]))
     }

@@ -97,8 +97,13 @@ public struct SelfTestReport: Sendable, Equatable {
 
     public static func load(from directory: URL) -> SelfTestReport? {
         guard let data = try? SmallFile.read(directory.appendingPathComponent(ModelLayout.selfTestState), limit: ModelLayout.stateLimit),
-            let root = try? JSONValue.parse(data), let build = root["os_build"]?.stringValue
+            let root = try? JSONValue.parse(data)
         else { return nil }
+        return parse(root)
+    }
+
+    static func parse(_ root: JSONValue) -> SelfTestReport? {
+        guard let build = root["os_build"]?.stringValue else { return nil }
         let results = (root["results"]?.arrayValue ?? []).compactMap { item -> SelfTestResult? in
             guard let function = item["function"]?.stringValue, let passed = item["pass"]?.boolValue else { return nil }
             return SelfTestResult(function: function, kind: item["kind"]?.stringValue ?? "", passed: passed, cosine: item["cos"]?.doubleValue ?? 0,

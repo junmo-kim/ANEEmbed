@@ -117,8 +117,8 @@ def generate(hf_dir, out_dir):
             tests.append({"function": name, "kind": kind, "doc_rows": n, "expected": put(exp)})
             print(f"[selftest] {name} doc_rows={n}", flush=True)
     # vision: fp32 HF vision tower + embedder on the procedural image
-    from transformers import AutoModel
-    hfm = AutoModel.from_pretrained(hf_dir, dtype=torch.float32).eval()
+    from transformers import EmbeddingGemma2Model
+    hfm = EmbeddingGemma2Model.from_pretrained(hf_dir, dtype=torch.float32, use_safetensors=True, local_files_only=True).eval()
     for B, (gx, gy) in VISION_GRIDS.items():
         pv, pos = pattern(gx, gy, B)
         with torch.no_grad():
@@ -217,15 +217,104 @@ def run(dist, only=None, compute_units="ane", verbose=True):
     return ok_all, results
 
 
-if __name__ == "__main__" and sys.argv[1] == "run":
-    only = None
-    cu = "ane"
-    for a in sys.argv[3:]:
-        if a.startswith("--functions="):
-            only = set(a.split("=", 1)[1].split(","))
-        if a == "--cpu":
-            cu = "cpu"
-    ok, res = run(sys.argv[2], only, cu)
+PPLX_FORMAT = "aneembed-pplx-selftest/1"
+
+
+def generate_pplx(hf_dir, out_dir):
+    from pathlib import Path
+    from tempfile import TemporaryDirectory
+    from pplx_build import function_specs
+    from pplx_reference import means, tokenizer
+
+    text = (
+        "A small coastal town mapped its bus routes, then asked residents which stops "
+        "they used on weekday mornings and where they needed better connections.",
+        "서울 도서관은 주말에 어린이와 가족을 위한 독서 모임을 열고 새 책을 소개합니다.",
+    )
+    tok = tokenizer(hf_dir)
+    sequences = [tok.encode(t, add_special_tokens=False).ids[:32] for t in text]
+    references = list(means(hf_dir, sequences))
+    if any(v.shape != (1024,) or not np.isfinite(v).all() for v in references):
+        raise ValueError("invalid pplx fp32 canary mean")
+    cases, data = [], bytearray()
+    direct = []
+    for spec in function_specs():
+        role, name = spec["role"], spec["function"]
+        if role in ("pre", "post") or (role == "fused_part" and spec["part"] != 0):
+            continue
+        # Swift creates q=k=0, v[first]=1, v[last]=3 and opens only those two keys.
+        # The expected output of the weightless attention function is 2 at every coordinate.
+        if role == "attention":
+            direct.append({"kind": "attention", "function": name})
+        count = 2 if role == "packed" else 1
+        cases.append({"kind": "route", "function": name, "sequences": sequences[:count], "offset": len(data)})
+        for ref in references[:count]:
+            data.extend(ref.astype("<f4", copy=False).tobytes())
+    out = Path(out_dir)
+    with TemporaryDirectory(prefix="_tmp_", dir=out) as tmp:
+        stage = Path(tmp)
+        (stage / "selftest.bin").write_bytes(data)
+        (stage / "selftest.json").write_text(
+            json.dumps({"format": PPLX_FORMAT, "cases": cases + direct}, indent=1) + "\n",
+            encoding="utf-8",
+        )
+        for name in ("selftest.bin", "selftest.json"):
+            (stage / name).replace(out / name)
+    print(f"[selftest] {len(cases)} routes, {len(direct)} direct attention cases", flush=True)
+
+
+def run_pplx(dist, binary, max_tokens):
+    import subprocess
+    from pathlib import Path
+    from tempfile import TemporaryDirectory
+    from pplx_verify import swift_binary, swift_environment
+
+    with TemporaryDirectory(prefix="pplx-warm-") as data_dir:
+        result = subprocess.run(
+            [swift_binary(binary), "models", "warm", "--model-dir", str(Path(dist).resolve()),
+             "--data-dir", data_dir, "--max-tokens", str(max_tokens), "--format", "json"],
+            env=swift_environment(), check=False, stdout=subprocess.PIPE, text=True,
+        )
+        print(result.stdout, end="")
+        if result.returncode:
+            return result.returncode
+        report = json.loads(result.stdout)
+        if report.get("max_tokens") != max_tokens or not report.get("selftest"):
+            print(f"SELFTEST FAIL: expected a warm self-test at {max_tokens} tokens", file=sys.stderr)
+            return 1
+        return 0
+
+
+def main():
+    import argparse
+
+    ap = argparse.ArgumentParser()
+    ap.add_argument("command", choices=("run",))
+    ap.add_argument("dist")
+    ap.add_argument("--functions", help="comma-separated functions to run (EmbeddingGemma 2)")
+    ap.add_argument("--cpu", action="store_true", help="run the EmbeddingGemma 2 CPU control")
+    ap.add_argument("--binary", help="anerun Swift executable (pplx)")
+    ap.add_argument("--max-tokens", type=int, help="warm through this token cap (pplx; default 32768)")
+    args = ap.parse_args()
+    with open(os.path.join(args.dist, "selftest.json"), encoding="utf-8") as f:
+        is_pplx = json.load(f).get("format") == PPLX_FORMAT
+    if is_pplx:
+        from pplx_verify import MAX_TOKENS
+
+        if args.functions is not None or args.cpu:
+            ap.error("pplx self-test uses the Swift host; choose a --max-tokens cap")
+        cap = MAX_TOKENS if args.max_tokens is None else args.max_tokens
+        if not 1 <= cap <= MAX_TOKENS:
+            ap.error(f"--max-tokens must be between 1 and {MAX_TOKENS}")
+        return run_pplx(args.dist, args.binary, cap)
+    if args.binary is not None or args.max_tokens is not None:
+        ap.error("--binary and --max-tokens apply to pplx")
+    only = set(args.functions.split(",")) if args.functions is not None else None
+    ok, res = run(args.dist, only, "cpu" if args.cpu else "ane")
     print(f"SELFTEST {'PASS' if ok else 'FAIL'} {sum(r['pass'] for r in res)}/{len(res)} "
           f"min_cos={min(r['min_cos'] for r in res):.6f} max_rel_err={max(r.get('rel_err', 0) for r in res):.4f}")
-    sys.exit(0 if ok else 1)
+    return 0 if ok else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
