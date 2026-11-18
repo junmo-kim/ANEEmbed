@@ -18,6 +18,7 @@ enum CLI {
                          [--breakdown] [--settle SECONDS] [--format yaml|json]
           anerun serve        HTTP: OpenAI /v1/embeddings, /v1/models, /health, POST /tokenize, /detokenize,
                                 POST /mcp, QUERY /{tool}
+          anerun playground [--no-open]   Local semantic search, loads on first request
           anerun mcp          MCP over stdio (newline-delimited JSON-RPC 2.0)
           anerun --version | --help | <command> --print-config
 
@@ -54,6 +55,7 @@ enum CLI {
             case "doctor": handler = DoctorCommand()
             case "models": handler = ModelsCommand()
             case "serve": handler = ServeCommand()
+            case "playground": handler = PlaygroundCommand()
             case "mcp": handler = MCPCommand()
             case "bench": handler = BenchCommand()
             default:

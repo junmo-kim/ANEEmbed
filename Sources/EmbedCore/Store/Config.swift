@@ -32,6 +32,8 @@ public struct Config: Sendable, Equatable {
                defaultValue: { Config.defaultDataDirectory.path }, validate: { $0.isEmpty ? "must not be empty" : nil }),
         Option(name: "host", help: "listen address (loopback by default; anything else exposes an unauthenticated API)",
                defaultValue: { "127.0.0.1" }, validate: { $0.isEmpty ? "must not be empty" : nil }),
+        Option(name: "idle-timeout", help: "exit the playground after this many idle seconds (0 disables)",
+               defaultValue: { "300" }, validate: integer(0...Int.max)),
         Option(name: "port", help: "listen port", defaultValue: { "18180" }, validate: integer(1...65535)),
         Option(name: "max-tokens", help: "longest text accepted, in model tokens; only the functions needed for this cap are loaded",
                defaultValue: { "2048" }, validate: integer(1...32768)),

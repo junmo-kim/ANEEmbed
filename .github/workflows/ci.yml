@@ -88,6 +88,9 @@ jobs:
       - name: Release binary smoke test (fake runtime, real sockets)
         run: Tests/Integration/release-binary-launch-smoke.sh .build/release/anerun
 
+      - name: Playground lifecycle (local sockets)
+        run: python3 -I Tests/Integration/playground-lifecycle.py .build/release/anerun
+
       - name: Binary size
         run: ls -l .build/release/anerun
 

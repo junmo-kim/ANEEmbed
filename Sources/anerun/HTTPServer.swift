@@ -4,11 +4,23 @@ import EmbedCore
 import Foundation
 import Network
 
+protocol HTTPRouting: Sendable {
+    func handle(_ request: consuming HTTPRequest) async -> HTTPResponse
+}
+
+extension Router: HTTPRouting {}
+
+/// An opt-in connection path for routers that need to track response delivery.
+protocol HTTPConnectionRouting: HTTPRouting {
+    func accept(_ transport: NetworkTransport, limiter: ConnectionLimiter, budget: BodyBudget,
+                limits: HTTPConnectionLimits) async
+}
+
 final class HTTPServer: @unchecked Sendable {
     let host: String
     let port: Int
     let maxBody: Int
-    let router: Router
+    let router: any HTTPRouting
     let connections: ConnectionLimiter
     /// Large request bodies buffered at once, across connections: one of --max-body.
     let bodies: BodyBudget
@@ -24,7 +36,7 @@ final class HTTPServer: @unchecked Sendable {
     private var listener: NWListener?
     private let stopped = AsyncStream<Int32>.makeStream()
 
-    init(host: String, port: Int, maxBody: Int, maxConnections: Int, router: Router) {
+    init(host: String, port: Int, maxBody: Int, maxConnections: Int, router: any HTTPRouting) {
         self.host = host
         self.port = port
         self.maxBody = maxBody
@@ -33,7 +45,7 @@ final class HTTPServer: @unchecked Sendable {
         bodies = BodyBudget(capacity: maxBody)
     }
 
-    func start() throws(ServiceError) {
+    func start(onReady: (@Sendable () -> Void)? = nil) throws(ServiceError) {
         let parameters = NWParameters.tcp
         guard let endpointPort = NWEndpoint.Port(rawValue: UInt16(port)) else {
             throw .badRequest("invalid_option", "invalid port \(port)", param: "port")
@@ -50,7 +62,9 @@ final class HTTPServer: @unchecked Sendable {
         }
         listener.stateUpdateHandler = { [self] update in
             switch update {
-            case .ready: Log.info("listening on http://\(host):\(port)")
+            case .ready:
+                Log.info("listening on http://\(host):\(port)")
+                onReady?()
             case .failed(let error):
                 Log.info("listener failed: \(error)")
                 stopped.continuation.yield(ExitCode.unavailable.rawValue)
@@ -67,12 +81,19 @@ final class HTTPServer: @unchecked Sendable {
         return .runtimeError
     }
 
+    func stop() { listener?.cancel() }
+
     // MARK: Connections
 
     private func serve(_ connection: NWConnection) async {
         let limits = HTTPConnectionLimits(maxBody: maxBody, headTimeout: Self.headTimeout, bodyIdleTimeout: Self.bodyIdleTimeout,
                                           sendTimeout: Self.sendTimeout, sendMinimumRate: Self.sendMinimumRate)
-        await HTTPConnection.accept(NetworkTransport(connection), limiter: connections, budget: bodies,
+        let transport = NetworkTransport(connection)
+        if let connectionRouter = router as? any HTTPConnectionRouting {
+            await connectionRouter.accept(transport, limiter: connections, budget: bodies, limits: limits)
+            return
+        }
+        await HTTPConnection.accept(transport, limiter: connections, budget: bodies,
                                     limits: limits) { [router] request in
             await router.handle(consume request)  // without `consume` the closure would keep the body to the end
         }
