@@ -53,7 +53,10 @@ struct PPLXFusedTests {
         }
 
         let values = try await PPLXFused.embed([[0, 1], [1]], length: 64, runner: runner, table: tokenTable())
-        #expect(values == [(0..<1024).map(Float.init), (1...1024).map(Float.init)])
+        let firstRow = (0..<1024).map { Float($0) }
+        let secondRow = (1...1024).map { Float($0) }
+        let expected = [firstRow, secondRow]
+        #expect(values == expected)
     }
 
     @Test func qwenPackingIsCausalWithinEachSequenceAndPoolsOnlyItsFinalRow() async throws {

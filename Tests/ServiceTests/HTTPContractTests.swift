@@ -231,6 +231,17 @@ struct HTTPContractTests {
         #expect(await call("POST", "/detokenize", ["tokens": []]) == (200, ["content": ""]))
     }
 
+    /// The simulated long call blocks synchronously. Give it its own thread so
+    /// short requests can run even with a single cooperative executor thread.
+    private final class BlockingTokenizerExecutor: TaskExecutor {
+        private let queue = DispatchQueue(label: "test.blocking-tokenizer")
+
+        func enqueue(_ job: consuming ExecutorJob) {
+            let job = UnownedJob(job)
+            queue.async { job.runSynchronously(on: self.asUnownedTaskExecutor()) }
+        }
+    }
+
     @Test func smallRawTokenizerRequestsUseReservedSlot() async throws {
         var limits = ServiceLimits()
         limits.longConcurrency = 2
@@ -238,11 +249,11 @@ struct HTTPContractTests {
         let router = Router(state: ServerState(.ready(service)), modelName: service.modelName)
         let (entered, ready) = AsyncStream<Void>.makeStream()
         let release = DispatchSemaphore(value: 0)
-        let large = Task {
+        let large = Task(executorPreference: BlockingTokenizerExecutor()) {
             try await service.withTokenizerLane {
                 ready.yield(())
                 ready.finish()
-                return release.wait(timeout: .now() + 5) == .success
+                return release.wait(timeout: .now() + 120) == .success
             }
         }
         for await _ in entered { break }
