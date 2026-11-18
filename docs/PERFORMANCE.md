@@ -55,7 +55,9 @@ individual loopback HTTP requests after the server became ready.
 | Multilingual text and code | 2,060 | 6.690 s | 0.999873 |
 | Multilingual text and code at full context | 32,768 | 172.963 s | 0.999897 |
 
-The short requests used a 64-token cap. The long requests used a 32,768-token
+The short requests used a 64-token cap. Across startup and the short requests,
+the largest sampled server footprint was 84,542,856 bytes (81 MiB rounded).
+The long requests used a 32,768-token
 cap, one request at each length. The full-context server took 61.045 s to
 start and self-test. Its peak process footprint was 1.98 GiB and peak RSS
 was 1.08 GiB, sampled once per second. System-wide ANE buffers are accounted

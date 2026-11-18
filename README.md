@@ -12,6 +12,20 @@ Local embeddings on the **Apple Neural Engine** from a single **Swift binary wit
 
 Each server process serves one model. Select it with `--model ID` or point to a verified local package with `--model-dir DIR`. For a v0.1.1 configuration, add `--model embeddinggemma-2` or set `ANERUN_MODEL=embeddinggemma-2` to keep using its existing package. Keep each index and its queries on the same model and dimensions.
 
+## Choosing a model for your memory budget
+
+There are two separate costs: **running the model** on your Mac and **storing its vectors** in your search index. All three models ran on a 16 GB M4 Mac mini. The measurements below cover different workloads, so they establish neither a minimum RAM requirement nor a ranking of total memory use.
+
+| Model | When to choose it | Measured M4 process memory | Raw storage per vector at full width |
+|---|---|---|---:|
+| EmbeddingGemma 2 | Search text and images in the same index. Text context tops out at 8,192 tokens. | 140–270 MB **idle**, with the default 2,048-token cap | 3 KiB (768 × float32) |
+| PPLX | Index text up to 32K tokens and keep all 1,024 coordinates in a store that supports signed int8. | **2.24 GiB peak footprint** across loading and inference in the 32K suite | 1 KiB (1,024 × int8) |
+| Qwen3 | Search text up to 32K tokens with an instruction on the query. Choose 32–1,024 float dimensions to fit your index. | **81 MiB sampled peak footprint** with a 64-token cap and short text, **1.98 GiB** in the 32K run | 4 KiB (1,024 × float32), or 128 B at 32 dimensions |
+
+**Leave room for ANE buffers.** Process footprint alone misses memory that macOS wires for the accelerator. In a mixed PPLX run on the M4, **system-wide** wired memory peaked at 8.69 GiB and fell to 2.46 GiB after 12 seconds idle. The Qwen3 run recorded process memory only. For EmbeddingGemma 2, a separate **M5 Ultra** measurement at the default cap isolated the ANE buffers: 5.25 GB wired during startup self-tests, 266 MB during a short query and zero wired when idle. These readings have different scopes and should be read separately. [Memory measurements](docs/PERFORMANCE.md)
+
+**On a memory-constrained Mac**, start with the default 2,048-token cap and raise it when a single input needs more context. For a large index, compare storage at the dimensions you intend to use. The byte counts above assume packed numeric storage and exclude index overhead. ANERun sends PPLX coordinates as JSON numbers or Float32 base64, so the index must store them as int8 to realize the 1 KiB figure.
+
 ## Install
 
 Build from this checkout on an Apple silicon Mac. Use Xcode 16 or newer for embeddings on macOS 15 or newer.
@@ -155,13 +169,13 @@ Every option has a flag and an environment variable. Precedence is flag, then `A
 
 ## Performance and memory
 
-| Model on M4 (16 GB) | Short text | Long text | Process memory |
-|---|---:|---:|---|
-| EmbeddingGemma 2 | 5.1 ms at 32 tokens (warm median, in process) | 1.46 s at 8,192 tokens (warm median) | 140–270 MB idle |
-| PPLX | 16.5 ms at 32 tokens (HTTP p50, short requests alone) | 165.79–184.06 s at 32,768 tokens (warm inference, three inputs) | 2.24 GiB peak footprint across the hardware suite |
-| Qwen3 | 15.1–20.3 ms at 3–32 tokens (HTTP) | 172.96 s at 32,768 tokens (one HTTP request) | 1.98 GiB peak footprint with the 32K cap |
+| Model on M4 (16 GB) | Short text | Long text |
+|---|---:|---:|
+| EmbeddingGemma 2 | 5.1 ms at 32 tokens (warm median, in process) | 1.46 s at 8,192 tokens (warm median) |
+| PPLX | 16.5 ms at 32 tokens (HTTP p50, short requests alone) | 165.79–184.06 s at 32,768 tokens (warm inference, three inputs) |
+| Qwen3 | 15.1–20.3 ms at 3–32 tokens (HTTP) | 172.96 s at 32,768 tokens (one HTTP request) |
 
-Process memory excludes system-wide ANE buffers. The [benchmark details](docs/PERFORMANCE.md) give the input sets, timing boundaries and memory measurements.
+The [benchmark details](docs/PERFORMANCE.md) give the input sets, timing boundaries and memory measurements.
 
 ### EmbeddingGemma 2 across machines
 
