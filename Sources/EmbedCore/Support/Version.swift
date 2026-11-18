@@ -1,2 +1,2 @@
 /// The release version, checked against the git tag by the release workflow.
-public let aneembedVersion = "0.1.1"
+public let aneembedVersion = "0.2.0"

@@ -5,9 +5,12 @@
 Measured with the Swift release build on a 16 GiB Mac mini, macOS 27.0.1.
 The model defaults to 2,048 tokens. With `--max-tokens 32768`, fused functions
 serve through 8,192 tokens and the long path uses one workspace for tiled attention.
-The table gives warm inference times on fixed token IDs.
+The table gives warm inference times on fixed token IDs. The reference uses the
+original FP32 model with the publisher's int8 output quantizer. Across 22 inputs,
+the lowest cosine similarity was 0.9992044 before output quantization and
+0.9988503 between the returned int8 vectors and the quantized reference.
 
-| Input | Swift | Python ANE prototype | Swift int8 cosine to fp32 |
+| Input | Swift | Python ANE prototype | Cosine vs. reference int8 |
 |---|---:|---:|---:|
 | 8,180 tokens | 13.26 s | 11.1 s, fused | 0.999747 |
 | 16,380 tokens | 48.24 s | 50.7 s | 0.999729 |
@@ -39,7 +42,34 @@ and finished 124 MiB below it. A client with a 60 s read timeout timed
 out on a full-length request. Set the response timeout above the
 expected inference time for long requests.
 
+## Qwen3 Embedding on Apple M4
+
+Qwen3-Embedding-0.6B ran on a 16 GiB Mac mini with macOS 27.0.1. Each row
+compares the returned normalized vector with the original FP32 model on the
+same token IDs. Lengths include EOS and any query instruction. Times cover
+individual loopback HTTP requests after the server became ready.
+
+| Input | Tokens | HTTP latency | Cosine vs. original FP32 |
+|---|---:|---:|---:|
+| Six short inputs, including a query also requested at 37 dimensions | 3–32 | 15.1–20.3 ms | 0.999802 minimum |
+| Multilingual text and code | 2,060 | 6.690 s | 0.999873 |
+| Multilingual text and code at full context | 32,768 | 172.963 s | 0.999897 |
+
+The short requests used a 64-token cap. The long requests used a 32,768-token
+cap, one request at each length. The full-context server took 61.045 s to
+start and self-test. Its peak process footprint was 1.98 GiB and peak RSS
+was 1.08 GiB, sampled once per second. System-wide ANE buffers are accounted
+for separately by macOS.
+
+The long-context measurements above come from model qualification. A separate
+M4 check of the packaged v0.2.0 candidate returned a 1,024-dimensional Qwen3
+vector with cosine 0.999944 against FP32 on an eight-token input. On the same
+executable, all 1,024 PPLX int8 coordinates and all 1,536 coordinates of two
+EmbeddingGemma 2 vectors matched their previous M4 outputs exactly.
+
 ## ANERun across machines
+
+The remaining tables cover EmbeddingGemma 2.
 
 | | Apple M4 (16 GB) | M5 Max (64 GB) | M5 Ultra (256 GB) |
 |---|---:|---:|---:|

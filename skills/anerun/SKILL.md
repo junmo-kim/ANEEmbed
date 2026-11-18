@@ -2,7 +2,7 @@
 name: anerun
 description: >
   Local text and image embeddings on the Apple Neural Engine (ANERun, macOS).
-  Embed with EmbeddingGemma 2 or text-only pplx-embed-v1-0.6b, compare two inputs by cosine
+  Embed with EmbeddingGemma 2 or text-only pplx-embed-v1-0.6b or qwen3-embedding-0.6b, compare two inputs by cosine
   similarity, count tokens, or run an OpenAI-compatible /v1/embeddings server, without a cloud API and
   without using the GPU. Reach for this when an agent needs semantic search, deduplication, clustering or
   retrieval over local data, needs to embed a query and documents consistently, or needs to check how
@@ -16,7 +16,7 @@ user_invocable: true
 
 `anerun` embeds texts and images on the Neural Engine. Put the binary on your `PATH` (README → Install)
 and install a model once with `anerun models install --model ID`. Select `embeddinggemma-2` for
-text and images or `pplx-embed-v1-0.6b` for text. Pass `--model ID`, set `ANERUN_MODEL=ID`, or
+text and images or either `pplx-embed-v1-0.6b` or `qwen3-embedding-0.6b` for text. Pass `--model ID`, set `ANERUN_MODEL=ID`, or
 use `--model-dir DIR` for a local package. The commands below assume you set `ANERUN_MODEL`.
 Output is YAML by default. Add
 `--format json` to parse. Errors go to stderr as `error` / `reason` / `detail` / `hint` with an exit code.
@@ -37,8 +37,11 @@ Output is YAML by default. Add
 
 - For EmbeddingGemma 2 retrieval use `--prompt query` or `--prompt document` (or `input_type` over
   HTTP/MCP). pplx embeds the supplied text as-is.
-- Both models default to 2,048 tokens. Set `--max-tokens` up to 8,192 for EmbeddingGemma 2 or
-  32,768 for pplx. An input over the configured limit receives `context_length_exceeded`.
+- All three models default to 2,048 tokens. Set `--max-tokens` up to 8,192 for EmbeddingGemma 2 or
+  32,768 for pplx and Qwen. Overlong text is truncated by default. Use `--no-truncate` with `embed` or
+  `similarity`, or pass `"truncate": false` in HTTP/MCP JSON arguments to reject it with
+  `context_length_exceeded`. CLI and MCP embeddings mark clipped rows with `"truncated": true`.
+  Similarity reports clipped operand indices in `truncated_indices` (0 for the first, 1 for the second).
   Allow several minutes for full-length 32K requests on an M4.
 - Compare vectors from the same model and dimensions. EmbeddingGemma 2 returns normalized vectors.
   pplx returns signed int8 coordinates in numeric arrays or base64 Float32. Use cosine similarity for pplx.

@@ -105,7 +105,13 @@ anerun similarity "a cat on a mat" --image-b cat.jpg
 anerun tokenize "hello world" --show-tokens
 ```
 
+`embed` (including JSONL input) and `similarity` truncate text to the model's configured context limit by default. Use `--no-truncate` to reject overlong text with `context_length_exceeded` (exit 65). An embedding row carries `"truncated": true` only when its text was clipped. A similarity result includes `truncated_indices` when clipping occurs, with `0` for the first operand and `1` for the second. `tokenize` shows the full token sequence.
+
 For pplx, use `anerun serve --model pplx-embed-v1-0.6b --max-tokens 32768` after installing that model. The 32K path runs attention in tiles and can give short queries time between predictions. Allow several minutes for a full-length request on an M4. One-off commands load and self-test the model each time. For regular use keep `serve` or `mcp` running.
+
+### Semantic search playground
+
+Run `anerun playground --model qwen3-embedding-0.6b` after installing the model. Enter documents and a query to rank them by cosine similarity. EmbeddingGemma 2 also accepts images. The page keeps document vectors in memory and loads the model on the first embedding request. Use `--no-open` to open the URL yourself. The server listens on loopback and exits after five idle minutes by default or when you click Stop. Set `--idle-timeout SECONDS` to change the idle interval (0 disables it).
 
 ### MCP
 
@@ -113,7 +119,9 @@ For pplx, use `anerun serve --model pplx-embed-v1-0.6b --max-tokens 32768` after
 { "mcpServers": { "anerun": { "command": "anerun", "args": ["mcp", "--model", "embeddinggemma-2"] } } }
 ```
 
-Tools include `embed_text` and `similarity` for either model and `embed_image` for EmbeddingGemma 2. The text tools expose the context limit in `_meta["aneembed/max_context_length"]` in `tools/list`. The same tools are reachable over HTTP as `POST /mcp` and as one-shot `QUERY /{tool}?<options>` with the raw text or image bytes as the body. Over stdio a message (one line) is limited to `--max-body`: a longer one is skipped and answered with a `-32600` error (`id` null). At most 16 messages are handled at once; further input is not read until one finishes. `embed --stdin` and `tokenize --stdin` stop with `line_too_long` (exit 65) at a line over `--max-body`. `embed_image` checks the number of images before decoding any of them, and each image's size before decoding it.
+Tools include `embed_text` and `similarity` for embedding models and `embed_image` for EmbeddingGemma 2. The text tools expose the context limit in `_meta["aneembed/max_context_length"]` in `tools/list`. They truncate overlong text by default and report clipping with the same fields as the CLI. Pass `"truncate": false` in the tool arguments to reject overlong text.
+
+The same tools are reachable over HTTP as `POST /mcp` and as one-shot `QUERY /{tool}?<options>`. For a strict `QUERY` call, use `?truncate=false` or put `"truncate": false` in the JSON arguments body. Over stdio a message (one line) is limited to `--max-body`: a longer one is skipped and answered with a `-32600` error (`id` null). At most 16 messages are handled at once; further input is not read until one finishes. `embed --stdin` and `tokenize --stdin` stop with `line_too_long` (exit 65) at a line over `--max-body`. `embed_image` checks the number of images before decoding any of them, and each image's size before decoding it.
 
 ## API
 
@@ -129,12 +137,15 @@ Tools include `embed_text` and `similarity` for either model and `embed_image` f
 
 Request fields of `/v1/embeddings`:
 
-- `encoding_format` is `float` (a JSON numeric array) or `base64` (little-endian Float32 bytes for both models). With pplx the numeric values are signed int8 coordinates in either encoding.
+- `encoding_format` is `float` (a JSON numeric array) or `base64` (little-endian Float32 bytes for all three models). With pplx the numeric values are signed int8 coordinates in either encoding.
 - `dimensions` defaults to the model's full output width. EmbeddingGemma 2 normalizes the selected prefix. pplx takes the prefix of the mean-pooled vector, applies `tanh`, scales by 127 and rounds to signed int8 codes. Use cosine similarity to compare quantized vectors.
 - `input_type` accepts `query` and `document`. EmbeddingGemma 2 adds the corresponding prompt prefix. pplx embeds the provided text as-is in either mode. Images require EmbeddingGemma 2.
+- `truncate` defaults to `true` for text. Clipped response items carry `"truncated": true`. Send `false` to reject text over the configured context limit with `400 context_length_exceeded`.
 - The response names the server's selected model or its `--model-name` alias. The request's `model` and `user` fields are accepted and ignored.
 
-Texts over the configured limit receive `400 context_length_exceeded`. `usage.prompt_tokens` counts model tokens. EmbeddingGemma 2 includes `<bos>` and `<eos>` for text and counts an image as its soft tokens plus four. pplx has no automatic boundary tokens. Errors use OpenAI's shape, `{"error": {"message", "type", "param", "code"}}`. Server-side failures carry a stable code and a generic message, with details in the server log. Invalid UTF-8 in JSON bodies receives `400 invalid_json`; raw `QUERY /embed_text` receives `400 invalid_utf8`.
+`usage.prompt_tokens_per_second` reports effective input throughput. It divides the tokens actually used across the batch by elapsed processing time, including tokenization or image preparation, scheduling and inference. The timer starts after HTTP parsing and ends before JSON serialization. llama-swap v273 reads this oMLX-compatible field for `/v1/embeddings`.
+
+`usage.prompt_tokens` counts the model tokens used. EmbeddingGemma 2 includes `<bos>` and `<eos>` for text and counts an image as its soft tokens plus four. pplx has no automatic boundary tokens. Errors use OpenAI's shape, `{"error": {"message", "type", "param", "code"}}`. Server-side failures carry a stable code and a generic message, with details in the server log. Invalid UTF-8 in JSON bodies receives `400 invalid_json`; raw `QUERY /embed_text` receives `400 invalid_utf8`.
 
 `/tokenize` and `/detokenize` use the selected model's vocabulary. For pplx, `add_special` has no effect and `parse_special` controls recognition of the tokenizer's special tokens. `/tokenize` accepts at most 1 MiB of text, counts beyond the embedding limit and can return token pieces via `with_pieces`. `/detokenize` decodes the IDs back to text, including special tokens, and replaces invalid UTF-8 with U+FFFD. The response is capped at 1 MiB plus any boundary token bytes. Content over these limits receives `413 content_too_long`.
 
@@ -170,12 +181,18 @@ Every option has a flag and an environment variable. Precedence is flag, then `A
 - **Use the model's prompts.** For EmbeddingGemma 2, send `input_type` as `query` or `document` to add the model's search prefixes. pplx uses the same unprefixed text for both.
 - **Embed an index and its queries with the same runtime.** Vectors from ANERun, llama.cpp, MLX and PyTorch agree to cosine ≈ 0.9999 for text, but not bit for bit, and llama.cpp's image preprocessing differs from the official recipe (cosine ≈ 0.996). Re-embed when you switch.
 - **Bulk image jobs (backfills): one client, 4–8 images per request.** More clients barely add throughput: the Neural Engine runs one call at a time, and large JPEGs are decoded on the CPU, at most `--image-concurrency` (default 2) at a time. On an M4 with 12–24 MP photos, one client reached 1.19 images/s at 1 image per request, 1.46 at 4 and 1.51 at 8. Two or three clients reached 1.56–1.59 (+3–5 %), but short queries sent meanwhile waited about 2.5 times longer (p90 0.66–0.70 s instead of 0.28 s). If searches run at the same time, prefer one client. Downscaling very large photos on the client speeds up decoding, at the cost of pixels that differ slightly from the official preprocessing.
-- **Long documents: chunk them, or raise `--max-tokens`.** The default 2048 keeps start time and memory low; texts over the limit are rejected (`400 context_length_exceeded`), never truncated. For the most tokens per second, chunks of about 512 tokens are best; an 8192-token text is processed at about a third of that rate ([details](docs/PERFORMANCE.md#anerun-across-machines)).
+- **Long documents: chunk them, or raise `--max-tokens`.** The default 2048 keeps start time and memory low. Chunk long documents to embed content beyond the configured context limit. For the most tokens per second, chunks of about 512 tokens are best; an 8192-token text is processed at about a third of that rate ([details](docs/PERFORMANCE.md#anerun-across-machines)).
 - **Keep `serve` (or `mcp`) running.** One-off CLI commands load and self-test the model each time (about 5 s).
 
 ## Performance and memory
 
-The table reports the EmbeddingGemma 2 release baseline. See [performance measurements](docs/PERFORMANCE.md) for the current long-text results and pplx.
+On the 16 GiB M4, PPLX's returned int8 vectors reached a minimum cosine of
+**0.998850** against the quantized original across 22 inputs. Qwen3 reached
+**0.999802** or higher on six short inputs and **0.999897** at 32,768 tokens
+against the original FP32 model. See the [M4 measurements](docs/PERFORMANCE.md)
+for latency by input length, peak process memory and the packaged release checks.
+
+The table below reports the EmbeddingGemma 2 release baseline.
 
 | ANERun, warm median | Apple M4 (16 GB) | M5 Max (64 GB) | M5 Ultra (256 GB) |
 |---|---:|---:|---:|

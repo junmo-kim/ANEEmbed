@@ -62,9 +62,9 @@ for pair in $TYPES; do
   echo
 done
 
-# Release commits and subjects without a known type: the former are left out, the rest go under Other.
+# Group the remaining subjects under Other, skipping routine version bumps.
 other="$(printf '%s\n' "$ALL_LOG" | grep -vE "^[0-9a-f]+ (${KNOWN_TYPES})(\([^)]*\))?!?: " \
-  | grep -vE '^[0-9a-f]+ (chore\(release\)|chore(\([^)]*\))?: bump version|Release v)' || true)"
+  | grep -vE '^[0-9a-f]+ (chore(\([^)]*\))?: bump version|Release v)' || true)"
 if [ -n "$other" ]; then
   any=1
   echo "### Other"

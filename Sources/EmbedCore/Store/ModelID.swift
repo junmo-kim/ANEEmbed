@@ -29,7 +29,7 @@ public enum ModelID: String, CaseIterable, Sendable {
         embeddinggemma-2 downloads about 1 GB. First install took about 4–5 minutes on M4.
         pplx-embed-v1-0.6b downloads about 2.4 GB. The first local install at 2,048 tokens took about 1.5 minutes on M4.
         qwen3-embedding-0.6b returns normalized text embeddings (1024 dimensions by default, any width from 32 to 1024).
-        Install it with --from DIR or an explicit --repo and --revision.
+        Install it with anerun models install --model qwen3-embedding-0.6b.
         """
     }
 }
