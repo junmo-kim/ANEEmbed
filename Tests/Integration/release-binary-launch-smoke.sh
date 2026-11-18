@@ -163,10 +163,43 @@ set +e
 "$binary" embed x --dimensions 300 >/dev/null 2>"$tmpdir/err"; code=$?
 set -e
 [ "$code" -eq 64 ] && grep -q 'invalid_dimensions' "$tmpdir/err" || fail "bad --dimensions: exit $code"
+long_text=$(head -c 3000 /dev/zero | tr '\0' 'x')
+"$binary" embed x "$long_text" --dimensions 128 --format json >"$tmpdir/truncated.json" 2>"$tmpdir/err" ||
+  fail "permissive embed exited nonzero"
+printf '"x"\n{"text":"%s","id":"long"}\n' "$long_text" |
+  "$binary" embed --stdin --dimensions 128 >"$tmpdir/truncated.jsonl" 2>"$tmpdir/err" ||
+  fail "permissive embed --stdin exited nonzero"
+"$binary" similarity x "$long_text" --format json >"$tmpdir/similarity.json" 2>"$tmpdir/err" ||
+  fail "permissive similarity exited nonzero"
+"$binary" tokenize "$long_text" --format json >"$tmpdir/tokenize.json" 2>"$tmpdir/err" ||
+  fail "tokenize exited nonzero"
+python3 - "$tmpdir" <<'PY' || fail "truncation outputs failed validation"
+import json, pathlib, sys
+root = pathlib.Path(sys.argv[1])
+embed = json.loads((root / "truncated.json").read_text())["data"]
+jsonl = [json.loads(line) for line in (root / "truncated.jsonl").read_text().splitlines()]
+similarity = json.loads((root / "similarity.json").read_text())
+tokenized = json.loads((root / "tokenize.json").read_text())["data"][0]
+for rows in (embed, jsonl):
+    assert [r["index"] for r in rows] == [0, 1]
+    assert "truncated" not in rows[0] and rows[1]["truncated"] is True
+    assert rows[1]["tokens"] < tokenized["count"]
+assert jsonl[1]["id"] == "long"
+assert similarity["truncated_indices"] == [1] and similarity["tokens"][1] == embed[1]["tokens"]
+PY
+
 set +e
-"$binary" embed "$(head -c 3000 /dev/zero | tr '\0' 'x')" >/dev/null 2>"$tmpdir/err"; code=$?
+"$binary" embed "$long_text" --no-truncate >/dev/null 2>"$tmpdir/err"; code=$?
 set -e
-[ "$code" -eq 65 ] && grep -q 'context_length_exceeded' "$tmpdir/err" || fail "over-long text: exit $code"
+[ "$code" -eq 65 ] && grep -q 'context_length_exceeded' "$tmpdir/err" || fail "embed --no-truncate: exit $code"
+set +e
+printf '"%s"\n' "$long_text" | "$binary" embed --stdin --no-truncate >/dev/null 2>"$tmpdir/err"; code=$?
+set -e
+[ "$code" -eq 65 ] && grep -q 'context_length_exceeded' "$tmpdir/err" || fail "embed --stdin --no-truncate: exit $code"
+set +e
+"$binary" similarity x "$long_text" --no-truncate >/dev/null 2>"$tmpdir/err"; code=$?
+set -e
+[ "$code" -eq 65 ] && grep -q 'context_length_exceeded' "$tmpdir/err" || fail "similarity --no-truncate: exit $code"
 
 # models install never runs on the fake runtime, and an override must pin a full commit (checked before any network use).
 set +e

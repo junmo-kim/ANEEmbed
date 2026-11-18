@@ -7,9 +7,9 @@ enum CLI {
 
         USAGE
           anerun embed [TEXT ...] [--stdin] [--image PATH ...] [--prompt query|document]
-                         [--dimensions N] [--encoding float|base64] [--format yaml|json]
+                         [--no-truncate] [--dimensions N] [--encoding float|base64] [--format yaml|json]
           anerun similarity A B [--image-a PATH] [--image-b PATH] [--prompt query|document]
-                         [--prompt-a ...] [--prompt-b ...] [--dimensions N] [--format yaml|json]
+                         [--prompt-a ...] [--prompt-b ...] [--no-truncate] [--dimensions N] [--format yaml|json]
           anerun tokenize [TEXT ...] [--stdin] [--prompt query|document] [--show-tokens] [--format yaml|json]
           anerun doctor [--verify] [--format yaml|json]
           anerun models path | verify | warm
@@ -28,6 +28,7 @@ enum CLI {
         \(Config.options.map { "  --\($0.name.padding(toLength: 18, withPad: " ", startingAt: 0)) \($0.environmentName.padding(toLength: 28, withPad: " ", startingAt: 0)) \($0.help)" }.joined(separator: "\n"))
 
         stdout carries data only (YAML by default, JSON with --format json; --stdin modes write JSONL).
+        Text embeddings truncate at the model's context limit by default. Use --no-truncate to reject overlong texts.
         Errors go to stderr with an exit code: 64 bad arguments, 65 input the model cannot take,
         69 no model or Neural Engine, 75 still loading, 1 anything else.
         A one-off command loads the model each time (seconds); keep `serve` or `mcp` running for regular use.
@@ -128,13 +129,14 @@ func parseInputLine(_ line: Data, number: Int) throws(ServiceError) -> (text: St
 // MARK: - embed
 
 struct EmbedCommand: Command {
-    let spec = ArgumentSpec(values: ["image", "prompt", "dimensions", "encoding", "format"], flags: ["stdin"])
+    let spec = ArgumentSpec(values: ["image", "prompt", "dimensions", "encoding", "format"], flags: ["stdin", "no-truncate"])
     static let batchSize = 256
 
     func run(_ arguments: ParsedArguments, config: Config, format: OutputFormat) async throws(ServiceError) -> ExitCode {
         let images = arguments.values("image")
         let texts = arguments.positionals
         let fromStdin = arguments.has("stdin")
+        let truncate = !arguments.has("no-truncate")
         guard [!images.isEmpty, !texts.isEmpty, fromStdin].filter({ $0 }).count == 1 else {
             throw .badRequest("missing_input", "give texts, --image paths or --stdin (one of them)")
         }
@@ -158,7 +160,8 @@ struct EmbedCommand: Command {
             var index = 0, number = 0
             func flush() async throws(ServiceError) {
                 guard !batch.isEmpty else { return }
-                let result = try await service.embedTexts(batch.map(\.text), inputType: type)
+                let result = try await service.embedTexts(batch.map(\.text), inputType: type, truncate: truncate)
+                let truncated = Set(result.truncatedIndices)
                 var lines = ""
                 for (offset, item) in batch.enumerated() {
                     let vector = Vectors.output(result.vectors[offset], to: output.dimensions, modelID: service.modelID)
@@ -166,6 +169,7 @@ struct EmbedCommand: Command {
                     if let id = item.id { record["id"] = id }
                     record["index"] = .int(index + offset)
                     record["tokens"] = .int(result.tokenCounts[offset])
+                    if truncated.contains(offset) { record["truncated"] = true }
                     record["embedding"] = output.encoding == .base64 ? .string(Vectors.base64(vector)) : .floats(vector)
                     lines += JSONValue.object(record).jsonString() + "\n"
                 }
@@ -192,7 +196,7 @@ struct EmbedCommand: Command {
             for path in images { data.append(try readFile(path)) }
             result = try await service.embedImages(data)
         } else {
-            result = try await service.embedTexts(texts, inputType: type)
+            result = try await service.embedTexts(texts, inputType: type, truncate: truncate)
         }
         Output.data(Tools.embeddingOutput(result, options: output, model: service.modelName, modelID: service.modelID), format: format)
         return .success
@@ -202,7 +206,8 @@ struct EmbedCommand: Command {
 // MARK: - similarity
 
 struct SimilarityCommand: Command {
-    let spec = ArgumentSpec(values: ["image-a", "image-b", "prompt", "prompt-a", "prompt-b", "dimensions", "format"])
+    let spec = ArgumentSpec(values: ["image-a", "image-b", "prompt", "prompt-a", "prompt-b", "dimensions", "format"],
+                            flags: ["no-truncate"])
 
     func run(_ arguments: ParsedArguments, config: Config, format: OutputFormat) async throws(ServiceError) -> ExitCode {
         if let model = config.modelID, !model.supportsImages,
@@ -227,6 +232,7 @@ struct SimilarityCommand: Command {
         }
         guard texts.isEmpty else { throw .badRequest("too_many_inputs", "similarity compares exactly two inputs") }
         if let dimensions = arguments.value("dimensions") { tool["dimensions"] = .string(dimensions) }
+        if arguments.has("no-truncate") { tool["truncate"] = false }
         let service = try await ModelLoader.makeService(config, log: Log.info)
         let result = try await Tools.call("similarity", arguments: tool, context: ToolContext(service: service, allowPaths: true))
         Output.data(result, format: format)

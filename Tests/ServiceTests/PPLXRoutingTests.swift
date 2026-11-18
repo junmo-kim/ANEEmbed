@@ -64,7 +64,9 @@ struct PPLXRoutingTests {
         let router = Router(state: ServerState(.ready(PPLXServiceTests.service())), modelName: alias, modelID: .pplx)
         let (status, plain) = try await request(router, "POST", "/v1/embeddings", ["input": "x", "model": "embeddinggemma-2"])
         #expect(status == 200 && plain["model"] == .string(alias))
-        #expect(plain["usage"] == ["prompt_tokens": 1, "total_tokens": 1])
+        #expect(plain["usage"]?["prompt_tokens"] == 1 && plain["usage"]?["total_tokens"] == 1)
+        #expect((plain["usage"]?["prompt_tokens_per_second"]?.doubleValue ?? 0) > 0)
+        #expect(plain["usage"]?["generation_tokens_per_second"] == nil)
         let full = try #require(try embedding(plain).arrayValue)
         #expect(full.count == 1024 && full.allSatisfy { (-128...127).contains($0.intValue ?? 1000) })
         #expect(full.contains { ($0.intValue ?? 0).magnitude > 1 })
@@ -74,7 +76,8 @@ struct PPLXRoutingTests {
                 "input": "x", "input_type": .string(prompt), "dimensions": 300, "encoding_format": "base64",
             ])
             let encoded = try #require(try embedding(body).stringValue)
-            #expect(status == 200 && body["usage"] == plain["usage"])
+            #expect(status == 200 && body["usage"]?["prompt_tokens"] == 1 && body["usage"]?["total_tokens"] == 1)
+            #expect((body["usage"]?["prompt_tokens_per_second"]?.doubleValue ?? 0) > 0)
             #expect(Vectors.decodeBase64(encoded) == full.prefix(300).map { Float($0.intValue!) })
         }
         for (body, reason): (JSONValue, String) in [

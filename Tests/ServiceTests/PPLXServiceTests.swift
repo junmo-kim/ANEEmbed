@@ -52,7 +52,7 @@ struct PPLXServiceTests {
             ("bounded", "context_length_exceeded", "input[1] has at least 12 tokens"),
         ] {
             do {
-                _ = try await service.embedTexts(["composed", text], inputType: .document)
+                _ = try await service.embedTexts(["composed", text], inputType: .document, truncate: false)
                 Issue.record("accepted invalid input")
             } catch {
                 #expect(error.reason == reason && error.param == "input" && error.exitCode == .dataError)
@@ -60,7 +60,7 @@ struct PPLXServiceTests {
             }
         }
         #expect(await runtime.batches.isEmpty)
-        let result = try await service.embedTexts(["composed"], inputType: .query)
+        let result = try await service.embedTexts(["composed"], inputType: .query, truncate: false)
         #expect(result == EmbeddingResult(vectors: [[0.5, -0.25]], tokenCounts: [1]))
         #expect(await runtime.batches == [[[7]]])
     }

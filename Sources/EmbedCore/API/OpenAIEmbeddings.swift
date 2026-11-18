@@ -25,8 +25,11 @@ public struct EmbeddingsRequest: Sendable, Equatable {
     public var encodingFormat: EncodingFormat = .float
     public var dimensions = 768
     public var inputType: InputType?
+    public var truncate: Bool
 
-    public init(input: Input, encodingFormat: EncodingFormat = .float, dimensions: Int = 768, inputType: InputType? = nil) {
+    public init(input: Input, encodingFormat: EncodingFormat = .float, dimensions: Int = 768, inputType: InputType? = nil,
+                truncate: Bool = true) {
+        self.truncate = truncate
         self.input = input
         self.encodingFormat = encodingFormat
         self.dimensions = dimensions
@@ -108,6 +111,12 @@ public struct EmbeddingsRequest: Sendable, Equatable {
         default:
             throw .badRequest("invalid_input_type", "input_type must be query or document", param: "input_type")
         }
+        if let value = object["truncate"] {
+            guard case .bool(let truncate) = value else {
+                throw .badRequest("invalid_truncate", "truncate must be a boolean", param: "truncate")
+            }
+            request.truncate = truncate
+        }
         return request
     }
 
@@ -151,11 +160,12 @@ public struct EmbeddingsRequest: Sendable, Equatable {
 public enum EmbeddingsResponse {
     /// The OpenAI response body for `result`.
     public static func body(_ result: EmbeddingResult, request: EmbeddingsRequest, model: String,
-                            modelID: ModelID = .embeddingGemma2) -> Data
+                            modelID: ModelID = .embeddingGemma2, promptTokensPerSecond: Double? = nil) -> Data
     {
         var output: [UInt8] = []
         output.reserveCapacity(result.vectors.count * (request.encodingFormat == .float ? request.dimensions * 12 : request.dimensions * 6) + 128)
         output.append(contentsOf: #"{"object":"list","data":["#.utf8)
+        let clipped = Set(result.truncatedIndices)
         for (index, vector) in result.vectors.enumerated() {
             if index > 0 { output.append(UInt8(ascii: ",")) }
             output.append(contentsOf: #"{"object":"embedding","index":\#(index),"embedding":"#.utf8)
@@ -164,12 +174,17 @@ public enum EmbeddingsResponse {
             case .float: writeJSONFloats(embedding, to: &output)
             case .base64: writeJSONString(Vectors.base64(embedding), to: &output)
             }
+            if clipped.contains(index) { output.append(contentsOf: #","truncated":true"#.utf8) }
             output.append(UInt8(ascii: "}"))
         }
         output.append(contentsOf: #"],"model":"#.utf8)
         writeJSONString(model, to: &output)
         let tokens = result.totalTokens
-        output.append(contentsOf: #","usage":{"prompt_tokens":\#(tokens),"total_tokens":\#(tokens)}}"#.utf8)
+        output.append(contentsOf: #","usage":{"prompt_tokens":\#(tokens),"total_tokens":\#(tokens)"#.utf8)
+        if let rate = promptTokensPerSecond, rate.isFinite, rate > 0 {
+            output.append(contentsOf: #","prompt_tokens_per_second":\#(rate)"#.utf8)
+        }
+        output.append(contentsOf: "}}".utf8)
         return Data(output)
     }
 }

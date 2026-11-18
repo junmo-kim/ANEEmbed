@@ -61,6 +61,17 @@ struct TokenizerRuleTests {
         #expect(tokenizer.encode("aaaa", addSpecialTokens: false) == [8, 8])
     }
 
+    @Test func boundedEncodingKeepsMergeableRunsIntact() throws {
+        let tokenizer = try tinyTokenizer()
+        let text = String(repeating: "a", count: 8193) + "<|image|> abc"
+        let full = tokenizer.encode(text)
+        for cap in [2, 64, 2048, full.count - 1] {
+            #expect(tokenizer.encodeForEmbedding(text, limit: cap, truncate: true)
+                    == .clipped(Array(full.prefix(cap - 1)) + [1]))
+        }
+        #expect(tokenizer.encodeForEmbedding(text, limit: full.count) == .ids(full))
+    }
+
     @Test func replacesSpacesWithLowLine() throws {
         let tokenizer = try tinyTokenizer()
         #expect(tokenizer.encode(" a", addSpecialTokens: false) == [10])

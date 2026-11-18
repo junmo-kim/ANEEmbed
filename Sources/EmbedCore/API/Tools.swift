@@ -33,6 +33,10 @@ public enum Tools {
     private static let formatSchema: JSONValue = [
         "type": "string", "enum": ["json", "yaml"], "description": "Output format of the tool text. Default json.",
     ]
+    private static let truncateSchema: JSONValue = [
+        "type": "boolean", "default": true,
+        "description": "Truncate text at the context limit. Set to false to reject overlong text.",
+    ]
 
     /// MCP tool descriptors (tools/list).
     public static let definitions: [JSONValue] = [
@@ -40,7 +44,7 @@ public enum Tools {
             "name": "embed_text",
             "description": """
                 Embed text with EmbeddingGemma 2 on the Apple Neural Engine (768-d, L2-normalized). Pass `text` or `texts` \
-                (up to the server's max tokens each; longer texts are rejected, not truncated). For retrieval, embed \
+                (overlong texts are truncated by default). For retrieval, embed \
                 queries with input_type=query and documents with input_type=document. Over HTTP: \
                 QUERY /embed_text?input_type=query with the raw UTF-8 text as the body.
                 """,
@@ -50,7 +54,7 @@ public enum Tools {
                     "text": ["type": "string", "description": "One text."],
                     "texts": ["type": "array", "items": ["type": "string"], "description": "Several texts (batched)."],
                     "input_type": inputTypeSchema, "dimensions": dimensionsSchema, "encoding_format": encodingSchema,
-                    "format": formatSchema,
+                    "format": formatSchema, "truncate": truncateSchema,
                 ],
             ],
         ],
@@ -85,7 +89,7 @@ public enum Tools {
                     "a_input_type": inputTypeSchema, "b_input_type": inputTypeSchema,
                     "a_image": ["type": "string"], "b_image": ["type": "string"],
                     "a_path": ["type": "string"], "b_path": ["type": "string"],
-                    "dimensions": dimensionsSchema, "format": formatSchema,
+                    "dimensions": dimensionsSchema, "format": formatSchema, "truncate": truncateSchema,
                 ],
             ],
         ],
@@ -168,7 +172,8 @@ public enum Tools {
         }
         let options = try outputOptions(arguments, modelID: context.service.modelID)
         let inputType = try self.inputType(arguments["input_type"], param: "input_type")
-        let result = try await context.service.embedTexts(texts, inputType: inputType)
+        let truncate = try truncateOption(arguments)
+        let result = try await context.service.embedTexts(texts, inputType: inputType, truncate: truncate)
         return embeddingOutput(result, options: options, model: context.service.modelName, modelID: context.service.modelID)
     }
 
@@ -199,16 +204,18 @@ public enum Tools {
     static func similarity(_ arguments: JSONObject, context: ToolContext) async throws(ServiceError) -> JSONValue {
         let service = context.service
         let dimensions = try outputOptions(arguments, modelID: service.modelID).dimensions
+        let truncate = try truncateOption(arguments)
         if !service.modelID.supportsImages {
-            return try await textSimilarity(arguments, service: service, dimensions: dimensions)
+            return try await textSimilarity(arguments, service: service, dimensions: dimensions, truncate: truncate)
         }
         var vectors: [[Float]] = []
         var tokens: [Int] = []
-        for side in ["a", "b"] {
+        var truncatedIndices: [Int] = []
+        for (index, side) in ["a", "b"].enumerated() {
             let result: EmbeddingResult
             if let text = arguments[side]?.stringValue {
                 let type = try inputType(arguments["\(side)_input_type"], param: "\(side)_input_type")
-                result = try await context.service.embedTexts([text], inputType: type)
+                result = try await service.embedTexts([text], inputType: type, truncate: truncate)
             } else if let data = arguments["\(side)_image"]?.stringValue {
                 result = try await context.service.embedImages([try base64Image(data, param: "\(side)_image",
                                                                                 limits: context.service.limits)])
@@ -220,11 +227,13 @@ public enum Tools {
             }
             vectors.append(result.vectors[0])
             tokens.append(result.tokenCounts[0])
+            if !result.truncatedIndices.isEmpty { truncatedIndices.append(index) }
         }
-        return similarityOutput(vectors, tokens: tokens, dimensions: dimensions, service: service)
+        return similarityOutput(vectors, tokens: tokens, truncatedIndices: truncatedIndices,
+                                dimensions: dimensions, service: service)
     }
 
-    private static func textSimilarity(_ arguments: JSONObject, service: EmbeddingService, dimensions: Int)
+    private static func textSimilarity(_ arguments: JSONObject, service: EmbeddingService, dimensions: Int, truncate: Bool)
         async throws(ServiceError) -> JSONValue
     {
         var texts: [String] = []
@@ -238,21 +247,32 @@ public enum Tools {
                 throw .badRequest("missing_input", "pass `\(side)` (text)", param: side)
             }
         }
-        let result = try await service.embedTextBatch(texts)
-        return similarityOutput(result.vectors, tokens: result.tokenCounts, dimensions: dimensions, service: service)
+        let result = try await service.embedTextBatch(texts, truncate: truncate)
+        return similarityOutput(result.vectors, tokens: result.tokenCounts, truncatedIndices: result.truncatedIndices,
+                                dimensions: dimensions, service: service)
     }
 
-    private static func similarityOutput(_ vectors: [[Float]], tokens: [Int], dimensions: Int, service: EmbeddingService)
-        -> JSONValue
+    private static func similarityOutput(_ vectors: [[Float]], tokens: [Int], truncatedIndices: [Int],
+                                         dimensions: Int, service: EmbeddingService) -> JSONValue
     {
         let output = vectors.map { Vectors.output($0, to: dimensions, modelID: service.modelID) }
-        return [
+        var result: JSONObject = [
             "cosine": .number(Double(Vectors.cosine(output[0], output[1]))), "dimensions": .int(dimensions),
             "tokens": [.int(tokens[0]), .int(tokens[1])], "model": .string(service.modelName),
         ]
+        if !truncatedIndices.isEmpty { result["truncated_indices"] = .array(truncatedIndices.map(JSONValue.int)) }
+        return .object(result)
     }
 
     // MARK: Shared
+
+    static func truncateOption(_ arguments: JSONObject) throws(ServiceError) -> Bool {
+        guard let value = arguments["truncate"] else { return true }
+        guard let truncate = value.boolValue else {
+            throw .badRequest("invalid_truncate", "truncate must be a boolean", param: "truncate")
+        }
+        return truncate
+    }
 
     public struct OutputOptions: Sendable {
         public var dimensions = 768
@@ -336,10 +356,13 @@ public enum Tools {
     public static func embeddingOutput(_ result: EmbeddingResult, options: OutputOptions, model: String,
                                        modelID: ModelID = .embeddingGemma2) -> JSONValue
     {
+        let truncated = Set(result.truncatedIndices)
         let data: [JSONValue] = result.vectors.enumerated().map { index, vector in
             let output = Vectors.output(vector, to: options.dimensions, modelID: modelID)
             let embedding: JSONValue = options.encoding == .base64 ? .string(Vectors.base64(output)) : .floats(output)
-            return ["index": .int(index), "tokens": .int(result.tokenCounts[index]), "embedding": embedding]
+            var item: JSONObject = ["index": .int(index), "tokens": .int(result.tokenCounts[index]), "embedding": embedding]
+            if truncated.contains(index) { item["truncated"] = true }
+            return .object(item)
         }
         return [
             "model": .string(model), "dimensions": .int(options.dimensions),

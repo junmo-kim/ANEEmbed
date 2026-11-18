@@ -31,7 +31,16 @@ struct QwenEmbeddingTests {
         func request(_ path: String, _ body: JSONValue? = nil) async throws -> (Int, JSONValue) {
             let response = await router.handle(HTTPRequest(method: body == nil ? "GET" : "POST", path: path,
                                                          body: body?.jsonData() ?? Data()))
-            return (response.status, try JSONValue.parse(response.body))
+            let body = try JSONValue.parse(response.body)
+            if path == "/v1/embeddings", response.status == 200 {
+                var object = try #require(body.objectValue)
+                var usage = try #require(object["usage"]?.objectValue)
+                #expect((usage["prompt_tokens_per_second"]?.doubleValue ?? 0) > 0)
+                usage["prompt_tokens_per_second"] = nil
+                object["usage"] = .object(usage)
+                return (response.status, .object(object))
+            }
+            return (response.status, body)
         }
         func embedding(_ body: JSONValue) throws -> [Float] {
             let array = try #require(body["data"]?.arrayValue?.first?["embedding"]?.arrayValue)

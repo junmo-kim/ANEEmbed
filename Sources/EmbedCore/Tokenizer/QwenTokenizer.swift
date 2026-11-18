@@ -14,7 +14,7 @@ public final class QwenTokenizer: TextTokenizer {
     private let addedBytes: [Int32: [UInt8]]
     private let vocabBytes: [[UInt8]]
     private let maxOrdinaryBytes: Int
-    private let suffixIDs: [Int32]
+    public let suffixIDs: [Int32]
 
     func checked(for model: ModelID) throws -> Self {
         guard suffixIDs == (model == .qwen3Embedding ? [151643] : []) else {
@@ -141,32 +141,33 @@ public final class QwenTokenizer: TextTokenizer {
     }
 
     public func encodeForEmbedding(_ text: String, limit: Int) -> BoundedTokenization {
-        var spans: [Span] = []
-        var ordinaryBytes = 0
-        var addedCount = 0
-        var minimum = suffixIDs.count
-        forEachSpan(in: text, parseSpecial: true) { span in
-            switch span {
-            case .ordinary(let normalized): ordinaryBytes += normalized.utf8.count
-            case .added: addedCount += 1
-            }
-            // Every BPE symbol starts as one normalized byte and merges concatenate
-            // their symbols, so one result covers at most maxOrdinaryBytes.
-            let (whole, remainder) = ordinaryBytes.quotientAndRemainder(dividingBy: maxOrdinaryBytes)
-            minimum = suffixIDs.count + addedCount + whole + (remainder == 0 ? 0 : 1)
-            guard minimum <= limit else { return false }
-            spans.append(span)
-            return true
-        }
-        guard minimum <= limit else { return .tooLong(atLeast: minimum) }
+        encodeForEmbedding(text, limit: limit, truncate: false)
+    }
 
+    public func encodeForEmbedding(_ text: String, limit: Int, truncate: Bool) -> BoundedTokenization {
+        guard limit >= suffixIDs.count else { return .tooLong(atLeast: suffixIDs.count) }
+        let bodyLimit = limit - suffixIDs.count
+        let stopAt = bodyLimit == Int.max ? Int.max : bodyLimit + 1
         var scratch = BPEScratch()
         var ids: [Int32] = []
-        for span in spans {
-            append(span, to: &ids, scratch: &scratch)
+        var exceedsLimit = false
+        forEachSpan(in: text, parseSpecial: true) { span in
+            if !truncate, case .ordinary(let normalized) = span {
+                let remaining = bodyLimit - ids.count
+                let (whole, tail) = normalized.utf8.count.quotientAndRemainder(dividingBy: maxOrdinaryBytes)
+                if whole > remaining || (whole == remaining && tail > 0) {
+                    exceedsLimit = true
+                    return false
+                }
+            }
+            append(span, to: &ids, scratch: &scratch, stopAt: stopAt)
+            exceedsLimit = ids.count > bodyLimit
+            return !exceedsLimit
         }
-        ids += suffixIDs
-        return .ids(ids)
+        guard exceedsLimit else { return .ids(ids + suffixIDs) }
+        guard truncate, limit > 0 else { return .tooLong(atLeast: limit + 1) }
+        ids.removeLast()
+        return .clipped(ids + suffixIDs)
     }
 
     /// Visits spans until the input ends or the consumer returns false.
@@ -206,29 +207,44 @@ public final class QwenTokenizer: TextTokenizer {
         }
     }
 
-    private func append(_ span: Span, to ids: inout [Int32], scratch: inout BPEScratch) {
+    private func append(_ span: Span, to ids: inout [Int32], scratch: inout BPEScratch, stopAt: Int = Int.max) {
         switch span {
         case .added(let id):
             ids.append(id)
         case .ordinary(let text):
-            forEachSplit(in: text) { piece in
+            visitSplits(in: text) { piece in
                 scratch.reset()
                 for byte in piece.utf8 { scratch.append(byteIDs[Int(byte)]) }
                 scratch.mergeAll(merges)
-                scratch.collect(into: &ids)
+                scratch.collect(into: &ids, stopAt: stopAt)
+                return ids.count < stopAt
             }
         }
     }
 
     func forEachSplit(in text: String, _ consume: (String) -> Void) {
+        visitSplits(in: text) { piece in
+            consume(piece)
+            return true
+        }
+    }
+
+    private func visitSplits(in text: String, _ consume: (String) -> Bool) {
         // NSString slices can bisect a grapheme at the regex's scalar boundary.
         let source = text as NSString
         var offset = 0
-        for match in splitter.matches(in: text, range: NSRange(location: 0, length: source.length)) {
-            precondition(match.range.location == offset && match.range.length > 0)
-            consume(source.substring(with: match.range))
-            offset = NSMaxRange(match.range)
+        var stopped = false
+        withoutActuallyEscaping(consume) { consume in
+            splitter.enumerateMatches(in: text, range: NSRange(location: 0, length: source.length)) { match, _, stop in
+                guard let match else { return }
+                precondition(match.range.location == offset && match.range.length > 0)
+                offset = NSMaxRange(match.range)
+                if !consume(source.substring(with: match.range)) {
+                    stopped = true
+                    stop.pointee = true
+                }
+            }
         }
-        precondition(offset == source.length)
+        precondition(stopped || offset == source.length)
     }
 }

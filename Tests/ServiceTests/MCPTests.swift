@@ -34,6 +34,10 @@ struct MCPTests {
             let tools = try #require(response?["result"]?["tools"]?.arrayValue)
             #expect(tools.compactMap { $0["name"]?.stringValue } == ["embed_text", "embed_image", "similarity"])
             #expect(tools.map { $0["inputSchema"] } == Tools.definitions.map { $0["inputSchema"] })
+            for index in [0, 2] {
+                let truncate = tools[index]["inputSchema"]?["properties"]?["truncate"]
+                #expect(truncate?["type"] == "boolean" && truncate?["default"] == true)
+            }
             #expect(tools[0]["_meta"]?["aneembed/max_context_length"] == .int(cap))
             #expect(tools[1] == Tools.definitions[1])
             #expect(tools[2]["_meta"]?["aneembed/max_context_length"] == .int(cap))
@@ -46,9 +50,11 @@ struct MCPTests {
         #expect(!failed)
         #expect(output["data"]?.arrayValue?.count == 2)
         #expect(output["data"]?.arrayValue?[0]["embedding"]?.arrayValue?.count == 512)
+        #expect(output["data"]?.arrayValue?.allSatisfy { $0["truncated"] == nil } == true)
 
         let (_, same) = try await call(handler, "similarity", ["a": "x", "b": "x"])
         #expect(abs((same["cosine"]?.doubleValue ?? 0) - 1) < 1e-5)
+        #expect(same["truncated_indices"] == nil)
 
         let png = TestSupport.png(width: 64, height: 64)
         let file = FileManager.default.temporaryDirectory.appendingPathComponent("aneembed-mcp-\(UUID().uuidString).png")
@@ -57,17 +63,60 @@ struct MCPTests {
         let (_, image) = try await call(handler, "embed_image", ["path": .string(file.path)])
         let (_, inline) = try await call(handler, "embed_image", ["data": .string(png.base64EncodedString())])
         #expect(image["data"] == inline["data"])
+        #expect(image["data"]?.arrayValue?.first?["truncated"] == nil)
         let (_, mixed) = try await call(handler, "similarity", ["a_path": .string(file.path), "b_image": .string(png.base64EncodedString())])
         #expect(abs((mixed["cosine"]?.doubleValue ?? 0) - 1) < 1e-5)
     }
 
     @Test func toolErrorsAreStructured() async throws {
         let handler = MCPHandler(state: ServerState(.ready(TestSupport.service(maxTokens: 64))), allowPaths: true, waitForModel: true)
-        let (failed, error) = try await call(handler, "embed_text", ["text": .string(String(repeating: "z", count: 100))])
+        let (failed, error) = try await call(handler, "embed_text", [
+            "text": .string(String(repeating: "z", count: 100)), "truncate": false,
+        ])
         #expect(failed)
         #expect(error["error"] == "invalid_input" && error["reason"] == "context_length_exceeded")
         let (missing, missingError) = try await call(handler, "embed_text", [:])
         #expect(missing && missingError["reason"] == "missing_input")
+    }
+
+    @Test func embedTextReportsOnlyClippedRows() async throws {
+        let handler = MCPHandler(state: ServerState(.ready(TestSupport.service(maxTokens: 64))), allowPaths: true, waitForModel: true)
+        let overlong: JSONValue = .string(String(repeating: "z", count: 100))
+        let exact: JSONValue = .string(String(repeating: "z", count: 62))
+        let (failed, output) = try await call(handler, "embed_text", ["texts": ["x", overlong, exact]])
+        let rows = try #require(output["data"]?.arrayValue)
+        #expect(!failed)
+        #expect(rows.map { $0["index"] } == [0, 1, 2])
+        #expect(rows.map { $0["tokens"] } == [3, 64, 64])
+        #expect(rows.map { $0["truncated"] } == [nil, true, nil])
+        #expect(output["usage"]?["prompt_tokens"] == 131)
+    }
+
+    @Test(arguments: [ModelID.embeddingGemma2, .pplx, .qwen3Embedding])
+    func similarityReportsClippedOperandsAndOffersStrictMode(_ model: ModelID) async throws {
+        var limits = ServiceLimits()
+        limits.maxTokens = 64
+        let service = EmbeddingService(tokenizer: ByteTokenizer(modelID: model),
+                                       runtime: FakeRuntime.make(maxTokens: 64, modelID: model),
+                                       limits: limits, modelID: model)
+        let handler = MCPHandler(state: ServerState(.ready(service)), allowPaths: true, waitForModel: true)
+        let overlong: JSONValue = .string(String(repeating: "z", count: 100))
+        let (failed, output) = try await call(handler, "similarity", ["a": "x", "b": overlong])
+        #expect(!failed)
+        #expect(output["tokens"]?.arrayValue?.last == 64)
+        #expect(output["truncated_indices"] == [1])
+        let (bothFailed, both) = try await call(handler, "similarity", ["a": overlong, "b": overlong])
+        #expect(!bothFailed && both["truncated_indices"] == [0, 1])
+        let (strictFailure, error) = try await call(handler, "similarity", ["a": "x", "b": overlong, "truncate": false])
+        #expect(strictFailure && error["reason"] == "context_length_exceeded")
+    }
+
+    @Test func truncateRequiresABoolean() async throws {
+        let handler = MCPHandler(state: ServerState(.ready(TestSupport.service())), allowPaths: true, waitForModel: true)
+        for invalid: JSONValue in ["false", .null] {
+            let (failed, error) = try await call(handler, "embed_text", ["text": "x", "truncate": invalid])
+            #expect(failed && error["reason"] == "invalid_truncate")
+        }
     }
 
     /// embed_image (MCP, and QUERY /embed_image with a JSON body) counts the images before decoding any, as

@@ -5,8 +5,8 @@
 //   1. added tokens: the 24 special tokens (<bos>, <|image>, ...) are cut out of the raw text first,
 //      leftmost-longest, and become their ids directly (they are not normalized)
 //   2. normalizer: Replace " " with "▁" (U+2581) in every other piece
-//   3. pre_tokenizer: Split on " " (MergedWithPrevious). After step 2 no " " is left, so each piece is
-//      one word; this is why BPE has to stay O(n log n) on a whole document
+//   3. pre_tokenizer: Split on " " (MergedWithPrevious). After step 2 no " " is left, so each ordinary piece stays
+//      intact; this is why BPE has to stay O(n log n) on a whole document
 //   4. BPE: one symbol per Unicode scalar (its vocab id, or <0xXX> byte tokens when the scalar is not in
 //      the vocab), then merges applied lowest rank first (leftmost on ties) with a priority queue
 //   5. post_processor: <bos> ... <eos>
@@ -56,6 +56,7 @@ public final class GemmaTokenizer: Sendable {
     private let byteIDs: [Int32]
     /// (left id << 32 | right id) -> (rank << 32 | merged id)
     private let merges: PairTable
+    private let mergeBoundaries: MergeBoundaries
     /// Added tokens, longest first within each leading byte.
     private let addedTokens: [[UInt8]]
     private let addedTokenIDs: [Int32]
@@ -98,6 +99,7 @@ public final class GemmaTokenizer: Sendable {
         bmpIDs = bmp
         astralIDs = astral
         tokenBytes = bytesByID
+        mergeBoundaries = MergeBoundaries(vocabulary: bytesByID)
 
         var bytes = [Int32](repeating: -1, count: 256)
         let hex = Array("0123456789ABCDEF".utf8)
@@ -149,6 +151,57 @@ public final class GemmaTokenizer: Sendable {
         maxBytesPerToken = bytes.allSatisfy({ $0 >= 0 }) && longest > 0 ? longest : nil
     }
 
+    /// A merge cannot cross two directly encoded scalars unless the resulting
+    /// vocabulary entry contains them next to each other.
+    private struct MergeBoundaries {
+        private static let asciiBits = 128 * 128
+        private static let unicodeBits = 1 << 16
+        private var words = [UInt64](repeating: 0, count: (asciiBits + unicodeBits) / 64)
+
+        init(vocabulary: [[UInt8]]) {
+            for key in vocabulary where key.count > 1 {
+                var previous: UInt32?
+                for scalar in String(decoding: key, as: UTF8.self).unicodeScalars {
+                    let current = scalar.value == 0x2581 ? 0x20 : scalar.value
+                    if let previous {
+                        let bit = Self.index(previous, current)
+                        words[bit >> 6] |= 1 << (bit & 63)
+                    }
+                    previous = current
+                }
+            }
+        }
+
+        // ASCII has an exact table. Other pairs share a fixed-size bitmap: a
+        // collision can only skip a possible cut, never permit an unsafe one.
+        private static func index(_ left: UInt32, _ right: UInt32) -> Int {
+            if left < 128 && right < 128 { return Int(left * 128 + right) }
+            let hash = (left &* 0x9E3779B1) ^ (right &* 0x85EBCA77)
+            return asciiBits + Int((hash ^ (hash >> 16)) & UInt32(unicodeBits - 1))
+        }
+
+        func contains(_ left: UInt32, _ right: UInt32) -> Bool {
+            let bit = Self.index(left == 0x2581 ? 0x20 : left, right == 0x2581 ? 0x20 : right)
+            return words[bit >> 6] & (1 << (bit & 63)) != 0
+        }
+    }
+
+    private func canSplit(_ utf8: UnsafeBufferPointer<UInt8>, at index: Int) -> Bool {
+        guard utf8[index] & 0xC0 != 0x80 else { return false }
+        var start = index - 1
+        while utf8[start] & 0xC0 == 0x80 { start -= 1 }
+        let left = decodeScalar(utf8, at: start).0
+        let right = decodeScalar(utf8, at: index).0
+        guard !mergeBoundaries.contains(left, right) else { return false }
+
+        func directlyEncoded(_ scalar: UInt32) -> Bool {
+            let normalized = scalar == 0x20 ? 0x2581 : scalar
+            if normalized < 0x10000 { return bmpIDs[Int(normalized)] >= 0 }
+            return astralIDs[normalized] != nil
+        }
+        return directlyEncoded(left) && directlyEncoded(right)
+    }
+
     // MARK: - Encoding
 
     /// Added tokens that llama.cpp keeps cutting out of the text with `parse_special` false: the EmbeddingGemma 2 GGUF
@@ -173,6 +226,42 @@ public final class GemmaTokenizer: Sendable {
     {
         output.reserveCapacity(output.count + text.utf8.count / 3 + 2)
         if addSpecialTokens { output.append(contentsOf: prefixIDs) }
+        encodeBody(text, parseSpecial: parseSpecial, into: &output, scratch: &scratch, stopAt: Int.max)
+        if addSpecialTokens { output.append(contentsOf: suffixIDs) }
+    }
+
+    public func encodeForEmbedding(_ text: String, limit: Int) -> BoundedTokenization {
+        encodeForEmbedding(text, limit: limit, truncate: false)
+    }
+
+    public func encodeForEmbedding(_ text: String, limit: Int, truncate: Bool) -> BoundedTokenization {
+        var scratch = BPEScratch()
+        return encodeForEmbedding(text, limit: limit, truncate: truncate, scratch: &scratch)
+    }
+
+    func encodeForEmbedding(_ text: String, limit: Int, truncate: Bool, scratch: inout BPEScratch) -> BoundedTokenization {
+        let framing = prefixIDs.count + suffixIDs.count
+        guard limit >= framing else { return .tooLong(atLeast: framing) }
+        let bodyLimit = limit - suffixIDs.count
+        var output = prefixIDs
+        output.reserveCapacity(min(limit, text.utf8.count / 3 + framing))
+        encodeBody(text, parseSpecial: true, into: &output, scratch: &scratch,
+                   stopAt: bodyLimit == Int.max ? Int.max : bodyLimit + 1)
+        let clipped = output.count > bodyLimit
+        if clipped {
+            guard truncate, limit > 0 else { return .tooLong(atLeast: limit + 1) }
+            output.removeLast()
+        }
+        output.append(contentsOf: suffixIDs)
+        return clipped ? .clipped(output) : .ids(output)
+    }
+
+    private func encodeBody(_ text: String, parseSpecial: Bool, into output: inout [Int32],
+                            scratch: inout BPEScratch, stopAt: Int)
+    {
+        // Start looking for a safe cut sooner when the caller will keep only a
+        // short prefix. Larger budgets amortize BPE across a wider chunk.
+        let minPieceBytes = max(64, min(stopAt, 1024)) * 4
         var text = text
         text.withUTF8 { utf8 in
             var pieceStart = 0
@@ -183,21 +272,30 @@ public final class GemmaTokenizer: Sendable {
                 {
                     if index > pieceStart {
                         encodePiece(UnsafeBufferPointer(rebasing: utf8[pieceStart..<index]), into: &output,
-                                    scratch: &scratch)
+                                    scratch: &scratch, stopAt: stopAt)
+                        if output.count == stopAt { return }
                     }
                     output.append(addedTokenIDs[tokenIndex])
+                    if output.count == stopAt { return }
                     index += length
                     pieceStart = index
                 } else {
+                    // Earlier positions have already been checked for added tokens,
+                    // so no added token can start before and extend across this cut.
+                    if stopAt != Int.max, index - pieceStart >= minPieceBytes, canSplit(utf8, at: index) {
+                        encodePiece(UnsafeBufferPointer(rebasing: utf8[pieceStart..<index]), into: &output,
+                                    scratch: &scratch, stopAt: stopAt)
+                        if output.count == stopAt { return }
+                        pieceStart = index
+                    }
                     index += 1
                 }
             }
             if utf8.count > pieceStart {
                 encodePiece(UnsafeBufferPointer(rebasing: utf8[pieceStart..<utf8.count]), into: &output,
-                            scratch: &scratch)
+                            scratch: &scratch, stopAt: stopAt)
             }
         }
-        if addSpecialTokens { output.append(contentsOf: suffixIDs) }
     }
 
     /// The number of tokens `encode` would return.
@@ -267,9 +365,17 @@ public final class GemmaTokenizer: Sendable {
 
     /// Normalizes (" " -> "▁"), splits into initial symbols and runs BPE on one piece.
     private func encodePiece(_ utf8: UnsafeBufferPointer<UInt8>, into output: inout [Int32],
-                             scratch: inout BPEScratch)
+                             scratch: inout BPEScratch, stopAt: Int)
     {
         scratch.reset()
+        // For small pieces avoid growing four separate arrays during a single
+        // encode. Long pieces can contain many multibyte scalars; size those on demand.
+        if utf8.count <= 256 {
+            scratch.ids.reserveCapacity(utf8.count)
+            scratch.previous.reserveCapacity(utf8.count)
+            scratch.next.reserveCapacity(utf8.count)
+            scratch.heap.reserveCapacity(utf8.count)
+        }
         var index = 0
         var pendingUnknown = false
         while index < utf8.count {
@@ -300,7 +406,7 @@ public final class GemmaTokenizer: Sendable {
             index += length
         }
         scratch.mergeAll(merges)
-        scratch.collect(into: &output)
+        scratch.collect(into: &output, stopAt: stopAt)
     }
 }
 
@@ -404,10 +510,10 @@ public struct BPEScratch: Sendable {
         }
     }
 
-    func collect(into output: inout [Int32]) {
+    func collect(into output: inout [Int32], stopAt: Int = Int.max) {
         guard !ids.isEmpty else { return }
         var index: Int32 = 0
-        while index < Int32(ids.count) {
+        while index < Int32(ids.count), output.count < stopAt {
             output.append(ids[Int(index)])
             index = next[Int(index)]
         }

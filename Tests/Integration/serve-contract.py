@@ -75,11 +75,17 @@ check("model object has OpenAI's fields", model.get("object") == "model" and isi
 sample = "hello world for the embedding contract" if pplx else "task: search result | query: hello"
 s, b = call("/v1/embeddings", {"input": sample})
 v = b["data"][0]["embedding"] if s == 200 else []
+if s == 200:
+    rate = b["usage"].pop("prompt_tokens_per_second", None)
+    check("single embedding reports positive prompt throughput", isinstance(rate, (int, float)) and rate > 0, rate)
 if pplx:
     check("single string -> 1024 unnormalized quantized values",
           len(v) == width and norm(v) > 1 and all(-128 <= x <= 127 and x == int(x) for x in v), s)
     for input_type in ("query", "document"):
         prompted_status, prompted = call("/v1/embeddings", {"input": sample, "input_type": input_type})
+        if prompted_status == 200:
+            rate = prompted["usage"].pop("prompt_tokens_per_second", None)
+            check("pplx reports positive prompt throughput", isinstance(rate, (int, float)) and rate > 0, rate)
         check(f"pplx accepts {input_type} without a prefix", prompted_status == 200 and prompted == b, prompted_status)
 else:
     check("single string -> 768 unit floats", len(v) == 768 and abs(norm(v) - 1) < 1e-3, s)
@@ -123,8 +129,8 @@ for name, payload in [("bad dimensions", {"input": "x", "dimensions": 1025 if pp
     check(f"{name} -> 400 OpenAI error", s == 400 and b.get("error", {}).get("type") == "invalid_request_error", b)
 
 too_long = "token " * (max_tokens + 10)
-s, b = call("/v1/embeddings", {"input": ["ok", too_long]})
-check(f"over {max_tokens} tokens -> 400, not truncated",
+s, b = call("/v1/embeddings", {"input": ["ok", too_long], "truncate": False})
+check(f"over {max_tokens} tokens with truncate=false -> 400",
       s == 400 and b["error"].get("code") == "context_length_exceeded" and str(max_tokens) in b["error"]["message"], b)
 def tokens(text):
     return call("/v1/embeddings", {"input": text})[1]["usage"]["prompt_tokens"]

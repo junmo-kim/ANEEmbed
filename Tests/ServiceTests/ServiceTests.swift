@@ -26,11 +26,26 @@ struct ServiceTests {
         }
     }
 
+    @Test(arguments: [ModelID.embeddingGemma2, .qwen3Embedding, .pplx])
+    func truncationPreservesModelFraming(model: ModelID) async throws {
+        var limits = ServiceLimits()
+        limits.maxTokens = 64
+        let tokenizer = ByteTokenizer(modelID: model)
+        let service = EmbeddingService(tokenizer: tokenizer, runtime: FakeRuntime.make(maxTokens: 64, modelID: model),
+                                       limits: limits, modelID: model)
+        let exact = String(repeating: "a", count: 64 - tokenizer.encode("").count)
+        let reference = try await service.embedTexts([exact], truncate: false)
+        let clipped = try await service.embedTexts([exact + "different suffix"], truncate: true)
+        #expect(reference.truncatedIndices.isEmpty && clipped.truncatedIndices == [0])
+        #expect(clipped.tokenCounts == [64] && clipped.vectors == reference.vectors)
+        #expect(service.tokenize(exact + "different suffix").count > 64)
+    }
+
     @Test func rejectsTextsOverTheLimitWithoutTruncating() async {
         let service = TestSupport.service(maxTokens: 512)
-        await #expect(throws: ServiceError.self) { try await service.embedTexts(["ok", String(repeating: "z", count: 600)]) }
+        await #expect(throws: ServiceError.self) { try await service.embedTexts(["ok", String(repeating: "z", count: 600)], truncate: false) }
         do {
-            _ = try await service.embedTexts([String(repeating: "z", count: 600)])
+            _ = try await service.embedTexts([String(repeating: "z", count: 600)], truncate: false)
         } catch {
             #expect(error.reason == "context_length_exceeded")
             #expect(error.httpStatus == 400)
@@ -69,7 +84,7 @@ struct ServiceTests {
         let huge = String(repeating: "z", count: 8 << 20)
         for inputType in [nil, InputType.query] {
             do {
-                _ = try await service.embedTexts(["ok", huge], inputType: inputType)
+                _ = try await service.embedTexts(["ok", huge], inputType: inputType, truncate: false)
                 Issue.record("an over-long text was embedded")
             } catch {
                 #expect(error.reason == "context_length_exceeded" && error.httpStatus == 400)
@@ -89,7 +104,7 @@ struct ServiceTests {
         #expect(try await service.embedTexts([String(repeating: "a", count: 510)]).tokenCounts == [512])
         for (bytes, message) in [(511, "has 513 tokens"), (512, "has 514 tokens"), (513, "has at least 513 tokens")] {
             do {
-                _ = try await service.embedTexts([String(repeating: "a", count: bytes)])
+                _ = try await service.embedTexts([String(repeating: "a", count: bytes)], truncate: false)
                 Issue.record("\(bytes) bytes were embedded")
             } catch {
                 #expect(error.reason == "context_length_exceeded" && error.message == "input[0] \(message); this model's maximum context length is 512 tokens")

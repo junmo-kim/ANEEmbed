@@ -170,7 +170,25 @@ public struct ByteTokenizer: TextTokenizer {
         return .ids(encode(text))
     }
 
+    public func encodeForEmbedding(_ text: String, limit: Int, truncate: Bool) -> BoundedTokenization {
+        guard truncate else { return encodeForEmbedding(text, limit: limit) }
+        let framing = prefixIDs.count + suffixIDs.count
+        let count = text.utf8.count + framing
+        guard count > limit else { return .ids(encode(text)) }
+        guard limit > 0, limit >= framing else { return .tooLong(atLeast: count) }
+        let prefix = text.utf8.prefix(limit - framing).map { Int32($0) + 3 }
+        return .clipped(prefixIDs + prefix + suffixIDs)
+    }
+
     public var maxBytesPerToken: Int? { 1 }
+    public var prefixIDs: [Int32] { modelID == .embeddingGemma2 ? [SpecialTokens.bos] : [] }
+    public var suffixIDs: [Int32] {
+        switch modelID {
+        case .embeddingGemma2: [SpecialTokens.eos]
+        case .qwen3Embedding: [151643]
+        default: []
+        }
+    }
 
     /// It has no added tokens, so `parseSpecial` changes nothing.
     public func encode(_ text: String, addSpecial: Bool, parseSpecial: Bool) -> [Int32] {

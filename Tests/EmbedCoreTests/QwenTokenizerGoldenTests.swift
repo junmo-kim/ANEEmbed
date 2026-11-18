@@ -28,6 +28,12 @@ struct QwenTokenizerGoldenTests {
                 || tokenizer.encode(record.text, addSpecial: false, parseSpecial: true) != record.ids {
                 idMismatches.append(record.name)
             }
+            let cap = max(1, record.ids.count / 2)
+            let expected: BoundedTokenization = record.ids.count > cap
+                ? .clipped(Array(record.ids.prefix(cap))) : .ids(record.ids)
+            if tokenizer.encodeForEmbedding(record.text, limit: cap, truncate: true) != expected {
+                idMismatches.append(record.name + " (bounded)")
+            }
             var pieces: [[UInt8]] = []
             tokenizer.forEachSplit(in: record.text) { pieces.append(Array($0.utf8)) }
             if pieces != record.pieces.map({ Array($0.utf8) }) {
@@ -58,6 +64,12 @@ struct QwenTokenizerGoldenTests {
         #expect(tokenizer.encode("hello world") == [14990, 1879, 151643])
         #expect(tokenizer.encode("hello world", addSpecial: false, parseSpecial: true) == [14990, 1879])
         #expect(tokenizer.encode("<|endoftext|>") == [151643, 151643])
+        let query = InputType.query.apply("한글 e\u{0301} <|endoftext|> fox", modelID: .qwen3Embedding)
+        let full = tokenizer.encode(query)
+        for cap in 1..<full.count {
+            #expect(tokenizer.encodeForEmbedding(query, limit: cap, truncate: true)
+                    == .clipped(Array(full.prefix(cap - 1)) + [151643]))
+        }
         #expect(tokenizer.encodeForEmbedding("", limit: 1) == .ids([151643]))
         #expect(tokenizer.encodeForEmbedding("", limit: 0) == .tooLong(atLeast: 1))
         #expect(tokenizer.encodeForEmbedding("<|endoftext|>", limit: 1) == .tooLong(atLeast: 2))
@@ -138,14 +150,16 @@ struct QwenTokenizerGoldenTests {
         let decomposed = String(repeating: "e\u{0301}", count: 43)
         let ids = tokenizer.encode(decomposed)
         #expect(ids.count > 1)
-        #expect(tokenizer.encodeForEmbedding(decomposed, limit: 1) == .ids(ids))
+        #expect(tokenizer.encodeForEmbedding(decomposed, limit: 1) == .tooLong(atLeast: 2))
+        #expect(tokenizer.encodeForEmbedding(decomposed, limit: ids.count) == .ids(ids))
         #expect(tokenizer.encodeForEmbedding("", limit: 0) == .ids([]))
 
         let text = "<|endoftext|>" + String(repeating: "x", count: 129) + "<tool_call>"
         let exact = tokenizer.encode(text)
         #expect(exact.count > 4)
         #expect(tokenizer.encodeForEmbedding(text, limit: 3) == .tooLong(atLeast: 4))
-        #expect(tokenizer.encodeForEmbedding(text, limit: 4) == .ids(exact))
+        #expect(tokenizer.encodeForEmbedding(text, limit: 4) == .tooLong(atLeast: 5))
+        #expect(tokenizer.encodeForEmbedding(text, limit: exact.count) == .ids(exact))
         #expect(tokenizer.encodeForEmbedding(text, limit: Int.max) == .ids(exact))
         #expect(tokenizer.encodeForEmbedding("<|endoftext|><tool_call>", limit: 1) == .tooLong(atLeast: 2))
     }

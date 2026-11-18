@@ -97,7 +97,7 @@ struct PPLXHardwareTests {
         let over = String(repeating: " x", count: 32769)
         #expect(service.tokenize(over).count == 32769)
         do {
-            _ = try await service.embedTexts([over])
+            _ = try await service.embedTexts([over], truncate: false)
             Issue.record("accepted 32,769 tokens")
         } catch {
             #expect(error.reason == "context_length_exceeded")

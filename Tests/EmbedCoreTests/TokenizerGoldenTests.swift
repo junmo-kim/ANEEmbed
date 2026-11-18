@@ -19,6 +19,34 @@ struct TokenizerGoldenTests {
         #expect(tokenizer.encode("hello world") == [2, 23391, 1902, 1])
     }
 
+    @Test(arguments: [
+        "The quick brown fox jumps over the lazy dog. An ordinary document follows. ",
+        "오늘 회의에서는 다음 주 일정을 정하고 고객 문의에 답변할 담당자를 확인했습니다 ",
+    ])
+    func longDocumentsClipAtSafeBoundaries(sentence: String) throws {
+        let tokenizer = try #require(RealTokenizer.shared)
+        let document = String(repeating: sentence, count: 1_048_576 / sentence.utf8.count + 1)
+        let full = tokenizer.encode(document)
+        for cap in [2, 64, 2048] {
+            var scratch = BPEScratch()
+            let expected = Array(full.prefix(cap - tokenizer.suffixIDs.count)) + tokenizer.suffixIDs
+            #expect(tokenizer.encodeForEmbedding(document, limit: cap, truncate: true, scratch: &scratch) == .clipped(expected))
+            #expect(scratch.ids.count < 4200)
+        }
+        #expect(tokenizer.encodeForEmbedding(document, limit: 64, truncate: false) == .tooLong(atLeast: 65))
+    }
+
+    @Test func boundedEncodingKeepsUnicodeFallbacksAndAddedTokensAcrossCuts() throws {
+        let tokenizer = try #require(RealTokenizer.shared)
+        let text = String(repeating: "한글𐐷e\u{301}▁문서 ", count: 650) + "<bos>"
+            + String(repeating: "질문과 답변을 확인합니다 ", count: 300)
+        let full = tokenizer.encode(text)
+        #expect(tokenizer.encodeForEmbedding(text, limit: full.count, truncate: false) == .ids(full))
+        let cap = full.count - 1
+        #expect(tokenizer.encodeForEmbedding(text, limit: cap, truncate: true)
+                == .clipped(Array(full.prefix(cap - 1)) + tokenizer.suffixIDs))
+    }
+
     @Test func matchesEveryGoldenText() throws {
         let tokenizer = try #require(RealTokenizer.shared)
         let lines = try Fixtures.data("tokenizer-golden.jsonl.xz").split(separator: UInt8(ascii: "\n"))

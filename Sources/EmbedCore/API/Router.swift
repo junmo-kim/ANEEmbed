@@ -113,12 +113,15 @@ public struct Router: Sendable {
             // The raw body (up to --max-body) is freed once parsed: only the decoded images stay while they are
             // embedded.
             let parsed = try EmbeddingsRequest.parse(request.takeBody(), limits: service.limits, modelID: modelID)
+            let timer = InputProcessingTimer()
             let result: EmbeddingResult
             switch parsed.input {
-            case .texts(let texts): result = try await service.embedTexts(texts, inputType: parsed.inputType)
+            case .texts(let texts): result = try await service.embedTexts(texts, inputType: parsed.inputType, truncate: parsed.truncate)
             case .images(let images): result = try await service.embedImages(images)
             }
-            return .json(200, raw: EmbeddingsResponse.body(result, request: parsed, model: modelName, modelID: modelID))
+            let rate = timer.tokensPerSecond(result.totalTokens)
+            return .json(200, raw: EmbeddingsResponse.body(result, request: parsed, model: modelName,
+                                                           modelID: modelID, promptTokensPerSecond: rate))
         } catch {
             return .openAIError(published(error, request))
         }
@@ -130,7 +133,7 @@ public struct Router: Sendable {
             // The raw body is freed once parsed, as for /v1/embeddings.
             let parsed = try TokenizeRequest.parse(request.takeBody())
             let tokenizer = service.tokenizer
-            let body = try await service.withTokenizerLane { () throws(ServiceError) -> Data in
+            let body = try await service.withTokenizerLane(isShort: service.isShortTokenizerInput(bytes: parsed.content.utf8.count)) { () throws(ServiceError) -> Data in
                 let ids = tokenizer.encode(parsed.content, addSpecial: parsed.addSpecial, parseSpecial: parsed.parseSpecial)
                 return TokenizerResponse.tokens(ids, pieces: parsed.withPieces ? tokenizer : nil)
             }
@@ -145,7 +148,7 @@ public struct Router: Sendable {
             let service = try state.service()
             let ids = try DetokenizeRequest.parse(request.takeBody())
             let tokenizer = service.tokenizer
-            let content = try await service.withTokenizerLane { () throws(ServiceError) -> String in
+            let content = try await service.withTokenizerLane(isShort: ids.count <= service.limits.shortTokens) { () throws(ServiceError) -> String in
                 try TokenizerResponse.content(ids, tokenizer: tokenizer)
             }
             return .json(200, ["content": .string(content)])
@@ -198,7 +201,13 @@ public struct Router: Sendable {
                     throw ServiceError.badRequest("json_required", "\(tool) takes its arguments as a JSON body")
                 }
             }
-            for (name, value) in request.query where name != "format" { arguments[name] = .string(value) }
+            for (name, value) in request.query where name != "format" {
+                if name == "truncate", let flag = Bool(value) {
+                    arguments[name] = .bool(flag)
+                } else {
+                    arguments[name] = .string(value)
+                }
+            }
             let service = try state.service()
             let output = try await Tools.call(tool, arguments: arguments, context: ToolContext(service: service, allowPaths: false))
             return reply(200, output)
@@ -213,5 +222,17 @@ extension HTTPResponse {
         var copy = self
         copy.status = status
         return copy
+    }
+}
+
+/// Measures a single request with a monotonic clock, before response serialization.
+private struct InputProcessingTimer {
+    private let start = ContinuousClock.now
+
+    func tokensPerSecond(_ inputTokens: Int) -> Double? {
+        let elapsed = start.duration(to: .now).components
+        let seconds = Double(elapsed.seconds) + Double(elapsed.attoseconds) / 1e18
+        guard inputTokens > 0, seconds > 0 else { return nil }
+        return Double(inputTokens) / seconds
     }
 }

@@ -24,9 +24,11 @@ public struct EmbeddingResult: Sendable, Equatable {
     public var vectors: [[Float]]
     /// Per input: tokens the model saw (images: soft tokens + 4).
     public var tokenCounts: [Int]
+    public var truncatedIndices: [Int]
     public var totalTokens: Int { tokenCounts.reduce(0, +) }
 
-    public init(vectors: [[Float]], tokenCounts: [Int]) {
+    public init(vectors: [[Float]], tokenCounts: [Int], truncatedIndices: [Int] = []) {
+        self.truncatedIndices = truncatedIndices
         self.vectors = vectors
         self.tokenCounts = tokenCounts
     }
@@ -41,7 +43,10 @@ public final class EmbeddingService: Sendable {
     private let queryLane: AsyncSemaphore
     private let imageLane: AsyncSemaphore
     private let longLane: AsyncSemaphore
-    private let tokenizerLane: AsyncSemaphore
+    private let shortTokenizerLane: AsyncSemaphore
+    private let longTokenizerLane: AsyncSemaphore
+    private let rawTokenizerLane: AsyncSemaphore
+    private let longRawTokenizerLane: AsyncSemaphore
 
     public init(tokenizer: any TextTokenizer, runtime: any EmbeddingRuntime, limits: ServiceLimits = ServiceLimits(),
                 modelName: String = "embeddinggemma-2", modelID: ModelID = .embeddingGemma2)
@@ -54,22 +59,34 @@ public final class EmbeddingService: Sendable {
         queryLane = AsyncSemaphore(max(1, limits.queryConcurrency))
         imageLane = AsyncSemaphore(max(1, limits.imageConcurrency))
         longLane = AsyncSemaphore(max(1, limits.longConcurrency))
-        tokenizerLane = AsyncSemaphore(max(1, limits.longConcurrency))
+        shortTokenizerLane = AsyncSemaphore(max(1, limits.queryConcurrency))
+        longTokenizerLane = AsyncSemaphore(max(1, limits.longConcurrency))
+        rawTokenizerLane = AsyncSemaphore(max(1, limits.longConcurrency))
+        longRawTokenizerLane = AsyncSemaphore(max(2, limits.longConcurrency) - 1)
     }
 
-    /// Runs the work of `POST /tokenize` and `/detokenize` at most `longConcurrency` at a time: tokenizing a 1 MiB text
-    /// takes 1.2–1.4 s end to end over HTTP on an M4, with the process peaking at 124 MB, so many such requests must not run at once.
-    public func withTokenizerLane<T: Sendable>(_ body: @escaping @Sendable () throws(ServiceError) -> T)
+    /// Raw tokenization and detokenization share a cap. Reserve one slot for
+    /// small requests when the configured cap allows more than one worker.
+    public func withTokenizerLane<T: Sendable>(isShort: Bool = false, _ body: @escaping @Sendable () throws(ServiceError) -> T)
         async throws(ServiceError) -> T
     {
         do {
-            return try await tokenizerLane.withPermit { try body() }
+            let run: @Sendable () async throws -> T = { [rawTokenizerLane] in
+                try await rawTokenizerLane.withPermit {
+                    try Task.checkCancellation()
+                    return try body()
+                }
+            }
+            if isShort || limits.longConcurrency <= 1 { return try await run() }
+            return try await longRawTokenizerLane.withPermit(run)
         } catch let error as ServiceError {
             throw error
         } catch {
-            throw ServiceError(.internal, "internal_error", "\(error)")
+            throw Self.map(error)
         }
     }
+
+    func isShortTokenizerInput(bytes: Int) -> Bool { bytes / 4 <= limits.shortTokens }
 
     public var maxTokens: Int { min(limits.maxTokens, runtime.info.maxTokens) }
     public var maxImageTokens: Int { modelID.supportsImages ? runtime.info.maxImageTokens : 0 }
@@ -81,16 +98,16 @@ public final class EmbeddingService: Sendable {
 
     // MARK: Texts
 
-    public func embedTexts(_ texts: [String], inputType: InputType? = nil) async throws(ServiceError) -> EmbeddingResult {
+    public func embedTexts(_ texts: [String], inputType: InputType? = nil, truncate: Bool = true) async throws(ServiceError) -> EmbeddingResult {
         guard !texts.isEmpty else { throw .badRequest("empty_input", "input must not be empty", param: "input") }
         guard texts.count <= limits.maxInputs else {
             throw .badRequest("too_many_inputs", "at most \(limits.maxInputs) inputs per request", param: "input")
         }
-        return try await embedTextBatch(texts, inputType: inputType)
+        return try await embedTextBatch(texts, inputType: inputType, truncate: truncate)
     }
 
     // A similarity request has two distinct operands, so it can validate them together without a text-list limit.
-    func embedTextBatch(_ texts: [String], inputType: InputType? = nil) async throws(ServiceError) -> EmbeddingResult {
+    func embedTextBatch(_ texts: [String], inputType: InputType? = nil, truncate: Bool = true) async throws(ServiceError) -> EmbeddingResult {
         let limit = maxTokens
         func tooLong(_ index: Int, _ tokens: String) -> ServiceError {
             ServiceError(.invalidInput, "context_length_exceeded",
@@ -98,38 +115,43 @@ public final class EmbeddingService: Sendable {
                          param: "input",
                          hint: limit < runtime.info.maxTokens ? "raise --max-tokens (up to \(runtime.info.maxTokens))" : nil)
         }
-        var tokenized: [[Int32]]
-        switch modelID {
-        case .embeddingGemma2:
-            // Gemma can reject from the byte count before encoding any input.
-            if let bytesPerToken = tokenizer.maxBytesPerToken {
-                let prefixBytes = inputType?.prefix.utf8.count ?? 0
-                if let over = texts.firstIndex(where: { $0.utf8.count + prefixBytes > limit * bytesPerToken }) {
-                    let bytes = texts[over].utf8.count + prefixBytes
-                    throw tooLong(over, "at least \((bytes + bytesPerToken - 1) / bytesPerToken)")
+        if !truncate, modelID == .embeddingGemma2, let bytesPerToken = tokenizer.maxBytesPerToken {
+            let prefixBytes = inputType?.prefix.utf8.count ?? 0
+            if let over = texts.firstIndex(where: { $0.utf8.count + prefixBytes > limit * bytesPerToken }) {
+                let bytes = texts[over].utf8.count + prefixBytes
+                throw tooLong(over, "at least \((bytes + bytesPerToken - 1) / bytesPerToken)")
+            }
+        }
+        var tokenized: [[Int32]] = []
+        var truncatedIndices: [Int] = []
+        tokenized.reserveCapacity(texts.count)
+        for (index, text) in texts.enumerated() {
+            let prepared = inputType?.apply(text, modelID: modelID) ?? text
+            // Choose a lane before BPE. The byte threshold is a scheduling heuristic,
+            // independent of the actual token count used for inference routing.
+            let lane = isShortTokenizerInput(bytes: prepared.utf8.count) ? shortTokenizerLane : longTokenizerLane
+            let encoded: BoundedTokenization
+            do {
+                encoded = try await lane.withPermit { [tokenizer] in
+                    try Task.checkCancellation()
+                    return tokenizer.encodeForEmbedding(prepared, limit: limit, truncate: truncate)
                 }
+            } catch {
+                throw Self.map(error)
             }
-            tokenized = texts.map { tokenize($0, inputType: inputType) }
-            if let over = tokenized.firstIndex(where: { $0.count > limit }) {
-                throw tooLong(over, "\(tokenized[over].count)")
+            let ids: [Int32]
+            switch encoded {
+            case .ids(let tokens): ids = tokens
+            case .clipped(let tokens):
+                ids = tokens
+                truncatedIndices.append(index)
+            case .tooLong(let count): throw tooLong(index, "at least \(count)")
             }
-        case .pplx, .qwen3Embedding:
-            tokenized = []
-            tokenized.reserveCapacity(texts.count)
-            for (index, text) in texts.enumerated() {
-                let prepared = inputType?.apply(text, modelID: modelID) ?? text
-                switch tokenizer.encodeForEmbedding(prepared, limit: limit) {
-                case .tooLong(let atLeast):
-                    throw tooLong(index, "at least \(atLeast)")
-                case .ids(let ids):
-                    guard !ids.isEmpty else {
-                        throw ServiceError(.invalidInput, "empty_sequence", "input[\(index)] has no tokens",
-                                           param: "input", hint: "pass text that yields at least one token")
-                    }
-                    guard ids.count <= limit else { throw tooLong(index, "\(ids.count)") }
-                    tokenized.append(ids)
-                }
+            guard !ids.isEmpty else {
+                throw ServiceError(.invalidInput, "empty_sequence", "input[\(index)] has no tokens", param: "input")
             }
+            guard ids.count <= limit else { throw tooLong(index, "\(ids.count)") }
+            tokenized.append(ids)
         }
         let short = tokenized.indices.filter { tokenized[$0].count <= limits.shortTokens }
         let long = tokenized.indices.filter { tokenized[$0].count > limits.shortTokens }
@@ -158,7 +180,7 @@ public final class EmbeddingService: Sendable {
         } catch {
             throw Self.map(error)
         }
-        return EmbeddingResult(vectors: vectors, tokenCounts: tokenized.map(\.count))
+        return EmbeddingResult(vectors: vectors, tokenCounts: tokenized.map(\.count), truncatedIndices: truncatedIndices)
     }
 
     // MARK: Images

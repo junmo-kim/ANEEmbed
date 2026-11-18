@@ -50,9 +50,10 @@ public protocol EmbeddingRuntime: Sendable {
     func warm() async throws
 }
 
-/// A successful encoding, or a safe lower bound that already exceeds the request's cap.
+/// A complete or clipped encoding, or a safe lower bound that exceeds the request's cap.
 public enum BoundedTokenization: Sendable, Equatable {
     case ids([Int32])
+    case clipped([Int32])
     case tooLong(atLeast: Int)
 }
 
@@ -60,6 +61,9 @@ public enum BoundedTokenization: Sendable, Equatable {
 public protocol TextTokenizer: Sendable {
     func encode(_ text: String) -> [Int32]
     func encodeForEmbedding(_ text: String, limit: Int) -> BoundedTokenization
+    func encodeForEmbedding(_ text: String, limit: Int, truncate: Bool) -> BoundedTokenization
+    var prefixIDs: [Int32] { get }
+    var suffixIDs: [Int32] { get }
     func tokenLabel(_ id: Int32) -> String
     /// The most UTF-8 bytes of input text that one token can stand for; nil when there is no such bound. With it, a
     /// text of more than `limit × maxBytesPerToken` bytes is known to have more than `limit` tokens without
@@ -74,10 +78,20 @@ public protocol TextTokenizer: Sendable {
 }
 
 extension TextTokenizer {
+    public var prefixIDs: [Int32] { [] }
+    public var suffixIDs: [Int32] { [] }
     public var maxBytesPerToken: Int? { nil }
 
     public func encodeForEmbedding(_ text: String, limit: Int) -> BoundedTokenization {
         .ids(encode(text))
+    }
+
+    public func encodeForEmbedding(_ text: String, limit: Int, truncate: Bool) -> BoundedTokenization {
+        guard truncate else { return encodeForEmbedding(text, limit: limit) }
+        let ids = encode(text)
+        guard ids.count > limit else { return .ids(ids) }
+        guard limit > 0, prefixIDs.count + suffixIDs.count <= limit else { return .tooLong(atLeast: ids.count) }
+        return .clipped(Array(ids.prefix(limit - suffixIDs.count)) + suffixIDs)
     }
 
     public func tokenLabel(_ id: Int32) -> String {

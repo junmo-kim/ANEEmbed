@@ -49,8 +49,8 @@ def verify(args):
         with client.open(req, timeout=args.timeout) as response:
             return json.load(response)
 
-    def embed(case, dimensions=DIM):
-        payload = {"model": MODEL, "input": case["text"], "dimensions": dimensions}
+    def embed(case, dimensions=DIM, *, truncate=True):
+        payload = {"model": MODEL, "input": case["text"], "dimensions": dimensions, "truncate": truncate}
         if case["id"] == "query":
             prefix = f"Instruct: {INSTRUCTION}\nQuery:"
             if not case["text"].startswith(prefix):
@@ -79,7 +79,7 @@ def verify(args):
                     raise ValueError(f"{case['id']}: token mismatch")
                 if count > args.cap:
                     try:
-                        embed(case)
+                        embed(case, truncate=False)
                     except urllib.error.HTTPError as error:
                         with error:
                             detail = json.load(error)

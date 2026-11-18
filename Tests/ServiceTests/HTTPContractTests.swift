@@ -108,9 +108,23 @@ struct HTTPContractTests {
         #expect(raw.status == 400)
     }
 
-    @Test func overTheLimitIsRejectedNotTruncated() async {
+    @Test func defaultTruncationMarksOnlyClippedRowsAndCountsUsedTokens() async {
+        let exact = String(repeating: "y", count: 2046)
+        let (status, body) = await call("POST", "/v1/embeddings", ["input": [.string(exact), .string(exact + "z")]])
+        #expect(status == 200)
+        #expect(body["data"]?.arrayValue?[0]["truncated"] == nil)
+        #expect(body["data"]?.arrayValue?[1]["truncated"] == true)
+        #expect(body["usage"]?["prompt_tokens"]?.intValue == 4096)
+        #expect(embedding(body) == embedding(body, at: 1))
+        for value: JSONValue in [.null, "true", 1] {
+            let (status, error) = await call("POST", "/v1/embeddings", ["input": "short", "truncate": value])
+            #expect(status == 400 && error["error"]?["code"] == "invalid_truncate")
+        }
+    }
+
+    @Test func overTheLimitIsRejectedInStrictMode() async {
         let tooLong = String(repeating: "y", count: 2100)
-        let (status, body) = await call("POST", "/v1/embeddings", ["input": ["ok", .string(tooLong)]])
+        let (status, body) = await call("POST", "/v1/embeddings", ["input": ["ok", .string(tooLong)], "truncate": false])
         #expect(status == 400)
         #expect(body["error"]?["code"] == "context_length_exceeded")
         #expect(body["error"]?["message"]?.stringValue?.contains("2048") == true)
@@ -217,6 +231,31 @@ struct HTTPContractTests {
         #expect(await call("POST", "/detokenize", ["tokens": []]) == (200, ["content": ""]))
     }
 
+    @Test func smallRawTokenizerRequestsUseReservedSlot() async throws {
+        var limits = ServiceLimits()
+        limits.longConcurrency = 2
+        let service = EmbeddingService(tokenizer: ByteTokenizer(), runtime: FakeRuntime.make(), limits: limits)
+        let router = Router(state: ServerState(.ready(service)), modelName: service.modelName)
+        let (entered, ready) = AsyncStream<Void>.makeStream()
+        let release = DispatchSemaphore(value: 0)
+        let large = Task {
+            try await service.withTokenizerLane {
+                ready.yield(())
+                ready.finish()
+                return release.wait(timeout: .now() + 5) == .success
+            }
+        }
+        for await _ in entered { break }
+
+        async let tokens = call("POST", "/tokenize", ["content": "hi"], router: router)
+        async let text = call("POST", "/detokenize", ["tokens": [107, 108]], router: router)
+        let responses = await (tokens, text)
+        release.signal()
+        #expect(try await large.value)
+        #expect(responses.0.0 == 200)
+        #expect(responses.1.0 == 200)
+    }
+
     @Test func tokenizerAPIErrors() async {
         func failure(_ path: String, _ body: JSONValue?) async -> (Int, JSONValue?, JSONValue?) {
             let (status, response) = await call("POST", path, body)
@@ -270,6 +309,16 @@ struct ToolEndpointTests {
         let yaml = await query("/embed_text", body: Data("hello".utf8))
         #expect(String(decoding: yaml.body, as: UTF8.self).hasPrefix("model: embeddinggemma-2\n"))
         #expect(yaml.header("Content-Type")?.hasPrefix("application/yaml") == true)
+    }
+
+    @Test func rawTextTruncationFlag() async throws {
+        let text = Data(repeating: 97, count: 2050)
+        let strict = await query("/embed_text?format=json&truncate=false", body: text)
+        #expect(strict.status == 400)
+        #expect(try JSONValue.parse(strict.body)["reason"] == "context_length_exceeded")
+        let clipped = await query("/embed_text?format=json&truncate=true", body: text)
+        #expect(clipped.status == 200)
+        #expect(try JSONValue.parse(clipped.body)["data"]?.arrayValue?[0]["truncated"] == true)
     }
 
     @Test func embedImageWithRawBytes() async throws {
