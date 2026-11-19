@@ -6,7 +6,7 @@ import CoreAI
 #endif
 
 /// A specialized compiled model threw the observed Core AI nilError while loading this entry.
-public struct CompiledFunctionLoadFailure: Error, Sendable, CustomStringConvertible {
+public struct CompiledFunctionLoadFailure: Error, Sendable, Hashable, Codable, CustomStringConvertible {
   public let asset: String
   public let function: String
 

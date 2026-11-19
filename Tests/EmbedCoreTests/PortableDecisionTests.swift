@@ -6,7 +6,7 @@ import Testing
 @testable import anerun
 
 struct PortableDecisionTests {
-    @Test(arguments: ["local", "remote", "retry", "sourceHash", "partial", "missingEntry", "nativeResource", "wrongChip", "fallback", "fallbackRemote", "sourceLoadFails", "compiledRetryFails", "fallbackMismatch"])
+    @Test(arguments: ["local", "remote", "retry", "sourceHash", "partial", "missingEntry", "nativeResource", "wrongChip", "fallback", "fallbackRemote", "sourceLoadFails", "compiledRetryFails", "fallbackMismatch", "secondEntry", "sameEntry", "badReport"])
     func verifiedActivation(_ scenario: String) async throws {
         let fm = FileManager.default
         let root = fm.temporaryDirectory.appendingPathComponent(UUID().uuidString)
@@ -57,19 +57,31 @@ struct PortableDecisionTests {
             try PropertyListSerialization.data(fromPropertyList: plist, format: .binary, options: 0).write(to: output.appendingPathComponent("manifest.plist"))
             try ir.write(to: output.appendingPathComponent("resources.bin"))
         }
-        let needsRecovery = ["fallback", "fallbackRemote", "sourceLoadFails", "compiledRetryFails", "fallbackMismatch"].contains(scenario)
+        let needsRecovery = ["fallback", "fallbackRemote", "sourceLoadFails", "compiledRetryFails", "fallbackMismatch", "secondEntry", "sameEntry", "badReport"].contains(scenario)
         var sourceLoads = 0
         var aotRetries = 0
         let recovery = PortableRecovery(cacheRoot: { cache }, warmSource: { url, name in
             sourceLoads += 1
             #expect(url.lastPathComponent == "stage.aimodel")
             #expect((try? Data(contentsOf: url.appendingPathComponent("main.mlirb"))) == ir)
-            #expect(name == "entry_b")
+            #expect(name == (sourceLoads == 2 ? "entry_a" : "entry_b"))
             if scenario == "sourceLoadFails" { throw PortableDecision.invalid("source load failed") }
         }, retryCompiled: { directory in
             aotRetries += 1
             #expect(try store.resolveDirectory() == old)
             #expect(directory == prepared)
+            if (scenario == "secondEntry" && aotRetries == 1) || scenario == "badReport" {
+                // A real child exercises exit status, report transport and native stdout noise together.
+                let helper = root.appendingPathComponent("fixture-child")
+                let report = scenario == "badReport" ? "truncated" : #"{"asset":"stage.h16g.aimodelc","function":"entry_a"}"#
+                try ("#!/bin/sh\nprintf 'native diagnostic\\n'\nprintf '%s' '" + report + "' > \"$3\"\nexit 75\n")
+                    .write(to: helper, atomically: true, encoding: .utf8)
+                try fm.setAttributes([.posixPermissions: 0o700], ofItemAtPath: helper.path)
+                try await PortableRecovery.child(["_portable-prepare-compiled", directory.path], executable: helper)
+            }
+            if scenario == "sameEntry" {
+                throw CompiledFunctionLoadFailure(asset: "stage.h16g.aimodelc", function: "entry_b")
+            }
             if scenario == "compiledRetryFails" { throw PortableDecision.invalid("compiled retry failed") }
         })
         let prepare: (URL) async throws -> Void = { directory in
@@ -104,7 +116,7 @@ struct PortableDecisionTests {
                 result = try await DecisionInstall.install(source, model: model, store: store,
                     architecture: scenario == "wrongChip" ? "other" : "h16g", compile: compiler, nativeAudit: audit, recovery: recovery, prepare: prepare)
             }
-            #expect(["remote", "local", "retry", "fallback", "fallbackRemote"].contains(scenario))
+            #expect(["remote", "local", "retry", "fallback", "fallbackRemote", "secondEntry"].contains(scenario))
             #expect(try store.resolveDirectory() == result)
             #expect(prepared == result)
             #expect(!fm.fileExists(atPath: result.appendingPathComponent("stage.aimodel").path))
@@ -127,7 +139,7 @@ struct PortableDecisionTests {
                     prepare: { _ in throw CompiledFunctionLoadFailure(asset: "stage.h16g.aimodelc", function: "entry_b") })
                 #expect(reused == result)
             }
-            #expect(sourceLoads == (needsRecovery ? 1 : 0))
+            #expect(sourceLoads == (scenario == "secondEntry" ? 2 : needsRecovery ? 1 : 0))
             #expect(aotRetries == sourceLoads)
             if scenario == "fallbackRemote" || scenario == "remote" {
                 for path in files.keys {
@@ -137,7 +149,7 @@ struct PortableDecisionTests {
             }
             #expect(calls == (scenario == "retry" ? 2 : 1))
         } catch {
-            let expected = ["sourceHash": "invalid_portable_bundle", "missingEntry": "invalid_portable_bundle",
+            let expected = ["sameEntry": "prepare_failed", "badReport": "prepare_failed", "sourceHash": "invalid_portable_bundle", "missingEntry": "invalid_portable_bundle",
                             "sourceLoadFails": "invalid_portable_bundle", "compiledRetryFails": "invalid_portable_bundle",
                             "fallbackMismatch": "invalid_portable_bundle", "partial": "partial_ane_placement", "nativeResource": "native_identity_failed", "wrongChip": "incompatible_architecture"]
             if scenario == "partial" { #expect(calls == 8) }
@@ -145,8 +157,8 @@ struct PortableDecisionTests {
             #expect(error.reason == expected[scenario])
             #expect(try store.resolveDirectory() == old)
             #expect((prepared != nil) == (scenario == "nativeResource" || needsRecovery))
-            #expect(sourceLoads == (["sourceLoadFails", "compiledRetryFails"].contains(scenario) ? 1 : 0))
-            #expect(aotRetries == (scenario == "compiledRetryFails" ? 1 : 0))
+            #expect(sourceLoads == (["sourceLoadFails", "compiledRetryFails", "sameEntry", "badReport"].contains(scenario) ? 1 : 0))
+            #expect(aotRetries == (["compiledRetryFails", "sameEntry", "badReport"].contains(scenario) ? 1 : 0))
         }
     }
 }
