@@ -5,13 +5,12 @@ import Foundation
 
 @available(macOS 27.0, *)
 final class Session {
-  let manifest: Manifest, builder: PromptBuilder, backbone: Backbone, mixer: Mixer?,
+  let manifest: Manifest, builder: PromptBuilder, backbone: Backbone,
     readout: Linear?, vision: Vision?
   let temperature: Double
   init(_ root: URL) throws {
     guard root.isFileURL else { throw DecisionError("Expected a resolved local bundle URL") }
-    let m = try root.decode("model.json", as: Manifest.self)
-    try m.validate()
+    let m = try Manifest.validated(at: root)
     let weights =
       m.embeddingLookup == nil
       ? try Weights(root.appendingPathComponent("model.safetensors")) : nil
@@ -25,16 +24,13 @@ final class Session {
         throw DecisionError("Invalid Elephant slot table")
       }
       codes = labels
-      mixer = nil
       temperature = 1
-      vision = try Vision(nil, elephant: true)
+      vision = Vision(elephant: true)
       readout = nil
     } else if m.valen {
-      guard let weights else { throw DecisionError("Missing Valen weights") }
-      mixer = try Mixer(weights, m.hidden)
       readout = nil
       temperature = 1
-      vision = m.visionAsset == nil ? nil : try Vision(weights)
+      vision = Vision(elephant: false)
     } else {
       struct Config: Decodable {
         let codes: [String]
@@ -55,7 +51,6 @@ final class Session {
       }
       codes = c.codes
       temperature = c.temperature
-      mixer = nil
       vision = nil
       readout =
         m.decisionHead != nil
@@ -70,16 +65,26 @@ final class Session {
   func decide(_ request: DecisionInput) async throws -> DecisionResponse {
     backbone.trace.removeAll(keepingCapacity: true)
     let timer = InputProcessingTimer()
+    var phases = [String: Double]()
+    let timed = manifest.valen && backbone.tracing
+    var last = timed ? ProcessInfo.processInfo.systemUptime : 0
+    func mark(_ phase: String) {
+      guard timed else { return }
+      let now = ProcessInfo.processInfo.systemUptime
+      phases[phase, default: 0] += now - last
+      last = now
+    }
     let visual: VisualFeatures?
     if let image = request.image {
       guard let vision else {
         throw DecisionError("This model bundle does not support images", input: true)
       }
-      visual = try await vision.encode(image, using: backbone)
+      visual = try await backbone.encodeImage(image, with: vision)
     } else {
       visual = nil
     }
-    let visualTokens = visual?.rows.count ?? 0
+    mark("vision")
+    let visualTokens = visual?.count ?? 0
     let prepared: PreparedDecision
     if manifest.kDecision {
       prepared = try KDecisionPrompt.build(
@@ -100,26 +105,36 @@ final class Session {
     } else {
       prepared = try builder.build(request, visualTokens: visualTokens)
     }
+    mark("prompt")
     let prompts = prepared.prompts
     var answers = [String: DecisionAnswer]()
     for p in prompts {
-      let rows = try await backbone.run(p, vision: visual)
-      for (index, b) in p.branches.enumerated() {
+      let chunks = try await backbone.run(p, vision: visual)
+      mark("backbone")
+      func row(_ index: Int) -> [Float] {
+        chunks[index / manifest.width].read { data, strides in
+          (0..<manifest.hidden).map { Float(data[$0 * strides[1] + index % manifest.width * strides[3]]) }
+        }
+      }
+      for b in p.branches {
+        if manifest.valen {
+          answers[b.question.name] = try await valenAnswer(chunks, branch: b)
+          mark("readout")
+          continue
+        }
         if let head = manifest.decisionHead {
           if manifest.elephant {
             answers[b.question.name] = try await elephantDeviceAnswer(
-              hidden: rows[0], branch: b, head: head)
+              hidden: row(p.ids.count - 1), branch: b, head: head)
             continue
           }
           answers[b.question.name] = try await deviceAnswer(
-            hidden: rows[0], branch: b, head: head)
+            hidden: row(p.ids.count - 1), branch: b, head: head)
           continue
         }
         let logits: [Float]
-        if let mixer {
-          logits = mixer.scores(rows, b)
-        } else if let readout {
-          let projected = readout(rows[manifest.kDecision ? index : 0])
+        if let readout {
+          let projected = readout(row(manifest.kDecision ? b.roles[0].lowerBound : p.ids.count - 1))
           // K-Decision predicates use the vocabulary symbols Y and N.
           logits =
             manifest.kDecision && b.question.kind == .noul
@@ -131,9 +146,10 @@ final class Session {
       }
     }
     if backbone.tracing {
-      let trace: [String: Any] = [
+      var trace: [String: Any] = [
         "device_calls": backbone.trace, "tokens": prepared.prompts.map { $0.ids.count },
       ]
+      if timed { trace["seconds"] = phases }
       if let json = try? JSONSerialization.data(withJSONObject: trace) {
         FileHandle.standardError.write(json + Data([10]))
       }
@@ -177,6 +193,11 @@ final class Session {
     let f = try await backbone.function("readout", in: head.asset)
     var out = try await f.run(inputs: ["hidden": input, "mask": mask])
     let output = try out.tensor("probabilities")
+    return try await formatDeviceAnswer(output, branch: branch)
+  }
+
+  func formatDeviceAnswer(_ output: NDArray, branch: Branch) async throws -> DecisionAnswer {
+    let count = branch.candidates.count
     guard output.shape == [1, 256, 1, 1] else { throw DecisionError("Invalid probability shape") }
     let values = output.read { p, strides in (0..<256).map { Double(p[$0 * strides[1]]) } }
     guard values.allSatisfy({ $0.isFinite && (0...1).contains($0) }),
@@ -313,6 +334,10 @@ public actor DecisionEngine {
   public init(bundleURL: URL, idleTimeout: Duration? = nil) {
     self.bundleURL = bundleURL
     self.idleTimeout = idleTimeout
+  }
+  /// Check the descriptor without creating a session or opening model assets.
+  public static func validateManifest(at directory: URL) throws {
+    _ = try Manifest.validated(at: directory)
   }
   public var isLoaded: Bool { session != nil }
   private func acquire() async {

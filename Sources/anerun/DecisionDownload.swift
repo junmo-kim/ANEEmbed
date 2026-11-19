@@ -49,7 +49,7 @@ enum DecisionDownload {
     static func installInventory(revision: String, pin: String?, model: ModelID, architecture: String, store: ModelStore,
                                  fetch: (String, URL, Int?) async throws(ServiceError) -> Data,
                                  compile: PortableDecision.Compiler = PortableDecision.compile,
-                                 nativeAudit: PortableDecision.NativeAudit = PortableDecision.auditPrepared,
+                                 nativeAudit: PortableDecision.NativeAudit = PortableDecision.verifyForActivation,
                         recovery: PortableRecovery = .live,
                                  prepare: (URL) async throws -> Void) async throws(ServiceError) -> URL {
         let target = try store.directory(for: revision)
@@ -97,7 +97,8 @@ enum DecisionDownload {
                     throw ServiceError(.unavailable, "prepare_failed", "cannot prepare packed model: \(error)")
                 }
                 if package.portable {
-                    do { try nativeAudit(directory) }
+                    do { try await nativeAudit(directory) }
+                    catch let error as ServiceError where error.reason == "prepare_failed" { throw error }
                     catch { throw ServiceError(.invalidInput, "native_identity_failed", "native cache audit: \(error)") }
                 }
             })

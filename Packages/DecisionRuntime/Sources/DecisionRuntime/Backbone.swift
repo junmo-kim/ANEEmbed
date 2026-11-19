@@ -40,17 +40,19 @@ final class Backbone {
   let rotary: [String: [UInt16]]
   let tracing = ProcessInfo.processInfo.environment["ANERUN_TRACE_DECISION"] == "1"
   var trace = [String: Int]()
+  private var initialStates = [[Int]: NDArray]()
   var models = [String: AIModel](), functions = [String: InferenceFunction]()
   init(_ root: URL, _ m: Manifest, _ w: Weights?) throws {
     var tables = [String: [UInt16]]()
-    if m.elephant {
-      for (kind, width) in [("text", 32), ("vision", 18)] {
+    if m.elephant || m.valen {
+      for (kind, width) in [("text", 32), ("vision", m.valen ? 16 : 18)] {
         guard let name = m.rotaryTables?[kind], name == URL(fileURLWithPath: name).lastPathComponent
         else {
           throw DecisionError("Missing rotary constant table")
         }
         let data = try Data(contentsOf: root.bundleChild(name))
-        guard data.count == 2048 * width * 4 else {
+        let limit = m.valen ? m.context : 2048
+        guard data.count == limit * width * 4 else {
           throw DecisionError("Invalid rotary table size")
         }
         tables[kind] = data.withUnsafeBytes { Array($0.bindMemory(to: UInt16.self)) }
@@ -59,7 +61,7 @@ final class Backbone {
     rotary = tables
     self.root = root
     manifest = m
-    if m.elephant {
+    if m.elephant || m.valen {
       positionsTable = nil
       embeddings = nil
       return
@@ -92,25 +94,94 @@ final class Backbone {
       throw DecisionError("Missing or ambiguous function " + name + " in " + asset)
     }
     if let f = functions[physicalName] { return f }
-    if models[asset] == nil {
-      var options = SpecializationOptions(preferredComputeUnitKind: .neuralEngine)
-      options.expectFrequentReshapes = false
-      models[asset] = try await AIModel.specialize(
-        contentsOf: root.bundleChild(asset),
-        options: options, cachePolicy: .persistent)
+    let model: AIModel
+    if let cached = models[asset] {
+      model = cached
+    } else {
+      model = try await Self.specialize(root.bundleChild(asset))
+      models[asset] = model
     }
-    let loaded: InferenceFunction?
-    do {
-      loaded = try models[asset]?.loadFunction(named: physicalName)
-    } catch where String(describing: error) == "nilError" {
-      throw CompiledFunctionLoadFailure(asset: asset, function: physicalName)
-    }
-    guard let f = loaded else {
-      throw DecisionError("Missing function " + name)
-    }
+    let f = try Self.load(physicalName, from: model, asset: asset)
     functions[physicalName] = f
     return f
   }
+  private static func specialize(_ url: URL) async throws -> AIModel {
+    var options = SpecializationOptions(preferredComputeUnitKind: .neuralEngine)
+    options.expectFrequentReshapes = false
+    return try await AIModel.specialize(contentsOf: url, options: options, cachePolicy: .persistent)
+  }
+
+  private static func load(_ entry: String, from model: AIModel, asset: String) throws -> InferenceFunction {
+    do {
+      guard let f = try model.loadFunction(named: entry) else { throw DecisionError("Missing function " + entry) }
+      return f
+    } catch where String(describing: error) == "nilError" {
+      throw CompiledFunctionLoadFailure(asset: asset, function: entry)
+    }
+  }
+
+  /// Overlap independent model loads inside the first request. The recurrent evaluations stay serial.
+  private func loadValenFunctions(for ids: [Int], capacity: Int) async throws {
+    guard let layout = manifest.embeddingLookup else { throw DecisionError("Missing Valen embedding banks") }
+    var needed = [(Manifest.Asset, [String])]()
+    for (i, asset) in manifest.assets.enumerated() where models[asset.asset] == nil {
+      let names = ["scan\(i)", "attend\(i)c\(capacity)"]
+      needed.append((asset, asset.functions.filter { names.contains(Manifest.logicalFunction($0)) }))
+    }
+    let bankIndices = Set(ids.map { $0 / layout.bankSize })
+    for i in bankIndices.sorted() where layout.assets.indices.contains(i) {
+      let bank = layout.assets[i]
+      if models[bank.asset] == nil { needed.append((bank, bank.functions)) }
+    }
+    for asset in [manifest.rolePool, manifest.roleMixer, manifest.decisionHead, manifest.resultStats].compactMap({ $0 })
+    where models[asset.asset] == nil { needed.append((asset, asset.functions)) }
+    if !needed.isEmpty { cache(try await Self.loadAssets(needed, in: root)) }
+  }
+
+  func encodeImage(_ data: Data, with vision: Vision) async throws -> VisualFeatures {
+    guard manifest.valen else { return try await vision.encode(data, using: self) }
+    // All text scans are needed regardless of the image grid or selected attention tier.
+    let scans = manifest.assets.enumerated().compactMap { index, asset -> (Manifest.Asset, [String])? in
+      guard models[asset.asset] == nil else { return nil }
+      return (asset, asset.functions.filter { Manifest.logicalFunction($0) == "scan\(index)" })
+    }
+    guard !scans.isEmpty else { return try await vision.encode(data, using: self) }
+    async let prepared = Self.loadAssets(scans, in: root)
+    let features = try await vision.encode(data, using: self)
+    cache(try await prepared)
+    return features
+  }
+
+  private typealias LoadedAsset = (String, AIModel, [String: InferenceFunction])
+
+  private func cache(_ assets: [LoadedAsset]) {
+    for (name, model, entries) in assets {
+      models[name] = model
+      functions.merge(entries) { existing, _ in existing }
+    }
+  }
+
+  private static func loadAssets(_ needed: [(Manifest.Asset, [String])], in directory: URL)
+    async throws -> [LoadedAsset]
+  {
+    try await withThrowingTaskGroup(of: LoadedAsset.self) { group in
+      var completed = [LoadedAsset]()
+      for (index, item) in needed.enumerated() {
+        if index >= 4, let next = try await group.next() { completed.append(next) }
+        group.addTask {
+          try Task.checkCancellation()
+          let (asset, names) = item
+          let model = try await specialize(directory.bundleChild(asset.asset))
+          var entries = [String: InferenceFunction]()
+          for name in names { entries[name] = try load(name, from: model, asset: asset.asset) }
+          return (asset.asset, model, entries)
+        }
+      }
+      for try await result in group { completed.append(result) }
+      return completed
+    }
+  }
+
   func prepare() async throws {
     for asset in manifest.assets + manifest.deviceExtras {
       for name in asset.functions { _ = try await function(name, in: asset.asset) }
@@ -119,7 +190,7 @@ final class Backbone {
       for name in manifest.visionFunctions ?? [] { _ = try await function(name, in: asset) }
     }
   }
-  func run(_ prompt: Prompt, vision: VisualFeatures?) async throws -> [[Float]] {
+  func run(_ prompt: Prompt, vision: VisualFeatures?) async throws -> [NDArray] {
     let m = manifest
     let w = m.width
     let h = m.hidden
@@ -127,6 +198,7 @@ final class Backbone {
     guard let capacity = m.tiers.first(where: { $0 >= n }) else {
       throw DecisionError("Context limit exceeded")
     }
+    if m.valen { try await loadValenFunctions(for: prompt.ids, capacity: capacity) }
     let causal = m.causal
     let count = (n + w - 1) / w
     let imageID = 248056
@@ -167,7 +239,7 @@ final class Backbone {
         for t in 0..<w {
           let i = chunk * w + t
           if i < n, prompt.ids[i] == imageID, let vision {
-            guard imageIndex < vision.rows.count else {
+            guard imageIndex < vision.count else {
               throw DecisionError("Image slots mismatch")
             }
             positions.append(
@@ -175,18 +247,20 @@ final class Backbone {
                 position, position + imageIndex / vision.columns,
                 position + imageIndex % vision.columns
               ))
-            let row = vision.rows[imageIndex]
+            let imageRow = imageIndex
             imageIndex += 1
-            if imageIndex == vision.rows.count {
-              position += max(vision.columns, vision.rows.count / vision.columns)
+            if imageIndex == vision.count {
+              position += max(vision.columns, vision.count / vision.columns)
             }
-            x.write { p, s in
-              for c in 0..<h { p[c * s[1] + t * s[3]] = Float16(m.elephant ? row[c] : row[c] * 64) }
+            vision.tensor.read { source, stride in
+              x.write { p, s in
+                for c in 0..<h { p[c * s[1] + t * s[3]] = source[c * stride[1] + imageRow * stride[3]] }
+              }
             }
           } else {
             positions.append((position, position, position))
             position += 1
-            if i < n && !m.elephant {
+            if i < n && m.embeddingLookup == nil {
               guard let embeddings else { throw DecisionError("Missing token embeddings") }
               let id = prompt.ids[i]
               guard id >= 0, id < embeddings.shape[0] else {
@@ -259,7 +333,7 @@ final class Backbone {
         x = try out.tensor("hidden_out")
       }
       guard x.shape == [1, h, 1, w] else { throw DecisionError("Invalid prompt output shape") }
-      return [x.read { p, s in (0..<h).map { Float(p[$0 * s[1] + (n - 1) * s[3]]) } }]
+      return [x]
     }
     var keys = NDArray.zeros([1, m.kvHeads, capacity, m.headDim])
     var values = keys
@@ -273,7 +347,7 @@ final class Backbone {
           guard case .ndArray(let desc)? = scan.descriptor.inputDescriptor(of: "packed_state"),
             desc.scalarType == .float16
           else { throw DecisionError("Invalid recurrence state") }
-          var state = NDArray.zeros(desc.shape)
+          var state = initialState(desc.shape)
           var saved = [[String: NDArray]]()
           for j in 0..<count {
             var inputs = attends ? rope[j] : [:]
@@ -347,14 +421,19 @@ final class Backbone {
         }
       }
     }
-    let selected =
-      m.kDecision
-      ? prompt.branches.map { $0.roles[0].lowerBound }
-      : Array(m.valen ? 0..<n : n - 1..<n)
-    return selected.map { i in
-      chunks[i / w].read { p, s in (0..<h).map { Float(p[$0 * s[1] + (i % w) * s[3]]) } }
-    }
+    return chunks
   }
+
+  private func initialState(_ shape: [Int]) -> NDArray {
+    // Valen layers with the same state shape share an immutable initial input.
+    // Each evaluation returns the subsequent state in a separate output.
+    guard manifest.valen else { return NDArray.zeros(shape) }
+    if let cached = initialStates[shape] { return cached }
+    let zero = NDArray.zeros(shape)
+    initialStates[shape] = zero
+    return zero
+  }
+
   func lookupTokens(_ ids: [Int], using layout: Manifest.Lookup, skipping imageID: Int?)
     async throws -> [NDArray]
   {

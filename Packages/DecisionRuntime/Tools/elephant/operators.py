@@ -40,9 +40,9 @@ class Finite(torch.nn.Module):
 
 
 class VisionPosition(torch.nn.Module):
-    def __init__(self, weight):
+    def __init__(self, weight, channels=1152):
         super().__init__()
-        if tuple(weight.shape) != (2304, 1152):
+        if tuple(weight.shape) != (2304, channels):
             raise ValueError("Unexpected vision position table")
         self.register_buffer("weight", weight.T.half().contiguous()[:, :, None, None])
         self.register_buffer("axis", torch.arange(48, dtype=torch.float16).reshape(1, 48, 1, 1))

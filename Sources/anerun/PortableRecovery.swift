@@ -55,6 +55,10 @@ struct PortableRecovery {
     static func runChild(_ args: [String]) async throws {
         #if canImport(CoreAI)
         if #available(macOS 27.0, *) {
+            if args.count == 2, args[0] == "_portable-check-valen" {
+                try await PortableDecision.checkValenPrediction(URL(fileURLWithPath: args[1]))
+                return
+            }
             if args.count == 3, args[0] == "_portable-load-source" {
                 let url = URL(fileURLWithPath: args[1])
                 guard url.pathExtension == "aimodel" else { throw PortableDecision.invalid("expected a source asset") }

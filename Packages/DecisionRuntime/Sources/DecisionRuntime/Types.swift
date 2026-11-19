@@ -162,9 +162,12 @@ struct Manifest: Decodable {
     case visionPosition = "vision_position"
     case featureScale = "feature_scale"
     case embeddingLookup = "embedding_lookup"
+    case rolePool = "role_pool"
+    case roleMixer = "role_mixer"
     case residualBlend = "residual_blend"
     case resultStats = "result_stats"
     case decisionHead = "decision_head"
+    case smallVision = "vision_256"
     case visionAsset = "vision_asset"
     case visionSourceHash = "vision_source_hash"
     case visionFunctions = "vision_functions"
@@ -210,16 +213,19 @@ struct Manifest: Decodable {
   static func logicalFunction(_ name: String) -> String {
     guard let split = name.lastIndex(of: "_") else { return name }
     let digest = name[name.index(after: split)...].utf8
-    guard digest.count == 64,
+    let logical = String(name[..<split])
+    let shortVision = digest.count == 8 && (logical == "p256" || logical == "p1024")
+    guard digest.count == 64 || shortVision,
       digest.allSatisfy({ (48...57).contains($0) || (97...102).contains($0) })
     else { return name }
-    return String(name[..<split])
+    return logical
   }
   var deviceExtras: [Asset] {
-    [decisionHead, residualBlend, resultStats, embeddingUnscale, visionPosition, featureScale]
+    [decisionHead, residualBlend, resultStats, embeddingUnscale, visionPosition, featureScale, rolePool, roleMixer, smallVision]
       .compactMap { $0 } + (rounding ?? []) + (embeddingLookup?.assets ?? [])
   }
-  let decisionHead: Asset?
+  let decisionHead: Asset?, rolePool: Asset?, roleMixer: Asset?
+  let smallVision: Asset?
   let visionAsset: String?, visionSourceHash: String?, visionFunctions: [String]?
   var kDecision: Bool { DecisionProfile(repository: source.repo) == .kDecision9B }
   var knowLine: Bool { DecisionProfile(repository: source.repo) == .knowLine9B }
@@ -229,8 +235,41 @@ struct Manifest: Decodable {
   var valen: Bool { DecisionProfile(repository: source.repo) == .valen4B }
   #if canImport(CoreAI)
   @available(macOS 27.0, *)
+  static func validated(at directory: URL) throws -> Manifest {
+    let manifest = try directory.decode("model.json", as: Manifest.self)
+    try manifest.validate()
+    return manifest
+  }
+
+  @available(macOS 27.0, *)
   func validate() throws {
-    if elephant {
+    if !valen && (rolePool != nil || roleMixer != nil || smallVision != nil) {
+      throw DecisionError("Unexpected Valen role operators")
+    }
+    if valen {
+      if embeddingLookup == nil && rolePool == nil && roleMixer == nil {
+        let chip = AIModel.deviceArchitectureName
+        let migration = chip == "h16g"
+          ? "Reinstall with anerun models install --model valen-4b."
+          : "Build a device-operator bundle for \(chip) and install it with anerun models install --model valen-4b --from DIR."
+        throw DecisionError("Legacy Valen bundle requires migration. " + migration)
+      }
+      let expected = [(rolePool, "valenPool"), (roleMixer, "valenMixer"), (decisionHead, "readout"),
+                      (resultStats, "stats"), (visionPosition, "visionpos"), (featureScale, "featurescale")]
+      guard hidden == 2560, context == 4096, width == 128, visionFunctions?.map(Self.logicalFunction) == ["p1024"],
+        smallVision.map({ $0.functions.map(Self.logicalFunction) == ["p256"] }) ?? true,
+        visionAsset != nil, visionFractions == "vision-fractions.fp16",
+        rotaryTables == ["text": "text-rotary.fp16", "vision": "vision-rotary.fp16"],
+        rounding == nil, residualBlend == nil, embeddingUnscale == nil,
+        stageKinds == Array(repeating: ["linear", "linear", "linear", "attention"], count: 8).flatMap({ $0 }),
+        execution.map(\.stages) == Array(0..<32).map({ [$0] }), execution.allSatisfy({ $0.passes == 1 }),
+        expected.allSatisfy({ $0.0?.functions.map(Self.logicalFunction) == [$0.1] }),
+        let lookup = embeddingLookup, lookup.bankSize == 4096, lookup.laneWidth == 16,
+        lookup.vocabSize == 248320, lookup.assets.count == 61,
+        lookup.assets.enumerated().allSatisfy({ $0.element.functions.map(Self.logicalFunction) == ["lookup\($0.offset)"] }),
+        Set((assets + deviceExtras).map(\.asset) + [visionAsset!]).count == assets.count + deviceExtras.count + 1
+      else { throw DecisionError("Incomplete Valen device operator manifest") }
+    } else if elephant {
       guard
         stageKinds
           == Array(repeating: ["linear", "linear", "attention"], count: 8).flatMap({ $0 }),

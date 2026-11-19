@@ -96,7 +96,26 @@ struct PortableDecisionTests {
             } catch { throw PortableDecision.invalid(error.localizedDescription) }
             if needsRecovery { throw CompiledFunctionLoadFailure(asset: "stage.h16g.aimodelc", function: "entry_b") }
         }
-        let audit: PortableDecision.NativeAudit = { try PortableDecision.auditPrepared($0, cache: cache) }
+        let audit: PortableDecision.NativeAudit = { directory in
+            #if canImport(CoreAI)
+            if #available(macOS 27.0, *), scenario == "secondEntry" {
+                #expect(aotRetries == 2)
+                #expect(try store.resolveDirectory() == old)
+                let verifier = root.appendingPathComponent("activation-child")
+                try """
+                #!/bin/sh
+                test "$1" = _portable-check-valen && test -f "$2/.decision-aot.json" && echo "$$" > "$2/../probe-pid"
+                """.write(to: verifier, atomically: true, encoding: .utf8)
+                try fm.setAttributes([.posixPermissions: 0o700], ofItemAtPath: verifier.path)
+                try await PortableDecision.verifyForActivation(directory, cache: cache, executable: verifier)
+                let pid = try String(contentsOf: directory.deletingLastPathComponent().appendingPathComponent("probe-pid"),
+                                     encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines)
+                #expect(Int32(pid) != nil && Int32(pid) != ProcessInfo.processInfo.processIdentifier)
+                return
+            }
+            #endif
+            try PortableDecision.auditPrepared(directory, cache: cache)
+        }
         do {
             let result: URL
             if scenario == "remote" || scenario == "fallbackRemote" {

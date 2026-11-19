@@ -36,6 +36,7 @@ class BaseExportTests(unittest.TestCase):
             patch("export_base.runtime_weights", side_effect=emit_runtime_weights),
             patch("glide9_operators.export_operators", return_value={}),
             patch("elephant.operators.export_operators", return_value={}),
+            patch("valen_operators.export", return_value={}),
         ):
             source = Path(tmp)
             (source / "config.json").write_text('{"vision_config": {}}')

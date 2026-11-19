@@ -4,7 +4,7 @@ import EmbedCore
 import Foundation
 
 let arguments = Array(CommandLine.arguments.dropFirst())
-if arguments.first == "_portable-load-source" || arguments.first == "_portable-prepare-compiled" {
+if let command = arguments.first, ["_portable-load-source", "_portable-prepare-compiled", "_portable-check-valen"].contains(command) {
     do { try await PortableRecovery.runChild(arguments) }
     catch let failure as CompiledFunctionLoadFailure where arguments.first == "_portable-prepare-compiled" && arguments.count == 3 {
         if let payload = try? JSONEncoder().encode(failure), payload.count <= 4096,

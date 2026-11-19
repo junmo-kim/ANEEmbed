@@ -1,10 +1,11 @@
 import Darwin
+import DecisionRuntime
 import EmbedCore
 import Foundation
 
 enum PortableDecision {
     typealias Compiler = (URL, URL, String) throws -> Void
-    typealias NativeAudit = (URL) throws -> Void
+    typealias NativeAudit = (URL) async throws -> Void
     static let receiptName = ".decision-aot.json"
     static let inventoryName = "decision-source-inventory.json"
 
@@ -95,7 +96,7 @@ enum PortableDecision {
             lookup["assets"] = try banks.map(transform)
             model["embedding_lookup"] = lookup
         }
-        for key in ["decision_head", "residual_blend", "result_stats", "embedding_unscale", "vision_position", "feature_scale"] {
+        for key in ["decision_head", "residual_blend", "result_stats", "embedding_unscale", "vision_position", "feature_scale", "role_pool", "role_mixer", "vision_256"] {
             if let row = model[key] as? [String: Any] { model[key] = try transform(row) }
         }
         if let name = model["vision_asset"] as? String {
@@ -218,6 +219,44 @@ enum PortableDecision {
                         functions: asset.functions, symbols: checked.symbols, resource: checked.resource.lastPathComponent,
                         sha256: try SHA256Hasher.hex(fileAt: checked.resource))
     }
+
+    static func verifyForActivation(_ directory: URL) async throws {
+        try await verifyForActivation(directory, cache: nativeCacheRoot(), executable: Bundle.main.executableURL)
+    }
+
+    static func verifyForActivation(_ directory: URL, cache: URL, executable: URL?) async throws {
+        try auditPrepared(directory, cache: cache)
+        #if canImport(CoreAI)
+        if #available(macOS 27.0, *), try ModelID.identify(in: directory) == .decision(.valen4B) {
+            try await PortableRecovery.child(["_portable-check-valen", directory.path], executable: executable)
+        }
+        #endif
+    }
+
+    #if canImport(CoreAI)
+    @available(macOS 27.0, *)
+    static func checkValenPrediction(_ directory: URL) async throws {
+        // Exercise the audited backbone at its permanent path after streaming the native resources.
+        // This session is released before activation and the serving process starts from unloaded.
+        // The one-pixel neutral PNG exercises the encoder and the text backbone together.
+        guard let pixel = Data(base64Encoded: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGNoaGgAAAMEAYFL09IQAAAAAElFTkSuQmCC") else {
+            throw invalid("invalid Valen preparation image")
+        }
+        let request = DecisionInput(state: "The first item is selected.", questions: [
+            .init(name: "selected", kind: .choice, instructions: "Which item is selected?",
+                  candidates: [.init(key: "first", description: "First item"),
+                               .init(key: "second", description: "Second item")])
+        ], image: pixel)
+        do {
+            let result = try await DecisionEngine(bundleURL: directory).decide(request)
+            guard result.answers["selected"]?.probabilities?.count == 2 else {
+                throw invalid("incomplete Valen preparation response")
+            }
+        } catch {
+            throw ServiceError(.unavailable, "prepare_failed", "audited Valen prediction failed: \(error)")
+        }
+    }
+    #endif
 
     static func auditPrepared(_ directory: URL) throws {
         try auditPrepared(directory, cache: nativeCacheRoot())

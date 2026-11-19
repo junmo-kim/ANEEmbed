@@ -54,6 +54,10 @@ enum DecisionCommands {
                 try await prepare(config.modelDirectory)
                 Output.data(["model_dir": .string(config.modelDirectory.path), "prepared": true], format: format)
             case "serve":
+                if model == .decision(.valen4B) {
+                    do { try DecisionEngine.validateManifest(at: config.modelDirectory) }
+                    catch { throw ServiceError(.invalidInput, "invalid_bundle", "Valen manifest: \(error)") }
+                }
                 let timeout = config.int("idle-timeout")
                 let engine = DecisionEngine(bundleURL: config.modelDirectory, idleTimeout: timeout > 0 ? .seconds(timeout) : nil)
                 let server = HTTPServer(host: config.host, port: config.port, maxBody: config.maxBodyBytes,

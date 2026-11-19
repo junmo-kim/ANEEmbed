@@ -17,6 +17,13 @@ final class DecisionTests: XCTestCase {
     }
   }
   var root: URL { Bundle.module.resourceURL!.appendingPathComponent("Fixtures") }
+  func testShortCompilerSymbolsResolveOnlyForVisionTiers() {
+    XCTAssertEqual(Manifest.logicalFunction("p1024_35aaefab"), "p1024")
+    XCTAssertEqual(Manifest.logicalFunction("p256_c8bc9cf4"), "p256")
+    for name in ["p256_1234567", "p1024_1234567g", "scan5_35aaefab"] {
+      XCTAssertEqual(Manifest.logicalFunction(name), name)
+    }
+  }
   func testPinnedTokenIDsAndMixerReadouts() throws {
     let tokenizer = try BPETokenizer(root)
     let fixtures = try root.decode("goldens.json", as: [Fixture].self)
@@ -130,6 +137,13 @@ final class DecisionTests: XCTestCase {
                      truncated ? true : nil)
     }
   }
+  #if canImport(CoreAI)
+  @available(macOS 27.0, *)
+  func testDecodedPixelTableMatchesTheFP16VisionABI() {
+    XCTAssertEqual(Vision.pixelBits, (0...255).map { Float16(Float($0) / 127.5 - 1).bitPattern })
+  }
+  #endif
+
   func testInstalledModel() async throws {
     guard let path = ProcessInfo.processInfo.environment["DECISION_TEST_BUNDLE"],
       let model = ProcessInfo.processInfo.environment["DECISION_TEST_MODEL"]

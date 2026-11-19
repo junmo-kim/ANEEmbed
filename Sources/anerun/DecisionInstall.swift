@@ -5,7 +5,7 @@ import Foundation
 enum DecisionInstall {
     static func install(_ source: URL, model: ModelID, store: ModelStore, architecture: String? = nil,
                         compile: PortableDecision.Compiler = PortableDecision.compile,
-                        nativeAudit: PortableDecision.NativeAudit = PortableDecision.auditPrepared,
+                        nativeAudit: PortableDecision.NativeAudit = PortableDecision.verifyForActivation,
                         recovery: PortableRecovery = .live,
                         prepare: (URL) async throws -> Void) async throws(ServiceError) -> URL {
         _ = try ModelID.identify(in: source, expected: model)

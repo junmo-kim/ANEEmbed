@@ -33,6 +33,23 @@ if [[ ${ANERUN_CHECK_RELEASE_COREAI:-0} == 1 ]]; then
   if (( $(sw_vers -productVersion | cut -d. -f1) >= 27 )); then expected=invalid_model_source; fi
   python3 -c 'import json, sys; assert json.load(sys.stdin)["reason"] == sys.argv[1]' \
     "$expected" < "$tmpdir/decision.err" || fail "unexpected decision dispatcher response"
+  if [[ "$expected" == invalid_model_source ]]; then
+    # An installed v0.3.0 backbone-only Valen descriptor must fail before serve starts listening.
+    python3 - "$binary" "$tmpdir" <<'PYLEGACY'
+import json, pathlib, subprocess, sys
+binary, root = sys.argv[1], pathlib.Path(sys.argv[2]) / "legacy-valen"
+root.mkdir()
+model = dict(source=dict(repo="Valen-Team/Valen-Decision-1.5-4B", revision="9b0cacc976d7fb72f252ee1adb1564f5f15e462c"),
+             architecture="h16g", assets=[], execution=[], stage_kinds=[], hidden=2560, width=128, context=4096,
+             tiers=[4096], rotary_dim=64, heads=1, kv_heads=1, head_dim=64, block_mask=False)
+(root / "model.json").write_text(json.dumps(model))
+run = subprocess.run([binary, "serve", "--model-dir", str(root), "--port", "58311", "--runtime", "coreml",
+                      "--format", "json"], capture_output=True, timeout=5)
+error = json.loads(run.stderr)
+assert run.returncode and error["reason"] == "invalid_bundle", error
+assert "Legacy Valen" in error["detail"] and "models install --model valen-4b" in error["detail"], error
+PYLEGACY
+  fi
 fi
 
 version=$("$binary" --version)

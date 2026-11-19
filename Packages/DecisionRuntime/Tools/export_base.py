@@ -140,8 +140,11 @@ def export(profile, checkpoint, output, tiers):
             from glide9_operators import export_operators
             bundle.update(export_operators(checkpoint, backbone.reader, stage, tiers[-1]))
         runtime_weights(profile, checkpoint, backbone.reader, stage / "checkpoint")
-        if profile == "elephant-1":
-            from elephant.operators import export_operators
+        if profile in ("elephant-1", "valen-4b"):
+            if profile == "valen-4b":
+                from valen_operators import export as export_operators
+            else:
+                from elephant.operators import export_operators
             weights = stage / "checkpoint" / "model.safetensors"
             bundle.update(export_operators(weights, stage))
             weights.unlink()  # Export-time tensors are fully represented in the device graphs.

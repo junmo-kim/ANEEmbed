@@ -125,7 +125,13 @@ def build(source, out, arch, max_attempts=DEFAULT_COMPILE_ATTEMPTS):
         raise ValueError("Compiled bundle is for a different chip")
     glide9 = manifest["source"]["repo"] == "fastino/GLiDE-9B"
     elephant = manifest["source"]["repo"] == "baselabs/elephant-1"
+    valen = manifest["source"]["repo"] == "Valen-Team/Valen-Decision-1.5-4B"
     extras = glide9_assets(manifest) if glide9 else []
+    if valen:
+        extras = [*manifest["embedding_lookup"]["assets"], *(manifest[k] for k in
+                  ("role_pool", "role_mixer", "decision_head", "result_stats", "vision_position", "feature_scale"))]
+        if manifest.get("vision_256") is not None:
+            extras.append(manifest["vision_256"])
     if elephant:
         from elephant.pack import validate
         validate(manifest, candidate=True, portable="architecture" not in manifest)
@@ -141,12 +147,12 @@ def build(source, out, arch, max_attempts=DEFAULT_COMPILE_ATTEMPTS):
             if (asset / "main.hash").read_bytes().hex() != item["source_hash"]:
                 raise ValueError(f"Unexpected source hash for {name}")
             start = time.time()
-            compile_stage(asset, path, arch, item["source_hash"], max_attempts, item["functions"] if glide9 or elephant else None)
+            compile_stage(asset, path, arch, item["source_hash"], max_attempts, item["functions"] if glide9 or elephant or valen else None)
             print(f"compile {name} {start:.6f} {time.time():.6f}", flush=True)
         elif asset.suffix == ".aimodelc":
             path = out/name
             subprocess.run(["cp", "-cR", asset, path], check=True)
-            verified(path, item["source_hash"], item["functions"] if glide9 or elephant else None)
+            verified(path, item["source_hash"], item["functions"] if glide9 or elephant or valen else None)
         else:
             raise ValueError(f"Unknown asset {name}")
         if name == manifest.get("vision_asset"):
@@ -157,9 +163,10 @@ def build(source, out, arch, max_attempts=DEFAULT_COMPILE_ATTEMPTS):
         if table.stat().st_size != manifest["context"] * manifest["rotary_dim"] * 2:
             raise ValueError("Invalid GLiDE-9B rotary table")
         shutil.copyfile(table, out / table.name)
-    if elephant:
-        for name, size in [(manifest["rotary_tables"]["text"], 2048 * 32 * 4),
-                           (manifest["rotary_tables"]["vision"], 2048 * 18 * 4),
+    if elephant or valen:
+        limit = 4096 if valen else 2048
+        for name, size in [(manifest["rotary_tables"]["text"], limit * 32 * 4),
+                           (manifest["rotary_tables"]["vision"], limit * (16 if valen else 18) * 4),
                            (manifest["vision_fractions"], 511 * 512)]:
             table = bundle_child(source, name)
             if table.stat().st_size != size:
@@ -168,7 +175,7 @@ def build(source, out, arch, max_attempts=DEFAULT_COMPILE_ATTEMPTS):
     ck = bundle_child(source, "checkpoint")
     for name in ("model.safetensors", "config.json", "LICENSE", "NOTICE", "licenses",
                  "decision_config.json", "readout.safetensors"):
-        if (glide9 or elephant) and name in ("model.safetensors", "readout.safetensors"):
+        if (glide9 or elephant or valen) and name in ("model.safetensors", "readout.safetensors"):
             continue
         if (ck/name).exists():
             subprocess.run(["cp", "-cR", ck/name, out/name], check=True)
