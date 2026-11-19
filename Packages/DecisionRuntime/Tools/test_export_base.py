@@ -3,7 +3,9 @@ import json
 import os
 from pathlib import Path
 import tempfile
+from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
 import torch
 from torch.nn import functional as F
@@ -11,10 +13,39 @@ from safetensors.torch import load_file, save_file
 
 from decision_graph import CheckpointReader
 from decision_vision import VisionGraph, vision_inputs
-from export_base import copy_notices, elephant_slots, execution_schedule, runtime_weights
+from export_base import PROFILES, copy_notices, elephant_slots, execution_schedule, export, runtime_weights
 
 
 class BaseExportTests(unittest.TestCase):
+    def test_valen_profile_selects_qualified_graph_math(self):
+        cfg = SimpleNamespace(
+            layer_types=("linear_attention", "full_attention"),
+            hidden=64, rotary_dim=16, heads=4, kv_heads=2, head_dim=16,
+        )
+        backbone = SimpleNamespace(cfg=cfg, reader=None)
+        def emit_runtime_weights(profile, source, reader, dest):
+            dest.mkdir()
+            (dest / "model.safetensors").touch()
+
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            patch("export_base.verify_text_checkpoint"),
+            patch("export_base.load_weights", return_value=backbone) as load,
+            patch("export_base.export_stage", return_value={}),
+            patch("export_base.export_vision", return_value={}),
+            patch("export_base.runtime_weights", side_effect=emit_runtime_weights),
+            patch("glide9_operators.export_operators", return_value={}),
+            patch("elephant.operators.export_operators", return_value={}),
+        ):
+            source = Path(tmp)
+            (source / "config.json").write_text('{"vision_config": {}}')
+            (source / "decision_config.json").write_text("{}")
+            for profile in PROFILES:
+                with self.subTest(profile=profile):
+                    export(profile, source, source / profile, [256])
+                    load.assert_called_with(source, scaled_recurrence=True,
+                                            valen_recurrence=profile == "valen-4b")
+
     def test_glide_midloop_includes_linear_tail(self):
         ranges = [(0, 3), (4, 7), (8, 11), (12, 15), (16, 17),
                   (18, 19), (20, 23), (24, 27), (28, 31)]

@@ -102,7 +102,13 @@ def export(profile, checkpoint, output, tiers):
     if output.exists():
         raise FileExistsError(output)
     verify_text_checkpoint(checkpoint, repo, revision)
-    backbone = load_weights(checkpoint, scaled_recurrence=profile in ("glide-2b", "glide-9b", "elephant-1"))
+    # Valen layer zero uses larger internal delta units. Packed state and
+    # residual I/O retain the existing scale, as do all later recurrence layers.
+    backbone = load_weights(
+        checkpoint,
+        scaled_recurrence=profile in ("valen-4b", "glide-2b", "glide-9b", "elephant-1"),
+        valen_recurrence=profile == "valen-4b",
+    )
     cfg = backbone.cfg
     ranges = stage_ranges(cfg, pair_before_attention=profile == "elephant-1")
     loop = None

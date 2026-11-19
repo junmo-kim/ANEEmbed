@@ -1,7 +1,9 @@
 """Two-chunk CPU parity against the installed Transformers Qwen3.5 model."""
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
 import torch
 from safetensors.torch import save_file
@@ -12,6 +14,23 @@ from text_norm import BoundedRMSNorm
 
 
 class TextStageTest(unittest.TestCase):
+    def test_first_layer_scale_does_not_follow_stage_boundaries(self):
+        cfg = SimpleNamespace(layer_types=("linear_attention",) * 3)
+        backbone = SimpleNamespace(cfg=cfg, valen_recurrence=True)
+
+        def layer(*args, **kwargs):
+            node = torch.nn.Identity()
+            node.state_channels = 1
+            return node
+
+        with patch("decision_graph.DeltaLayer", side_effect=layer) as delta:
+            ScanStage(backbone, 0, 1)
+            ScanStage(backbone, 2, 2)
+        self.assertEqual(
+            [(call.args[1], call.kwargs["recurrence_scale"]) for call in delta.call_args_list],
+            [("layers.0.", 256), ("layers.1.", 64), ("layers.2.", 64)],
+        )
+
     def test_fp16_norm_range(self):
         # Uniform near-limit input and a single large channel have opposite
         # effects on the mean absolute scale. Check both along with tiny rows.

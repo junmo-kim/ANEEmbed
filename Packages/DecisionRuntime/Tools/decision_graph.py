@@ -69,6 +69,7 @@ class Backbone:
     prefix: str
     dtype: torch.dtype
     scaled_recurrence: bool
+    valen_recurrence: bool = False
 
     def weight(self, name, shape, *, offset=0):
         tensor = self.reader.get_tensor(self.prefix + name)
@@ -79,7 +80,7 @@ class Backbone:
         return tensor.to(self.dtype)
 
 
-def load_weights(path, *, dtype=torch.float16, scaled_recurrence=False):
+def load_weights(path, *, dtype=torch.float16, scaled_recurrence=False, valen_recurrence=False):
     path = Path(path)
     root = json.loads((path / "config.json").read_text())
     t = root.get("text_config", root)
@@ -108,7 +109,7 @@ def load_weights(path, *, dtype=torch.float16, scaled_recurrence=False):
             or set(cfg.layer_types) - {"linear_attention", "full_attention"}
             or len(cfg.layer_types) != t["num_hidden_layers"] or cfg.layer_types[-1] != "full_attention"):
         raise ValueError("Unsupported Qwen3.5 text dimensions or layer order")
-    return Backbone(cfg, reader, prefix, dtype, scaled_recurrence)
+    return Backbone(cfg, reader, prefix, dtype, scaled_recurrence, valen_recurrence)
 
 
 def stage_ranges(cfg, *, pair_before_attention=False):
@@ -223,7 +224,7 @@ class FullQuery(nn.Module):
 
 class DeltaLayer(nn.Module):
     """Block solution of the causal gated delta recurrence with carried K x V memory."""
-    def __init__(self, bb, prefix):
+    def __init__(self, bb, prefix, *, recurrence_scale=RECURRENCE_SCALE):
         super().__init__()
         c = bb.cfg
         self.cfg = c
@@ -242,8 +243,10 @@ class DeltaLayer(nn.Module):
         self.unit_norm.weight = nn.Parameter(torch.full((c.key_dim,), c.key_dim ** -0.5,
                                                         dtype=bb.dtype), requires_grad=False)
         self.scaled_recurrence = bb.scaled_recurrence
+        self.recurrence_scale = recurrence_scale
+        self.valen_recurrence = bb.valen_recurrence
         self.gate_norm = norm(bb, p + "norm", c.value_dim, 3, offset=0,
-                              input_scale=RECURRENCE_SCALE if self.scaled_recurrence else 1)
+                              input_scale=recurrence_scale if self.scaled_recurrence else 1)
         self.register_buffer("kernel", bb.weight(p + "conv1d.weight", (self.mix, 1, c.taps)))
         self.register_buffer("bias", bb.weight(p + "dt_bias", (c.value_heads,)).reshape(1,-1,1,1))
         self.register_buffer("rate_scale", -bb.weight(p + "A_log", (c.value_heads,)).float().exp()
@@ -331,16 +334,24 @@ class DeltaLayer(nn.Module):
         rate = (a.clamp_min(0) + torch.log1p((-a.abs()).exp())) * self.rate_scale
         # Delta is linear in both values and incoming memory. Keep the small
         # context in scaled units through gate normalization, then restore state units.
-        if self.scaled_recurrence:
-            v = v * RECURRENCE_SCALE
-            memory = memory * RECURRENCE_SCALE
-        out, memory = self.delta(self.unit_heads(q), self.unit_heads(k), self.tiles(heads(v, c.value_heads)),
-                                 self.tiles(beta), self.tiles(rate), memory)
+        scale = self.recurrence_scale
+        if self.valen_recurrence:
+            # Preserve operand evaluation order in the qualified Valen graph.
+            out, memory = self.delta(
+                self.unit_heads(q), self.unit_heads(k), self.tiles(heads(v * scale, c.value_heads)),
+                self.tiles(beta), self.tiles(rate), memory * scale,
+            )
+        else:
+            if self.scaled_recurrence:
+                v = v * scale
+                memory = memory * scale
+            out, memory = self.delta(self.unit_heads(q), self.unit_heads(k), self.tiles(heads(v, c.value_heads)),
+                                     self.tiles(beta), self.tiles(rate), memory)
         out = self.gate_norm(out) * self.ff.silu(heads(self.z(x), c.value_heads))
-        if self.scaled_recurrence:
-            memory = memory / RECURRENCE_SCALE
+        if self.scaled_recurrence and not self.valen_recurrence:
+            memory = memory / scale
         history = self.pack(extended[..., 1 - c.taps:])
-        packed = torch.cat((history, self.pack(memory)), dim=1)
+        packed = torch.cat((history, self.pack(memory / scale if self.valen_recurrence else memory)), dim=1)
         return self.ff(residual + self.out(channels(out))), packed
 
 
@@ -349,8 +360,11 @@ class ScanStage(nn.Module):
         super().__init__()
         cfg = backbone.cfg
         full = cfg.layer_types[end] == "full_attention"
-        self.layers = nn.ModuleList(DeltaLayer(backbone, f"layers.{i}.")
-                                    for i in range(start, end + int(not full)))
+        self.layers = nn.ModuleList(
+            DeltaLayer(backbone, f"layers.{i}.", recurrence_scale=(
+                256 if backbone.valen_recurrence and i == 0 else RECURRENCE_SCALE))
+            for i in range(start, end + int(not full))
+        )
         self.channels = max(1, sum(layer.state_channels for layer in self.layers))
         self.query = FullQuery(backbone, f"layers.{end}.") if full else None
 
