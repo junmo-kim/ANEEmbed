@@ -32,8 +32,8 @@ public struct Config: Sendable, Equatable {
                defaultValue: { Config.defaultDataDirectory.path }, validate: { $0.isEmpty ? "must not be empty" : nil }),
         Option(name: "host", help: "listen address (loopback by default; anything else exposes an unauthenticated API)",
                defaultValue: { "127.0.0.1" }, validate: { $0.isEmpty ? "must not be empty" : nil }),
-        Option(name: "idle-timeout", help: "exit the playground after this many idle seconds (0 disables)",
-               defaultValue: { "300" }, validate: integer(0...Int.max)),
+        Option(name: "idle-timeout", help: "decision server idle unload in seconds (0 disables)",
+               defaultValue: { "0" }, validate: integer(0...Int.max)),
         Option(name: "port", help: "listen port", defaultValue: { "18180" }, validate: integer(1...65535)),
         Option(name: "max-tokens", help: "longest text accepted, in model tokens; only the functions needed for this cap are loaded",
                defaultValue: { "2048" }, validate: integer(1...32768)),
@@ -76,6 +76,7 @@ public struct Config: Sendable, Equatable {
     public private(set) var sources: [String: Source] = [:]
     public private(set) var modelID: ModelID?
     private var resolvedModelDirectory: URL?
+    var modelResolutionError: ServiceError?
 
     /// Resolves every option from `flags` (name without dashes -> value) and `environment`.
     public init(flags: [String: String] = [:], environment: [String: String] = ProcessInfo.processInfo.environment)
@@ -139,7 +140,7 @@ public struct Config: Sendable, Equatable {
         let installing = command == "models install" || command == "install"
         let needsName = requiresName || installing
         if name.isEmpty && (needsName || (required && explicit == nil)) {
-            let example = "aneembed \(command) --model \(ModelID.pplx.rawValue)"
+            let example = "anerun \(command) --model \(ModelID.pplx.rawValue)"
             let selectors = needsName ? "--model" : "--model or --model-dir"
             throw ServiceError(.badRequest, "missing_model", "\(command) requires \(selectors)\n\(ModelID.catalog)",
                                param: "model", hint: "try `\(example)`")
@@ -161,15 +162,25 @@ public struct Config: Sendable, Equatable {
                 try store.checkNamespace()
                 return selected
             }
-            let directory = try store.resolveDirectory().standardizedFileURL.resolvingSymlinksInPath()
-            let manifest = try Manifest.load(from: directory)
-            try manifest.checkModel(model, directory: directory)
+            let directory: URL
+            do {
+                directory = try store.resolveDirectory().standardizedFileURL.resolvingSymlinksInPath()
+            } catch {
+                if command == "doctor" {
+                    selected.modelResolutionError = error
+                    return selected
+                }
+                guard model == .qwen3Embedding, error.reason == "model_missing" else { throw error }
+                throw ServiceError(error.kind, error.reason, error.message, param: error.param,
+                                   hint: "install with `anerun models install --model \(model.rawValue) --from DIR`, "
+                                       + "supply --repo and --revision, or pass --model-dir DIR")
+            }
+            if command != "doctor" { _ = try ModelID.identify(in: directory, expected: model) }
             selected.resolvedModelDirectory = directory
         } else if let explicit {
             let directory = explicit.standardizedFileURL.resolvingSymlinksInPath()
-            let manifest = try Manifest.load(from: directory)
-            guard let model = manifest.modelID else { throw manifest.unsupportedModel(in: directory) }
-            try validateTokenRange(for: model)
+            let model = command == "doctor" ? try? ModelID.identify(in: directory) : try ModelID.identify(in: directory)
+            if let model { try validateTokenRange(for: model) }
             selected.modelID = model
             selected.resolvedModelDirectory = directory
         }

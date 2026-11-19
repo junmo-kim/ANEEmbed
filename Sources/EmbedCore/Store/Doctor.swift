@@ -1,22 +1,25 @@
-// `aneembed doctor` runs the startup asset checks. --verify hashes every source file against the manifest.
+// `anerun doctor` runs the startup asset checks. --verify hashes every source file against the manifest.
 import Foundation
 
 public enum Doctor {
     public static func report(_ config: Config, verify: Bool = false) -> JSONValue {
         let os = ProcessInfo.processInfo.operatingSystemVersion
         let engine = NeuralEngine.device
+        let system: JSONObject = [
+            "aneembed": .string(aneembedVersion),
+            "macos": .string("\(os.majorVersion).\(os.minorVersion).\(os.patchVersion)"),
+            "macos_build": .string(operatingSystemBuild),
+            "neural_engine": engine.available ? .string("available (\(engine.cores) cores)") : "unavailable",
+            "runtime": .string(config.string("runtime")),
+        ]
+        func result(_ fields: JSONObject) -> JSONValue { .object(JSONObject(system.pairs + fields.pairs)) }
         if config.modelID == nil, config.string("model-dir").isEmpty, config.string("model").isEmpty {
-            return [
-                "aneembed": .string(aneembedVersion),
-                "macos": .string("\(os.majorVersion).\(os.minorVersion).\(os.patchVersion)"),
-                "macos_build": .string(operatingSystemBuild),
-                "neural_engine": engine.available ? .string("available (\(engine.cores) cores)") : "unavailable",
-                "runtime": .string(config.string("runtime")),
+            return result([
                 "model": [:],
                 "compile_cache": "no model selected",
                 "ready": false,
-                "problems": ["select a model with `aneembed doctor --model ID`", .string(ModelID.catalog)],
-            ]
+                "problems": ["select a model with `anerun doctor --model ID`", .string(ModelID.catalog)],
+            ])
         }
         let directory = config.modelDirectory
         let exists = FileManager.default.fileExists(atPath: directory.path)
@@ -25,6 +28,26 @@ public enum Doctor {
 
         var model: JSONObject = ["dir": .string(directory.path), "present": .bool(exists)]
         if let modelID = config.modelID { model["name"] = .string(modelID.rawValue) }
+        if let error = config.modelResolutionError {
+            model["present"] = false
+            return result(["model": .object(model), "compile_cache": "no active model", "ready": false,
+                           "problems": [.string(error.message)]])
+        }
+        let hasDecisionDescriptor = !FileManager.default.fileExists(atPath: directory.appendingPathComponent(ModelLayout.manifest).path)
+            && FileManager.default.fileExists(atPath: directory.appendingPathComponent("model.json").path)
+        if config.modelID?.isDecision == true || hasDecisionDescriptor {
+            do {
+                let identified = try ModelID.identify(in: directory, expected: config.modelID)
+                model["name"] = .string(identified.rawValue)
+                model["bundle_identity"] = "recognized"
+                problems.append(.string("check decision runtime readiness with `anerun models verify` and the same model selector"))
+            } catch {
+                model["bundle_identity"] = "unverified"
+                problems.append(.string(error.message))
+            }
+            return result(["model": .object(model), "compile_cache": "unchecked (CoreAI)", "ready": false,
+                           "problems": .array(problems)])
+        }
         let isTextOnly = config.modelID?.supportsImages == false
         let isQwen = config.modelID == .qwen3Embedding
         if exists {
@@ -81,7 +104,7 @@ public enum Doctor {
                 problems.append(.string(error.message))
             }
             for (name, present) in files where !present { problems.append(.string("model file missing: \(name)")) }
-            if !isTextOnly { files.append(("vision_model", ModelLayout.model(ModelLayout.visionModel, in: directory) != nil)) }
+            if !isQwen { files.append(("vision_model", ModelLayout.model(ModelLayout.visionModel, in: directory) != nil)) }
             model["files"] = .object(JSONObject(files.map { (key: $0.0, value: .string($0.1 ? "present" : "missing")) }))
             if config.skipSelfTest {
                 model["selftest_data"] = "not used (--selftest skip: every function is served unchecked)"
@@ -101,7 +124,7 @@ public enum Doctor {
         } else if !config.useFakeRuntime {
             let name = config.modelID?.rawValue ?? ModelID.embeddingGemma2.rawValue
             let source = isQwen ? " --from DIR" : ""
-            problems.append(.string("no model: run `aneembed models install --model \(name)\(source)` or pass --model-dir"))
+            problems.append(.string("no model: run `anerun models install --model \(name)\(source)` or pass --model-dir"))
         }
 
         let cache: String
@@ -113,7 +136,7 @@ public enum Doctor {
             } else if let manifest = manifestForPackage, warm.manifestSHA256 != manifest.sha256 {
                 cache = "stale: warmed for another model package (manifest sha256 \(warm.manifestSHA256.prefix(12))); the next start compiles again"
             } else if warm.binary != Executable.identity {
-                cache = "stale: warmed by another aneembed binary (\(warm.binaryVersion)); the first start compiles again"
+                cache = "stale: warmed by another anerun binary (\(warm.binaryVersion)); the first start compiles again"
             } else if warm.maxTokens < config.maxTokens {
                 cache = "partial: warmed up to \(warm.maxTokens) tokens, configured \(config.maxTokens)"
             } else if isTextOnly && (!Set(requiredFunctions).isSubset(of: warm.functions)
@@ -126,7 +149,7 @@ public enum Doctor {
         } else {
             cache = "cold: never warmed (the first start compiles for the Neural Engine)"
         }
-        if cache != "warm" && exists { problems.append(.string("run `aneembed models warm` (compile cache \(cache.prefix { $0 != ":" }))")) }
+        if cache != "warm" && exists { problems.append(.string("run `anerun models warm` (compile cache \(cache.prefix { $0 != ":" }))")) }
 
         // The self-test of the last load (serve, mcp, models warm/install): functions that failed are not served.
         var selfTest: JSONValue = "not run yet"
@@ -148,12 +171,7 @@ public enum Doctor {
         }
         if !engine.available && !config.useFakeRuntime { problems.append(.string("no Neural Engine")) }
 
-        return [
-            "aneembed": .string(aneembedVersion),
-            "macos": .string("\(os.majorVersion).\(os.minorVersion).\(os.patchVersion)"),
-            "macos_build": .string(operatingSystemBuild),
-            "neural_engine": engine.available ? .string("available (\(engine.cores) cores)") : "unavailable",
-            "runtime": .string(config.string("runtime")),
+        return result([
             "max_tokens": .int(config.maxTokens),
             // What a load with this --max-tokens compiles and self-tests (long functions only above 2048).
             "text_functions": .array((isTextOnly ? requiredFunctions : CoreMLBucketRunner.lengths(forMaxTokens: config.maxTokens).map(BucketContract.functionName)
@@ -163,6 +181,6 @@ public enum Doctor {
             "selftest": selfTest,
             "ready": .bool(problems.isEmpty),
             "problems": .array(problems),
-        ]
+        ])
     }
 }

@@ -18,7 +18,7 @@ struct ModelDownloader {
     /// Downloads `path` into `directory`, stopping as soon as it exceeds `size` (the manifest's) or, for
     /// manifest.json (`size` nil), DownloadLimit.manifestBytes. Returns the bytes of manifest.json.
     @discardableResult
-    private func fetch(_ path: String, to directory: URL, size: Int? = nil) async throws(ServiceError) -> Data {
+    func fetch(_ path: String, to directory: URL, size: Int? = nil) async throws(ServiceError) -> Data {
         let url = try source.url(for: path)
         let destination = directory.appendingPathComponent(path)
         let download = CappedDownload(destination: destination, declaredSize: size)

@@ -115,6 +115,7 @@ public final class EmbeddingService: Sendable {
                          param: "input",
                          hint: limit < runtime.info.maxTokens ? "raise --max-tokens (up to \(runtime.info.maxTokens))" : nil)
         }
+        if case .decision = modelID { throw modelID.unsupportedEmbedding }
         if !truncate, modelID == .embeddingGemma2, let bytesPerToken = tokenizer.maxBytesPerToken {
             let prefixBytes = inputType?.prefix.utf8.count ?? 0
             if let over = texts.firstIndex(where: { $0.utf8.count + prefixBytes > limit * bytesPerToken }) {

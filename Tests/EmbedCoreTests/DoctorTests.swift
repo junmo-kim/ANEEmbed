@@ -1,7 +1,9 @@
+import DecisionProfiles
 import Foundation
 import Testing
 
 @testable import EmbedCore
+@testable import anerun
 
 @Suite("Doctor")
 struct DoctorTests {
@@ -129,6 +131,42 @@ struct DoctorTests {
         #expect(Self.problems(config).contains { $0.contains("pinned in this build") })
         // The same files as --model-dir are checked against their own manifest only.
         #expect(!Self.problems(try Config(flags: ["model-dir": revision.path], environment: [:])).contains { $0.contains("pinned") })
+    }
+
+    @Test func cliReportsAnInvalidActiveManifest() async throws {
+        let (base, revision) = try Self.replacedPinnedRevision()
+        defer { try? FileManager.default.removeItem(at: base) }
+        try Data("{".utf8).write(to: revision.appendingPathComponent(ModelLayout.manifest))
+        let flags = ["data-dir": base.path, "model": ModelID.embeddingGemma2.rawValue, "runtime": "coreml"]
+        let config = try Config(flags: flags, environment: [:]).selectingModel(for: "doctor")
+        let report = Doctor.report(config, verify: true)
+        #expect(report["model"]?["dir"] == .string(revision.resolvingSymlinksInPath().path))
+        #expect(report["model"]?["manifest"] == "invalid")
+        #expect(report["ready"] == false)
+        let status = await CLI.run(["doctor", "--verify", "--format", "json", "--data-dir", base.path,
+                                    "--model", ModelID.embeddingGemma2.rawValue, "--runtime", "coreml"])
+        #expect(status == 0)
+    }
+
+    @Test func cliReportsDecisionBundleIdentityWithoutPreparing() async throws {
+        let directory = try Self.modelDirectory(manifest: false)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let profile = DecisionProfile.valen4B
+        let header: JSONValue = ["source": ["repo": .string(profile.repository), "revision": .string(profile.revision)]]
+        let descriptor = directory.appendingPathComponent("model.json")
+        try header.jsonData().write(to: descriptor)
+        let flags = ["model-dir": directory.path, "runtime": "coreml"]
+        let config = try Config(flags: flags, environment: [:]).selectingModel(for: "doctor")
+        let report = Doctor.report(config, verify: true)
+        #expect(report["model"]?["bundle_identity"] == "recognized")
+        #expect(report["model"]?["name"] == .string(profile.rawValue))
+        #expect(report["ready"] == false)
+        let status = await CLI.run(["doctor", "--verify", "--format", "json", "--model-dir", directory.path,
+                                    "--runtime", "coreml"])
+        #expect(status == 0)
+        try Data("{".utf8).write(to: descriptor)
+        let damaged = try Config(flags: flags, environment: [:]).selectingModel(for: "doctor")
+        #expect(Doctor.report(damaged)["model"]?["bundle_identity"] == "unverified")
     }
 
     @Test func fakeRuntimeNeedsNoModel() throws {

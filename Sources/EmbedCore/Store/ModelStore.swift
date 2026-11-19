@@ -137,7 +137,9 @@ public struct Manifest: Sendable, Equatable {
     /// Package name (`name`; older drafts used `model`).
     public var model: String
     public var modelID: ModelID? {
-        model == "embeddinggemma-2-ane" ? .embeddingGemma2 : ModelID(rawValue: model)
+        if model == "embeddinggemma-2-ane" { return .embeddingGemma2 }
+        guard let id = ModelID(rawValue: model), !id.isDecision else { return nil }
+        return id
     }
     public private(set) var pplxContract: PPLXPackageContract?
     /// Revision recorded in the manifest, if any (the published one is pinned by commit, not by this field).
@@ -232,7 +234,7 @@ public struct Manifest: Sendable, Equatable {
         do { data = try SmallFile.read(directory.appendingPathComponent(ModelLayout.manifest), limit: ModelLayout.manifestLimit) } catch {
             guard error != .missing else {
                 throw ServiceError(.unavailable, "manifest_missing", "no manifest.json in \(directory.path)",
-                                   hint: "install with `aneembed models install --model ID` or point --model-dir at a model package")
+                                   hint: "install with `anerun models install --model ID` or point --model-dir at a model package")
             }
             throw ServiceError(.unavailable, "invalid_manifest", "\(directory.path): \(error.describe(ModelLayout.manifest))")
         }
@@ -246,7 +248,7 @@ public struct Manifest: Sendable, Equatable {
         throw ServiceError(.unavailable, "pinned_manifest_mismatch",
                            "the installed package of the pinned revision is not the one pinned in this build: its "
                            + "manifest.json has sha256 \(sha256), not \(pinned)",
-                           hint: "reinstall it with `aneembed models install`")
+                           hint: "reinstall it with `anerun models install`")
     }
 
     /// Checks the package identity before a named load or install uses any of its files.
@@ -254,7 +256,7 @@ public struct Manifest: Sendable, Equatable {
         guard let modelID else { throw unsupportedModel(in: directory) }
         guard modelID == expected else {
             throw ServiceError(.invalidInput, "model_mismatch", "expected \(expected.rawValue) but found \(modelID.rawValue) in \(directory.path)",
-                               hint: "use the matching package with `aneembed models install --model \(expected.rawValue) --from DIR` "
+                               hint: "use the matching package with `anerun models install --model \(expected.rawValue) --from DIR` "
                                + "or point --model-dir at the package you want to load")
         }
     }
@@ -274,9 +276,9 @@ public struct Manifest: Sendable, Equatable {
         }
         if legacyLongPath {
             throw ServiceError(.unavailable, "unsupported_model",
-                               "the package has the per-layer long path of the first model layout; this aneembed runs the "
+                               "the package has the per-layer long path of the first model layout; this anerun runs the "
                                + "windowed layout (winp/winl functions)",
-                               hint: "install the model package this build pins (`aneembed models install`)")
+                               hint: "install the model package this build pins (`anerun models install`)")
         }
         let full = BucketContract.fullAttentionLengths
         let expectedBuckets = Dictionary(uniqueKeysWithValues: full.map { ($0, BucketContract.slots(forLength: $0)) })
@@ -284,7 +286,7 @@ public struct Manifest: Sendable, Equatable {
             throw ServiceError(.unavailable, "unsupported_model",
                                "the package declares buckets \(buckets.keys.sorted()) (slots \(buckets.keys.sorted().map { buckets[$0]! })); "
                                + "this build loads \(full) with max(8, S/32) slots",
-                               hint: "install the model package this build pins (`aneembed models install`), or update aneembed")
+                               hint: "install the model package this build pins (`anerun models install`), or update anerun")
         }
         let expectedPacking = Dictionary(uniqueKeysWithValues: WindowContract.packingLengths.map {
             ($0, BucketContract.slots(forLength: $0))
@@ -300,7 +302,7 @@ public struct Manifest: Sendable, Equatable {
                                "the package's windowed functions (\(declared)) differ from this build's (block "
                                + "\(WindowContract.block), halo \(WindowContract.halo), packing \(WindowContract.packingLengths), "
                                + "long \(WindowContract.longLengths))",
-                               hint: "install the model package this build pins (`aneembed models install`), or update aneembed")
+                               hint: "install the model package this build pins (`anerun models install`), or update anerun")
         }
     }
 
@@ -330,7 +332,7 @@ public struct Manifest: Sendable, Equatable {
             let compiled = directory.appendingPathComponent(compiledName)
             guard listed || FileManager.default.fileExists(atPath: compiled.path) else { return nil }
             guard FileManager.default.fileExists(atPath: compiled.path) else {
-                return (name, "not compiled: run `aneembed models warm`", true)
+                return (name, "not compiled: run `anerun models warm`", true)
             }
             let damaged = Self.compiledCoreFiles.filter { file in
                 guard case .success(let size) = Self.regularFileSize("\(compiledName)/\(file)", in: directory) else { return true }
@@ -338,7 +340,7 @@ public struct Manifest: Sendable, Equatable {
             }
             guard damaged.isEmpty else {
                 return (name, "incomplete: \(damaged.joined(separator: ", ")) missing or empty; reinstall, or remove "
-                    + "\(compiledName) and run `aneembed models warm`", true)
+                    + "\(compiledName) and run `anerun models warm`", true)
             }
             guard hash else { return (name, "compiled", false) }
             return (name, differing.contains(compiledName)
@@ -410,7 +412,7 @@ public struct Manifest: Sendable, Equatable {
         return .success(info.st_size)
     }
 
-    private static func fileProblem(_ file: ManifestEntry, in directory: URL, hash: Bool, progress: ((String) -> Void)? = nil)
+    package static func fileProblem(_ file: ManifestEntry, in directory: URL, hash: Bool, progress: ((String) -> Void)? = nil)
         -> Problem?
     {
         switch regularFileSize(file.path, in: directory) {
@@ -460,7 +462,7 @@ public struct Manifest: Sendable, Equatable {
 /// What `models warm` compiled, so a later start knows whether the OS cache is likely still warm.
 ///
 /// The OS keeps the Neural Engine compile per model path, macOS build and executable: the same binary
-/// copied to another path compiles again (measured), so an upgraded aneembed recompiles once too.
+/// copied to another path compiles again (measured), so an upgraded anerun recompiles once too.
 public struct WarmState: Sendable, Equatable {
     public var osBuild: String
     public var binaryVersion: String
@@ -677,7 +679,7 @@ public struct ModelStore: Sendable {
     private func missingModel(_ detail: String) -> ServiceError {
         let id = model?.rawValue ?? ModelID.embeddingGemma2.rawValue
         return ServiceError(.unavailable, "model_missing", "\(id): \(detail)",
-                            hint: "install with `aneembed models install --model \(id)` or set --model-dir to an existing package")
+                            hint: "install with `anerun models install --model \(id)` or set --model-dir to an existing package")
     }
 
     /// Validates the directories that hold a named install lock, allowing a new store to be created.

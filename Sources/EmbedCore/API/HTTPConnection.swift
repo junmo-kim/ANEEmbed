@@ -1,5 +1,5 @@
 // One HTTP/1.1 connection: frames requests from the byte stream (keep-alive, pipelining), answers each through a
-// handler and enforces the connection's time limits. Independent of the socket layer: `aneembed serve` passes a
+// handler and enforces the connection's time limits. Independent of the socket layer: `anerun serve` passes a
 // transport over its Network.framework connection, the tests an in-memory one.
 import Foundation
 

@@ -31,6 +31,7 @@ public enum ModelLoader {
         guard let model = config.modelID else {
             throw .badRequest("missing_model", "select a model with --model or --model-dir", param: "model")
         }
+        guard !model.isDecision else { throw model.unsupportedEmbedding }
         if config.useFakeRuntime {
             let tokenizer = fakeTokenizer(model, tokenizerURL: tokenizerURL)
             log("fake runtime (no model): vectors are deterministic stand-ins, not embeddings")
@@ -46,7 +47,7 @@ public enum ModelLoader {
         }
         guard FileManager.default.fileExists(atPath: directory.path) else {
             throw ServiceError(.unavailable, "model_missing", "no model directory at \(directory.path)",
-                               hint: "run `aneembed models install --model \(config.modelID?.rawValue ?? "embeddinggemma-2")` or pass --model-dir")
+                               hint: "run `anerun models install --model \(config.modelID?.rawValue ?? "embeddinggemma-2")` or pass --model-dir")
         }
         let (manifest, unavailablePackages) = try checkPackage(config, allowDegradedPPLX: true, log: log)
         if manifest.pplxContract != nil {
@@ -109,7 +110,7 @@ public enum ModelLoader {
                 vision = vision?.keeping(servable)
                 guard !buckets.lengths.isEmpty else {
                     throw ServiceError(.unavailable, "selftest_failed", "every text function failed the self-test on this Mac",
-                                       hint: "see `aneembed doctor`; please report the macOS build")
+                                       hint: "see `anerun doctor`; please report the macOS build")
                 }
             }
             let longRunner = long.flatMap {
@@ -150,6 +151,7 @@ public enum ModelLoader {
         }
         let directory = config.modelDirectory
         let file = directory.appendingPathComponent(ModelLayout.tokenizer)
+        guard !model.isDecision else { throw model.unsupportedEmbedding }
         if config.useFakeRuntime { return fakeTokenizer(model, tokenizerURL: file) }
         let manifest = try Manifest.load(from: directory)
         try manifest.checkModel(model, directory: directory)
@@ -161,9 +163,10 @@ public enum ModelLoader {
                   data.count == entry.size, SHA256Hasher.hex(data) == entry.sha256
             else {
                 throw ServiceError(.unavailable, "model_files_changed", "\(file.path) doesn't match its manifest",
-                                   hint: "reinstall with aneembed models install --model \(model.rawValue)")
+                                   hint: "reinstall with anerun models install --model \(model.rawValue)")
             }
             switch model {
+            case .decision: throw model.unsupportedEmbedding
             case .embeddingGemma2: return try GemmaTokenizer(data: data)
             case .pplx, .qwen3Embedding: return try QwenTokenizer(data: data).checked(for: model)
             }
@@ -171,7 +174,7 @@ public enum ModelLoader {
             throw error
         } catch {
             throw ServiceError(.unavailable, "tokenizer_missing", "\(file.path): \(error)",
-                               hint: "reinstall with aneembed models install --model \(model.rawValue)")
+                               hint: "reinstall with anerun models install --model \(model.rawValue)")
         }
     }
 
@@ -185,6 +188,7 @@ public enum ModelLoader {
 
     static func makeTokenizer(_ model: ModelID, from url: URL) throws -> any TextTokenizer {
         switch model {
+        case .decision: throw model.unsupportedEmbedding
         case .embeddingGemma2: return try GemmaTokenizer(contentsOf: url)
         case .pplx, .qwen3Embedding: return try QwenTokenizer(contentsOf: url).checked(for: model)
         }
@@ -210,7 +214,7 @@ public enum ModelLoader {
             throw ServiceError(.unavailable, "model_files_changed",
                                "the model files do not match manifest.json: "
                                + requiredAssets.map { "\($0.path) \($0.issue)" }.joined(separator: ", "),
-                               hint: "run `aneembed models verify`; reinstall with `aneembed models install`")
+                               hint: "run `anerun models verify`; reinstall with `anerun models install`")
         }
         var unavailable: [String: String] = [:]
         for (key, problems) in groups {

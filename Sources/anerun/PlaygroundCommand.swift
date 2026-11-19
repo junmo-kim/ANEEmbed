@@ -1,3 +1,4 @@
+import DecisionRuntime
 import EmbedCore
 import Foundation
 
@@ -15,7 +16,7 @@ struct PlaygroundCommand: Command {
             throw .badRequest("missing_model", "select a model with --model or --model-dir", param: "model")
         }
 
-        let seconds = config.int("idle-timeout")
+        let seconds = config.sources["idle-timeout"] == .default ? 300 : config.int("idle-timeout")
         let lifetime = PlaygroundLifetime(timeout: seconds > 0 ? .seconds(seconds) : nil)
         let router = PlaygroundRouter(config: config, model: model, lifetime: lifetime)
         let server = HTTPServer(host: "127.0.0.1", port: config.port, maxBody: config.maxBodyBytes,
@@ -112,23 +113,37 @@ private actor PlaygroundLifetime {
 private actor PlaygroundInference {
     let config: Config
     let model: ModelID
-    private var loading: Task<Router, Never>?
+    private var loading: Task<Result<any HTTPRouting, ServiceError>, Never>?
 
     init(config: Config, model: ModelID) {
         self.config = config
         self.model = model
     }
 
-    func router() async -> Router {
-        if let loading { return await loading.value }
-        let task = Task<Router, Never> { [config, model] in
+    func router() async throws(ServiceError) -> any HTTPRouting {
+        if let loading { return try await loading.value.get() }
+        let task = Task<Result<any HTTPRouting, ServiceError>, Never> { [config, model] in
+            if model.isDecision {
+                guard !config.useFakeRuntime else {
+                    return .failure(.badRequest("fake_runtime", "decision models require CoreAI", param: "runtime"))
+                }
+                #if canImport(CoreAI)
+                if #available(macOS 27.0, *) {
+                    // The engine serializes the first session load and owns model residency.
+                    return .success(DecisionRouter(engine: DecisionEngine(bundleURL: config.modelDirectory),
+                                                   model: config.modelName))
+                }
+                #endif
+                return .failure(ServiceError(.unavailable, "coreai_unavailable",
+                                             "decision models require macOS 27 and a build with CoreAI"))
+            }
             let state = ServerState()
             await load(into: state, config: config)
-            return Router(state: state, modelName: config.modelName, modelID: model,
-                                   configuredMaxTokens: config.maxTokens, log: { Log.info($0) })
+            return .success(Router(state: state, modelName: config.modelName, modelID: model,
+                                   configuredMaxTokens: config.maxTokens, log: { Log.info($0) }))
         }
         loading = task
-        return await task.value
+        return try await task.value.get()
     }
 }
 
@@ -137,6 +152,7 @@ private struct PlaygroundRouter: HTTPConnectionRouting {
     private let inference: PlaygroundInference
     private let modelName: String
     private let modelID: String
+    private let decision: Bool
     private let images: Bool
     private let hosts: Set<String>
 
@@ -145,7 +161,8 @@ private struct PlaygroundRouter: HTTPConnectionRouting {
         inference = PlaygroundInference(config: config, model: model)
         modelName = config.modelName
         modelID = model.rawValue
-        images = model.supportsImages
+        decision = model.isDecision
+        images = model.supportsImages || (decision && ["valen-4b", "elephant-1"].contains(model.rawValue))
         var hosts: Set<String> = ["127.0.0.1:\(config.port)", "localhost:\(config.port)"]
         if config.port == 80 { hosts.formUnion(["127.0.0.1", "localhost"]) }
         self.hosts = hosts
@@ -191,16 +208,21 @@ private struct PlaygroundRouter: HTTPConnectionRouting {
                                     body: Data(PlaygroundPage.html.utf8))
         case ("GET", "/playground/config"):
             response = .json(200, ["model": .string(modelName), "id": .string(modelID),
-                                   "kind": "embedding", "images": .bool(images)])
+                                   "kind": decision ? "decision" : "embedding", "images": .bool(images)])
         case ("POST", "/playground/stop"):
             guard let payload = try? JSONValue.parse(request.takeBody()), payload.objectValue != nil else {
                 return error(400, "invalid_json", "expected a JSON object")
             }
             await lifetime.requestStop()
             response = .json(200, ["status": "stopping"])
-        case ("POST", "/v1/embeddings"):
-            let router = await inference.router()
-            response = await router.handle(consume request)
+        case ("POST", "/v1/decisions") where decision, ("POST", "/v1/embeddings") where !decision:
+            do {
+                let router = try await inference.router()
+                response = await router.handle(consume request)
+            } catch {
+                Log.info(error.description)
+                response = .openAIError(error.publicFacing)
+            }
         default:
             return error(404, "not_found", "no playground route for this request")
         }

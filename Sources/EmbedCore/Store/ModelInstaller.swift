@@ -67,7 +67,7 @@ public final class InstallLock: @unchecked Sendable {
         }
         close(descriptor)
         throw ServiceError(.loading, "install_cancelled", "installation cancelled while waiting for \(path)",
-                           hint: "retry aneembed models install")
+                           hint: "retry anerun models install")
     }
 
     public func release() {
@@ -152,7 +152,7 @@ public enum ModelInstaller {
         if !trustedPin, let current = try? Manifest.load(from: preferred), current.sha256 != manifestSHA256 {
             throw ServiceError(.invalidInput, "revision_conflict",
                                "\(preferred.path) already has manifest \(current.sha256), received \(manifestSHA256)",
-                               hint: "install from a new revision or use aneembed models install --from DIR with the selected model")
+                               hint: "install from a new revision or use anerun models install --from DIR with the selected model")
         }
         let revision = preferred.lastPathComponent
         let active = try? store.activeDirectory()
@@ -217,7 +217,7 @@ public enum ModelInstaller {
 
     static func checkCancellation() throws(ServiceError) {
         guard !Task.isCancelled else {
-            throw ServiceError(.loading, "install_cancelled", "installation cancelled", hint: "retry aneembed models install")
+            throw ServiceError(.loading, "install_cancelled", "installation cancelled", hint: "retry anerun models install")
         }
     }
 

@@ -3,7 +3,7 @@ import Foundation
 
 enum CLI {
     static let usage = """
-        anerun \(aneembedVersion): embeddings on the Apple Neural Engine
+        anerun \(aneembedVersion): embeddings and decisions on the Apple Neural Engine
 
         USAGE
           anerun embed [TEXT ...] [--stdin] [--image PATH ...] [--prompt query|document]
@@ -11,14 +11,15 @@ enum CLI {
           anerun similarity A B [--image-a PATH] [--image-b PATH] [--prompt query|document]
                          [--prompt-a ...] [--prompt-b ...] [--no-truncate] [--dimensions N] [--format yaml|json]
           anerun tokenize [TEXT ...] [--stdin] [--prompt query|document] [--show-tokens] [--format yaml|json]
+          anerun decide --stdin    Decision request as JSON (state, questions, optional base64 image)
           anerun doctor [--verify] [--format yaml|json]
           anerun models path | verify | warm
           anerun models install --model ID [--from DIR | --repo R --revision COMMIT]
           anerun bench [--sizes 32,128,...] [--repeat N] [--image PATH] [--concurrency N] [--buckets]
                          [--breakdown] [--settle SECONDS] [--format yaml|json]
           anerun serve        HTTP: OpenAI /v1/embeddings, /v1/models, /health, POST /tokenize, /detokenize,
-                                POST /mcp, QUERY /{tool}
-          anerun playground [--no-open]   Local semantic search, loads on first request
+                                POST /mcp, QUERY /{tool}; decision models serve POST /v1/decisions
+          anerun playground [--no-open] [--idle-timeout SECONDS]  Local browser UI (5 min idle by default)
           anerun mcp          MCP over stdio (newline-delimited JSON-RPC 2.0)
           anerun --version | --help | <command> --print-config
 
@@ -49,6 +50,7 @@ enum CLI {
         do throws(ServiceError) {
             let handler: Command
             switch command {
+            case "decide": handler = DecideCommand()
             case "embed": handler = EmbedCommand()
             case "similarity": handler = SimilarityCommand()
             case "tokenize": handler = TokenizeCommand()
@@ -88,6 +90,9 @@ enum CLI {
                 return ExitCode.success.rawValue
             }
             let selected = try config.selectingModel(for: commandName, requiresName: isInstall, required: needsModel)
+            if command != "doctor", command != "playground", let model = selected.modelID, model.isDecision {
+                return try await DecisionCommands.run(commandName, arguments: parsed, config: selected, model: model, format: format).rawValue
+            }
             return try await handler.run(parsed, config: selected, format: format).rawValue
         } catch {
             Output.write(error.structured.render(as: format) + "\n", to: FileHandle.standardError)
@@ -403,7 +408,7 @@ struct ModelsCommand: Command {
         guard source.isPublished else {
             throw ServiceError(.unavailable, "model_not_published",
                                "no published revision of \(model.rawValue) is pinned in this build",
-                               hint: "run aneembed models install --model \(model.rawValue) --from DIR, or supply --repo and --revision")
+                               hint: "run anerun models install --model \(model.rawValue) --from DIR, or supply --repo and --revision")
         }
         let store = ModelStore(dataDirectory: config.dataDirectory, model: model)
         let target = try store.directory(for: source.revision)
@@ -487,7 +492,7 @@ struct ModelsCommand: Command {
         }
         guard !Task.isCancelled else {
             throw ServiceError(.loading, "install_cancelled", "installation cancelled before activating \(revision)",
-                               hint: "retry aneembed models install")
+                               hint: "retry anerun models install")
         }
         do { try store.activate(revision: revision) } catch {
             throw ServiceError(.internal, "activate_failed", "cannot switch to \(revision): \(error.localizedDescription)")

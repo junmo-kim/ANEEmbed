@@ -1,4 +1,4 @@
-// `aneembed bench`: latency, throughput and memory of this binary on this Mac, in process (no socket).
+// `anerun bench`: latency, throughput and memory of this binary on this Mac, in process (no socket).
 //
 // Requests go through the same Router as `serve` (JSON parse, tokenize, schedule, Core ML, JSON encode),
 // so the numbers are what a client sees minus the loopback round trip. Texts use a fixed bilingual

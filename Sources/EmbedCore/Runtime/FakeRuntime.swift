@@ -6,6 +6,7 @@ import Foundation
 public enum FakeRuntime {
     public static func make(maxTokens: Int, modelID: ModelID = .embeddingGemma2) -> any EmbeddingRuntime {
         switch modelID {
+        case .decision: preconditionFailure("Expected an embedding model")
         case .embeddingGemma2: return make(maxTokens: maxTokens)
         case .pplx, .qwen3Embedding: return FakePPLXRuntime(maxTokens: maxTokens)
         }

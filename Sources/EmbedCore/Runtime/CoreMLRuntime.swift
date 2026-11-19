@@ -118,7 +118,7 @@ func checkSignature(_ model: MLModel, name: String, inputs: [(String, [Int])], o
     let available = model.modelDescription.inputDescriptionsByName
     for (input, shape) in inputs {
         guard let constraint = available[input]?.multiArrayConstraint else {
-            throw RuntimeError.model("\(name) has no \(input) input (this aneembed expects \(layout))")
+            throw RuntimeError.model("\(name) has no \(input) input (this anerun expects \(layout))")
         }
         guard constraint.shape.map(\.intValue) == shape else {
             throw RuntimeError.model("\(name).\(input) is \(constraint.shape), want \(shape)")

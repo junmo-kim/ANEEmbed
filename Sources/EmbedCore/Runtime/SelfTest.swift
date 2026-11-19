@@ -159,11 +159,11 @@ public struct SelfTestSuite: Sendable {
             throw ServiceError(.unavailable, "selftest_missing",
                                "the package in \(directory.path) has no self-test data (\(ModelLayout.selfTest), "
                                + "\(ModelLayout.selfTestData)): its functions cannot be checked on this Mac",
-                               hint: "reinstall with `aneembed models install`; --selftest skip serves unchecked (unsafe)")
+                               hint: "reinstall with `anerun models install`; --selftest skip serves unchecked (unsafe)")
         }
         func invalid(_ message: String) -> ServiceError {
             ServiceError(.unavailable, "invalid_selftest", "cannot read the package's self-test: \(message)",
-                         hint: "check the package with `aneembed models verify`, or reinstall it")
+                         hint: "check the package with `anerun models verify`, or reinstall it")
         }
         guard let declared = manifest.files.first(where: { $0.path == ModelLayout.selfTestData })?.size else {
             throw invalid("\(ModelLayout.selfTestData) is not listed in \(ModelLayout.manifest)")

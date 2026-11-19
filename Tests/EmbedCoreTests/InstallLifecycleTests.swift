@@ -1,7 +1,9 @@
+import DecisionProfiles
 import Foundation
 import Testing
 
 @testable import EmbedCore
+@testable import anerun
 
 @Suite("Model installation lifecycle")
 struct InstallLifecycleTests {
@@ -81,6 +83,40 @@ struct InstallLifecycleTests {
             throw ServiceError(.internal, "unexpected_fetch", "the verified repair should be reused")
         }
         #expect(resumed == installed)
+    }
+
+    @Test func decisionRetryReusesPublishedRepairAfterPrepareFails() async throws {
+        let base = try directory()
+        defer { try? FileManager.default.removeItem(at: base) }
+        let source = base.appendingPathComponent("bundle")
+        try FileManager.default.createDirectory(at: source, withIntermediateDirectories: false)
+        let profile = DecisionProfile.valen4B
+        let model = ModelID.decision(profile)
+        let header: JSONValue = ["source": ["repo": .string(profile.repository), "revision": .string(profile.revision)]]
+        try header.jsonData().write(to: source.appendingPathComponent("model.json"))
+        let payload = Data("working".utf8)
+        try payload.write(to: source.appendingPathComponent("payload"))
+        let store = ModelStore(dataDirectory: base, model: model)
+        let original = try await DecisionInstall.install(source, model: model, store: store, prepare: { _ in })
+        try Data("damaged".utf8).write(to: original.appendingPathComponent("payload"))
+
+        var pending: URL?
+        let error = await #expect(throws: ServiceError.self) {
+            try await DecisionInstall.install(source, model: model, store: store) { directory throws(ServiceError) in
+                pending = directory
+                throw ServiceError(.unavailable, "prepare_failed", "simulated interruption")
+            }
+        }
+        #expect(error?.reason == "prepare_failed")
+        let repair = try #require(pending)
+        #expect(repair != original)
+        #expect(try store.resolveDirectory() == original)
+        let installed = try await DecisionInstall.install(source, model: model, store: store) { directory in
+            #expect(directory == repair)
+        }
+        #expect(installed == repair)
+        #expect(try store.resolveDirectory() == repair)
+        #expect(try Data(contentsOf: repair.appendingPathComponent("payload")) == payload)
     }
 
     @Test func retriesSelectOnlyTheVerifiedActiveRepairOfTheRequestedRevision() throws {

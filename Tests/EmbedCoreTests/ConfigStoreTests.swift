@@ -128,6 +128,30 @@ struct ModelStoreTests {
         return url
     }
 
+    @Test func decisionBundlesUseTheSameNamedPointerAndRequireThePinnedCheckpoint() throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let model = ModelID.decision(.glide2B)
+        let store = ModelStore(dataDirectory: root, model: model)
+        let bundle = try store.directory(for: "fixture")
+        try FileManager.default.createDirectory(at: bundle, withIntermediateDirectories: true)
+        let manifest = bundle.appendingPathComponent("model.json")
+        func writeRevision(_ revision: String) throws {
+            let header: JSONValue = ["source": ["repo": "fastino/GLiDE-2B", "revision": .string(revision)]]
+            try header.jsonData().write(to: manifest)
+        }
+        try writeRevision("00f122c120cdeed82284106cb77d9bab5a50ad16")
+        try store.activate(revision: "fixture")
+        let named = try Config(flags: ["data-dir": root.path, "model": "glide-2b"], environment: [:])
+            .selectingModel(for: "serve")
+        let direct = try Config(flags: ["model-dir": bundle.path], environment: [:]).selectingModel(for: "decide")
+        #expect(named.modelID == model && direct.modelID == model)
+        #expect(named.modelDirectory == direct.modelDirectory)
+        #expect(throws: ServiceError.self) { try ModelID.identify(in: bundle, expected: .decision(.valen4B)) }
+        try writeRevision("wrong")
+        #expect(throws: ServiceError.self) { try ModelID.identify(in: bundle) }
+    }
+
     @Test func namedStoresKeepIndependentPointersAndSnapshotTheResolvedRevision() throws {
         let directory = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: directory) }
@@ -694,7 +718,7 @@ struct ModelStoreTests {
         let config = try raw.selectingModel(for: "serve")
         #expect(config.pinnedManifestSHA256 == ModelSource.pinned.manifestSHA256)
         let error = #expect(throws: ServiceError.self) { try ModelLoader.checkPackage(config) }
-        #expect(error?.reason == "pinned_manifest_mismatch" && error?.hint?.contains("aneembed models install") == true)
+        #expect(error?.reason == "pinned_manifest_mismatch" && error?.hint?.contains("anerun models install") == true)
 
         let explicit = try Config(flags: ["model-dir": revision.path], environment: [:])
         #expect(explicit.pinnedManifestSHA256 == nil)

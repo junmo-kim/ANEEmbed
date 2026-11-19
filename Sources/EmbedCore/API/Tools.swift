@@ -134,6 +134,7 @@ public enum Tools {
     public static func definitions(for modelID: ModelID, maxContextLength: Int? = nil) -> [JSONValue] {
         let catalog: [JSONValue]
         switch modelID {
+        case .decision: return []
         case .embeddingGemma2: catalog = definitions
         case .pplx: catalog = pplxDefinitions
         case .qwen3Embedding: catalog = qwenDefinitions

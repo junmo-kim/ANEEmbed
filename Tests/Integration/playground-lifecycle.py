@@ -51,10 +51,13 @@ def call(port, method, path, payload=None):
 
 def main(binary):
     with tempfile.TemporaryDirectory() as tmp:
-        # The selector reads the manifest, but the UI needs no model payload.
-        (Path(tmp) / "manifest.json").write_text(json.dumps({"name": "embeddinggemma-2", "files": []}))
+        # A recognized header with no model assets can display the UI on any build.
+        directory = Path(tmp)
+        (directory / "model.json").write_text(json.dumps({"source": {
+            "repo": "Valen-Team/Valen-Decision-1.5-4B",
+            "revision": "9b0cacc976d7fb72f252ee1adb1564f5f15e462c"}}))
         with playground(binary, "--model-dir", tmp, idle=2) as (server, port, config):
-            assert config["kind"] == "embedding" and config["images"] is True, config
+            assert config["kind"] == "decision" and config["images"] is True, config
             assert call(port, "GET", "/playground")[0] == 200
             assert server.wait(timeout=10) == 0
 

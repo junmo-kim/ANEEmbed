@@ -13,6 +13,7 @@ public enum Vectors {
 
     static func supportedDimensions(for modelID: ModelID) -> [Int] {
         switch modelID {
+        case .decision: preconditionFailure("Expected an embedding model")
         case .embeddingGemma2: dimensions
         case .pplx: pplxDimensions
         case .qwen3Embedding: qwenDimensions
@@ -26,6 +27,7 @@ public enum Vectors {
     static func validateDimensions(_ value: Int?, modelID: ModelID) throws(ServiceError) -> Int {
         let allowed: String
         switch modelID {
+        case .decision: throw modelID.unsupportedEmbedding
         case .embeddingGemma2: allowed = "one of \(dimensions.map(String.init).joined(separator: ", "))"
         case .pplx: allowed = "an integer from 1 to \(pplxDimension)"
         case .qwen3Embedding: allowed = "an integer from \(qwenDimensionRange.lowerBound) to \(qwenDimensionRange.upperBound)"
@@ -58,6 +60,7 @@ public enum Vectors {
     /// Applies the selected model's output transform to the requested prefix.
     public static func output(_ vector: [Float], to dimensions: Int, modelID: ModelID) -> [Float] {
         switch modelID {
+        case .decision: preconditionFailure("Expected an embedding model")
         case .embeddingGemma2, .qwen3Embedding:
             return truncated(vector, to: dimensions)
         case .pplx:
@@ -104,6 +107,7 @@ public enum InputType: String, Sendable, CaseIterable {
 
     public func apply(_ text: String, modelID: ModelID) -> String {
         switch modelID {
+        case .decision: preconditionFailure("Expected an embedding model")
         case .embeddingGemma2: apply(text)
         case .pplx: text
         case .qwen3Embedding:

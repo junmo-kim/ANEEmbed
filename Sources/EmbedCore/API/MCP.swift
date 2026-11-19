@@ -1,4 +1,4 @@
-// MCP over JSON-RPC 2.0: initialize, ping, tools/list, tools/call. Used by `aneembed mcp` (stdio,
+// MCP over JSON-RPC 2.0: initialize, ping, tools/list, tools/call. Used by `anerun mcp` (stdio,
 // newline-delimited) and `POST /mcp`. Tool failures are results with isError and a structured text
 // (error/reason/detail/hint) the agent can act on; protocol errors are JSON-RPC errors.
 import Foundation

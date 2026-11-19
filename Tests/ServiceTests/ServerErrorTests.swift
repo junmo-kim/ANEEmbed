@@ -52,7 +52,7 @@ struct ServerErrorTests {
 
     @Test func aFailedLoadIsGeneric() async throws {
         let failure = ServiceError(.unavailable, "model_missing", "no model directory at \(Self.secret)/models/current",
-                                   hint: "run `aneembed models install`, or pass --model-dir")
+                                   hint: "run `anerun models install`, or pass --model-dir")
         let router = Router(state: ServerState(.failed(failure)), modelName: "m")
         let health = await router.handle(HTTPRequest(method: "GET", path: "/health"))
         #expect(health.status == 503 && !body(health).contains(Self.secret))

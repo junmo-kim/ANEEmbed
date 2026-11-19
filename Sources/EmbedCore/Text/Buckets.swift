@@ -122,7 +122,7 @@ public struct PackingPlanner: Sendable {
     /// Estimated cost of one call per bucket length (any unit).
     public let costs: [Int: Double]
 
-    /// Per-call latency in ms of each packing function, one text filling it (`aneembed bench --buckets`,
+    /// Per-call latency in ms of each packing function, one text filling it (`anerun bench --buckets`,
     /// Apple M5 Ultra, macOS 27). Only the ratios matter to the planner; other chips scale them roughly
     /// together.
     public static let defaultCosts: [Int: Double] = [

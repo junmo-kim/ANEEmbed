@@ -1,4 +1,4 @@
-// HTTP routes of `aneembed serve`, independent of the socket layer:
+// HTTP routes of `anerun serve`, independent of the socket layer:
 //
 //   POST  /v1/embeddings (/embeddings)   OpenAI-compatible embeddings
 //   GET   /v1/models (/models)           the model id and its limits
@@ -9,6 +9,7 @@
 //   QUERY /{tool}?<options>              one-shot tool call (RFC 10008 QUERY, as in macvis): the body is the
 //                                        raw input (UTF-8 text for embed_text, image bytes for embed_image)
 //                                        or, with Content-Type application/json, the tool arguments
+import DecisionProfiles
 import Foundation
 
 public struct Router: Sendable {
@@ -222,17 +223,5 @@ extension HTTPResponse {
         var copy = self
         copy.status = status
         return copy
-    }
-}
-
-/// Measures a single request with a monotonic clock, before response serialization.
-private struct InputProcessingTimer {
-    private let start = ContinuousClock.now
-
-    func tokensPerSecond(_ inputTokens: Int) -> Double? {
-        let elapsed = start.duration(to: .now).components
-        let seconds = Double(elapsed.seconds) + Double(elapsed.attoseconds) / 1e18
-        guard inputTokens > 0, seconds > 0 else { return nil }
-        return Double(inputTokens) / seconds
     }
 }

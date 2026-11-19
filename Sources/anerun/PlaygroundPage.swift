@@ -16,7 +16,7 @@ enum PlaygroundPage {
     [hidden] { display: none !important }
     body { margin: 0; color: var(--ink); background: var(--paper) }
     main { width: min(1160px, 100%); margin: auto; padding: clamp(16px, 4vw, 48px) }
-    header, .row, .panel-head, .metrics { display: flex; align-items: center; gap: 10px; flex-wrap: wrap }
+    header, .row, .panel-head, .question-head, .metrics { display: flex; align-items: center; gap: 10px; flex-wrap: wrap }
     header, .panel-head { justify-content: space-between }
     header { padding-bottom: 18px; border-bottom: 1px solid var(--line) }
     .brand { font-weight: 780; letter-spacing: -.035em; font-size: 1.25rem }
@@ -33,7 +33,7 @@ enum PlaygroundPage {
     h3 { font-size: .97rem; overflow-wrap: anywhere }
     label, legend { display: block; font-weight: 650; min-width: 0 }
     label > input:not([type=checkbox]), label > textarea, label > select { margin-top: 4px }
-    .stack, #result { display: grid; gap: 12px }
+    .stack, #questions, .candidates, #result { display: grid; gap: 12px }
     .grow { flex: 1 1 140px }
     .hint, .empty, .subtle, small { color: var(--muted); font-size: .86rem }
     .empty { padding: 24px 12px; text-align: center; border: 1px dashed var(--line); border-radius: 8px }
@@ -46,10 +46,23 @@ enum PlaygroundPage {
     button:disabled { cursor: default; opacity: .52 }
     .primary { background: var(--green); border-color: var(--green); color: white; padding: 8px 14px }
     .primary:hover:not(:disabled) { background: #174134 }
-    #stop { color: var(--error) }
+    .remove, #stop { color: var(--error) }
     :focus-visible { outline: 3px solid #447d68; outline-offset: 2px }
+    fieldset { min-width: 0; margin: 0; padding: 10px; border: 1px solid var(--line); border-radius: 9px }
+    legend { padding: 0 5px }
+    .question-head { justify-content: space-between }
+    .candidates { margin: 9px 0 }
+    .candidate { display: grid; grid-template-columns: minmax(62px, 1fr) minmax(100px, 2fr) auto; align-items: end; gap: 6px }
+    .candidate label { font-size: .8rem }
+    .score-key { align-self: center; font: .8rem ui-monospace, monospace; color: var(--muted) }
+    .candidate button { min-height: 36px }
     .actions { border-top: 1px solid var(--line); padding-top: 12px }
     .metrics { gap: 5px 12px; font: .8rem ui-monospace, monospace; color: var(--green) }
+    .answer { border: 1px solid var(--line); border-radius: 9px; padding: 10px 12px }
+    .value { font-weight: 750; color: var(--green); overflow-wrap: anywhere }
+    .prob { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 2px 8px; margin-top: 7px; font-size: .85rem; overflow-wrap: anywhere }
+    meter { grid-column: 1 / -1; width: 100%; height: 8px; accent-color: var(--green) }
+    meter::-webkit-meter-optimum-value { background: var(--green) }
     .ranks { margin: 0; padding-left: 2rem }
     .ranks li { padding: 7px 0; overflow-wrap: anywhere; border-bottom: 1px solid var(--line) }
     .ranks li:last-child { border: 0 }
@@ -66,6 +79,7 @@ enum PlaygroundPage {
     pre { max-height: 260px; overflow: auto; background: var(--paper); padding: 10px; font: .78rem ui-monospace, monospace }
     summary { cursor: pointer; font-weight: 650 }
     @media (max-width: 760px) { .workbench { grid-template-columns: minmax(0, 1fr) } }
+    @media (max-width: 370px) { .candidate { grid-template-columns: minmax(0, 1fr) minmax(0, 1.45fr); } .candidate button { grid-column: 2; justify-self: end } }
     </style>
     </head>
     <body>
@@ -74,18 +88,24 @@ enum PlaygroundPage {
         <div class="row"><span class="mark" aria-hidden="true">∿</span><span class="brand">ANERun</span><span id="model" class="model">Connecting…</span></div>
         <button id="stop" type="button" disabled>Stop server</button>
       </header>
-      <div class="intro"><h1 id="title">Semantic search</h1><p id="subtitle">Rank local documents by cosine similarity to a query.</p></div>
+      <div class="intro"><h1 id="title">Playground</h1><p id="subtitle">Run the model served by this local instance.</p></div>
       <div id="workbench" class="workbench" hidden>
         <section class="panel" aria-labelledby="input-heading">
           <div class="panel-head">
             <h2 id="input-heading">Request</h2>
             <div class="row">
               <button id="example" type="button">Load example</button>
-              <button class="primary" id="run" type="submit" form="form">Rank documents</button>
+              <button class="primary" id="run" type="submit" form="form">Run</button>
             </div>
           </div>
           <form id="form" class="stack" autocomplete="off">
-            <div class="stack" id="embedding">
+            <div class="stack" id="decision" hidden>
+              <label>State<textarea id="state" rows="3" autocomplete="off" spellcheck="false" placeholder="Enter text or paste serialized JSON"></textarea></label>
+              <label id="decision-image-field" hidden>State image <span class="hint">(optional)</span><input id="decision-image" type="file" accept="image/*"></label>
+              <div id="questions"></div>
+              <div><button type="button" id="add-question">Add question</button></div>
+            </div>
+            <div class="stack" id="embedding" hidden>
               <label>Documents<textarea id="documents" rows="5" autocomplete="off" spellcheck="false" placeholder="One document per line"></textarea></label>
               <label id="document-image-field" hidden>Image documents <span class="hint">(optional)</span><input id="document-images" type="file" accept="image/*" multiple></label>
               <p class="hint" id="cache">Document vectors are kept in this page.</p>
@@ -120,9 +140,9 @@ enum PlaygroundPage {
       if (className) element.className = className;
       return element;
     };
-    const form = byId('form'), result = byId('result');
+    const form = byId('form'), questions = byId('questions'), result = byId('result');
     const run = byId('run'), copy = byId('copy'), stop = byId('stop');
-    let config, revision = 0, pending, stopped = false;
+    let config, revision = 0, pending, stopped = false, nextQuestion = 0;
     let vectors = new Map();
     const recentRuns = [];
     let historyVersion = 0;
@@ -171,17 +191,98 @@ enum PlaygroundPage {
       cacheStatus();
       status('');
     }
+    function field(label, value, className, multiline = false) {
+      const control = node(multiline ? 'textarea' : 'input');
+      control.autocomplete = 'off';
+      control.spellcheck = false;
+      if (multiline) control.rows = 2;
+      control.className = className;
+      control.value = value;
+      const wrap = node('label', label);
+      wrap.className = 'grow';
+      wrap.append(control);
+      return wrap;
+    }
+    function button(label, action, className) {
+      const element = node('button', label, className);
+      element.type = 'button';
+      element.dataset.action = action;
+      return element;
+    }
+    function addCandidate(container, key = '', description = '') {
+      const row = node('div', undefined, 'candidate');
+      const remove = button('Remove', 'remove-candidate', 'remove');
+      remove.setAttribute('aria-label', 'Remove candidate');
+      const level = node('span', undefined, 'score-key');
+      level.hidden = true;
+      row.append(field('Key', key, 'candidate-key'), level,
+        field('Description', description, 'candidate-description'), remove);
+      container.append(row);
+    }
+    function showCandidateKeys(card) {
+      const score = card.querySelector('.kind').value === 'score';
+      [...card.querySelectorAll('.candidate')].forEach((row, index) => {
+        row.querySelector('.candidate-key').parentElement.hidden = score;
+        const level = row.querySelector('.score-key');
+        level.hidden = !score;
+        level.textContent = 'Level ' + index;
+      });
+    }
+    function addQuestion(question = {}) {
+      const card = node('fieldset', undefined, 'stack question');
+      const number = ++nextQuestion;
+      const head = node('div', undefined, 'question-head');
+      const name = field('Question name', question.name ?? ('question_' + number), 'question-name');
+      const kind = node('select', undefined, 'kind');
+      kind.autocomplete = 'off';
+      const kinds = [['choice', 'Choice'], ['noul', 'Yes / no']];
+      if (config.id !== 'k-decision-9b') kinds.push(['score', 'Score']);
+      for (const [value, label] of kinds) {
+        const option = node('option', label);
+        option.value = value;
+        kind.append(option);
+      }
+      kind.value = question.kind ?? 'choice';
+      const kindLabel = node('label', 'Answer type', 'grow');
+      kindLabel.append(kind);
+      head.append(name, kindLabel);
+      const options = node('div', undefined, 'option-group');
+      const rows = node('div', undefined, 'candidates');
+      for (const candidate of question.candidates ?? [{key: '', description: ''}, {key: '', description: ''}]) {
+        addCandidate(rows, candidate.key, candidate.description);
+      }
+      options.append(rows, button('Add candidate', 'add-candidate'));
+      options.hidden = kind.value === 'noul';
+      card.append(node('legend', 'Question ' + number), head,
+        field('Instructions', question.instructions ?? '', 'instructions', true), options,
+        button('Remove question', 'remove-question', 'remove'));
+      questions.append(card);
+      showCandidateKeys(card);
+      return name.querySelector('input');
+    }
     function loadExample() {
+      const billing = {name: 'team', kind: 'choice', instructions: 'Which team should handle this request?',
+        candidates: [{key: 'billing', description: 'Charges, invoices, and refunds'},
+          {key: 'technical', description: 'Product errors and outages'}]};
       byId('truncate').checked = true;
-      byId('document-images').value = byId('query-image').value = '';
-      byId('documents').value = 'Refunds are issued to the original payment method within five business days.\nReset your password from the sign-in page.\nTrack shipments using the link in your dispatch email.';
-      byId('query').value = 'How long will my refund take?';
+      if (config.kind === 'decision') {
+        questions.replaceChildren();
+        nextQuestion = 0;
+        byId('decision-image').value = '';
+        byId('state').value = 'I was charged twice for the same order. Please refund the extra charge.';
+        addQuestion(billing);
+      } else {
+        byId('document-images').value = byId('query-image').value = '';
+        byId('documents').value = 'Refunds are issued to the original payment method within five business days.\nReset your password from the sign-in page.\nTrack shipments using the link in your dispatch email.';
+        byId('query').value = 'How long will my refund take?';
+      }
       invalidate();
     }
     function resetPage(showExample = false) {
       clearHistory();
       vectors.clear();
       form.reset();
+      questions.replaceChildren();
       if (showExample && config && !stopped) loadExample();
       else invalidate();
     }
@@ -189,6 +290,38 @@ enum PlaygroundPage {
     window.addEventListener('pageshow', event => {
       if (event.persisted) resetPage(true);
     });
+    questions.addEventListener('change', event => {
+      if (event.target.matches('.kind')) {
+        const options = event.target.closest('.question').querySelector('.option-group');
+        options.hidden = event.target.value === 'noul';
+        if (!options.hidden && !options.querySelector('.candidate')) {
+          addCandidate(options.querySelector('.candidates'));
+          addCandidate(options.querySelector('.candidates'));
+        }
+        showCandidateKeys(event.target.closest('.question'));
+      }
+    });
+    questions.addEventListener('click', event => {
+      const action = event.target.dataset.action;
+      if (!action) return;
+      const card = event.target.closest('.question');
+      if (action === 'remove-question') {
+        card.remove();
+        (questions.querySelector('.question-name') ?? byId('add-question')).focus();
+      } else if (action === 'remove-candidate') {
+        event.target.closest('.candidate').remove();
+        card.querySelector('[data-action=add-candidate]').focus();
+      } else {
+        const rows = card.querySelector('.candidates');
+        addCandidate(rows);
+        showCandidateKeys(card);
+        rows.lastElementChild.querySelector(card.querySelector('.kind').value === 'score'
+          ? '.candidate-description' : '.candidate-key').focus();
+      }
+      if (action === 'remove-candidate') showCandidateKeys(card);
+      invalidate();
+    });
+    byId('add-question').onclick = () => { addQuestion().focus(); invalidate(); };
     byId('example').onclick = loadExample;
     form.addEventListener('input', invalidate);
     form.addEventListener('change', event => { if (event.target.type === 'file') invalidate(); });
@@ -199,7 +332,7 @@ enum PlaygroundPage {
       reader.onerror = () => reject(new Error('Could not read ' + file.name + '.'));
       reader.readAsDataURL(file);
     });
-    const endpoint = '/v1/embeddings';
+    const endpoints = {decision: '/v1/decisions', embedding: '/v1/embeddings'};
     async function api(path, body, signal) {
       const options = {signal, redirect: 'error', cache: 'no-store', mode: 'same-origin'};
       if (body !== undefined) {
@@ -214,6 +347,35 @@ enum PlaygroundPage {
       if (!response.ok) throw new Error(data?.error?.message ?? (response.status + ' ' + response.statusText));
       if (!data && path !== '/playground/stop') throw new Error('The server did not return JSON.');
       return data;
+    }
+    function decisionSnapshot() {
+      const items = [...questions.children].map(card => {
+        const get = selector => card.querySelector(selector).value;
+        const kind = get('.kind');
+        const candidates = kind === 'noul' ? [] : [...card.querySelectorAll('.candidate')].map((row, i) => ({
+          key: kind === 'score' ? String(i) : row.querySelector('.candidate-key').value.trim(),
+          description: row.querySelector('.candidate-description').value.trim()
+        }));
+        return {name: get('.question-name').trim(), kind, instructions: get('.instructions'), candidates};
+      });
+      if (!items.length) throw new Error('Add at least one question.');
+      if (items.some(item => !item.name || !item.instructions.trim()) ||
+          new Set(items.map(item => item.name)).size !== items.length) {
+        throw new Error('Give each question a unique name and instructions.');
+      }
+      for (const item of items) {
+        if (item.kind === 'noul') continue;
+        if (item.candidates.length < 2 || item.candidates.some(c => !c.key || !c.description) ||
+            new Set(item.candidates.map(c => c.key)).size !== item.candidates.length) {
+          throw new Error('Add at least two candidates with unique keys and descriptions for ' + item.name + '.');
+        }
+      }
+      return {body: {model: config.model, state: byId('state').value, questions: items, truncate: byId('truncate').checked},
+        file: config.images ? byId('decision-image').files[0] : undefined};
+    }
+    async function decisionBody(snapshot) {
+      if (snapshot.file) snapshot.body.image = (await readImage(snapshot.file)).split(',', 2)[1];
+      return snapshot.body;
     }
     function documents() {
       const texts = byId('documents').value.split(/\r?\n/).filter(text => text.trim()).map(text => ({text, label: text}));
@@ -268,7 +430,7 @@ enum PlaygroundPage {
     }
     async function fetchVector(item, type, truncate, signal) {
       const body = await embeddingBody(item, type, truncate);
-      const response = await api(endpoint, body, signal);
+      const response = await api(endpoints.embedding, body, signal);
       const row = response?.data?.find?.(entry => entry.index === 0);
       const unit = normalized(row?.embedding);
       if (!unit) throw new Error('The server returned an invalid or zero-norm embedding.');
@@ -294,6 +456,50 @@ enum PlaygroundPage {
       matches.sort((a, b) => b.score - a.score || a.index - b.index);
       return {matches, nextCache, dimensions: query.unit.length, clipped: query.clipped};
     }
+    const percent = value => (value * 100).toFixed(1) + '%';
+    function probability(container, label, value) {
+      if (!Number.isFinite(value)) return;
+      const row = node('div', undefined, 'prob');
+      const meter = node('meter');
+      meter.min = 0; meter.max = 1; meter.value = value;
+      meter.setAttribute('aria-label', label + ' probability');
+      row.append(node('span', label), node('span', percent(value)), meter);
+      container.append(row);
+    }
+    function decisionResult(data, items) {
+      if (!data?.answers || typeof data.answers !== 'object') throw new Error('The server returned no answers.');
+      let summary;
+      const answers = items.map((item, index) => {
+        const answer = Object.hasOwn(data.answers, item.name) ? data.answers[item.name] : null;
+        if (!answer) throw new Error('The server returned no answer for ' + item.name + '.');
+        const card = node('article', undefined, 'answer');
+        card.append(node('h3', item.name));
+        if (answer.type === 'noul' && Number.isFinite(answer.noul)) {
+          const value = percent(answer.noul) + ' yes';
+          card.append(node('p', value, 'value'));
+          if (!index) summary = value;
+          probability(card, 'Yes', answer.noul);
+          probability(card, 'No', 1 - answer.noul);
+        } else {
+          const value = answer.choice ?? (Number.isFinite(answer.score) ? answer.score.toFixed(2) : '—');
+          card.append(node('p', String(value), 'value'));
+          if (!index) {
+            summary = typeof answer.choice === 'string'
+              ? (answer.choice.length <= 48 && !answer.choice.startsWith('data:') ? answer.choice : 'Choice selected')
+              : 'Score ' + value;
+          }
+          if (Number.isFinite(answer.confidence)) card.append(node('small', 'Confidence ' + percent(answer.confidence)));
+          for (const {key} of item.candidates) {
+            const legend = answer.legend && Object.hasOwn(answer.legend, key) ? answer.legend[key] : '';
+            const probabilities = answer.probabilities ?? {};
+            if (Object.hasOwn(probabilities, key)) probability(card, legend ? key + ' · ' + legend : key, probabilities[key]);
+          }
+        }
+        return card;
+      });
+      result.replaceChildren(...answers);
+      return items.length > 1 ? summary + ' · ' + items.length + ' answers' : summary;
+    }
     function ranking(data) {
       const list = node('ol', undefined, 'ranks');
       for (const match of data.matches) {
@@ -316,20 +522,33 @@ enum PlaygroundPage {
       pending = controller;
       run.disabled = copy.disabled = true;
       result.setAttribute('aria-busy', 'true');
-      status('Embedding and ranking…');
+      status(config.kind === 'decision' ? 'Running decision…' : 'Embedding and ranking…');
       const current = () => revision === ticket && !controller.signal.aborted;
       let submitted = false;
       try {
-        const snapshot = embeddingSnapshot();
-        submitted = true;
-        const data = await search(snapshot, controller.signal);
-        if (!current()) return;
-        vectors = data.nextCache;
-        cacheStatus();
-        ranking(data);
-        const best = data.matches[0], latency = elapsed(start);
-        metrics(latency, data.dimensions + ' dimensions', 'Cosine similarity', data.clipped ? 'Query truncated' : '');
-        recordRun(historyTicket, 'Top match: document ' + (best.index + 1) + ' · ' + best.score.toFixed(4), latency);
+        if (config.kind === 'decision') {
+          const snapshot = decisionSnapshot(), body = await decisionBody(snapshot);
+          if (!current()) return;
+          submitted = true;
+          const data = await api(endpoints.decision, body, controller.signal);
+          if (!current()) return;
+          const summary = decisionResult(data, body.questions), latency = elapsed(start);
+          const usage = data.usage ?? {};
+          metrics(latency, Number.isFinite(usage.input_tokens) ? usage.input_tokens + ' input tokens' : '',
+            usage.truncated ? 'State truncated' : '');
+          recordRun(historyTicket, summary, latency);
+        } else {
+          const snapshot = embeddingSnapshot();
+          submitted = true;
+          const data = await search(snapshot, controller.signal);
+          if (!current()) return;
+          vectors = data.nextCache;
+          cacheStatus();
+          ranking(data);
+          const best = data.matches[0], latency = elapsed(start);
+          metrics(latency, data.dimensions + ' dimensions', 'Cosine similarity', data.clipped ? 'Query truncated' : '');
+          recordRun(historyTicket, 'Top match: document ' + (best.index + 1) + ' · ' + best.score.toFixed(4), latency);
+        }
         status('Complete.');
       } catch (error) {
         if (current()) {
@@ -352,13 +571,18 @@ enum PlaygroundPage {
     copy.onclick = async () => {
       const ticket = revision;
       try {
-        const {docs, query, truncate} = embeddingSnapshot();
-        const commands = [];
-        for (const doc of docs) {
-          if (ticket !== revision) return;
-          commands.push(curl(endpoint, await embeddingBody(doc, 'document', truncate)));
+        let commands;
+        if (config.kind === 'decision') {
+          commands = [curl(endpoints.decision, await decisionBody(decisionSnapshot()))];
+        } else {
+          const {docs, query, truncate} = embeddingSnapshot();
+          commands = [];
+          for (const doc of docs) {
+            if (ticket !== revision) return;
+            commands.push(curl(endpoints.embedding, await embeddingBody(doc, 'document', truncate)));
+          }
+          commands.push(curl(endpoints.embedding, await embeddingBody(query, 'query', truncate)));
         }
-        commands.push(curl(endpoint, await embeddingBody(query, 'query', truncate)));
         if (ticket !== revision) return;
         const command = commands.join('\n');
         byId('curl-text').textContent = command;
@@ -398,12 +622,21 @@ enum PlaygroundPage {
       try {
         const value = await api('/playground/config');
         if (typeof value.model !== 'string' || typeof value.id !== 'string' ||
-            value.kind !== 'embedding' || typeof value.images !== 'boolean') {
+            !Object.hasOwn(endpoints, value.kind) || typeof value.images !== 'boolean') {
           throw new Error('Invalid playground configuration.');
         }
         config = value;
+        const deciding = config.kind === 'decision';
         byId('model').textContent = config.model;
-        byId('document-image-field').hidden = byId('query-image-field').hidden = !config.images;
+        byId('title').textContent = deciding ? 'Decision playground' : 'Embedding playground';
+        byId('subtitle').textContent = deciding
+          ? 'Give the model a state and compare its answers.'
+          : 'Search your documents by meaning and inspect their cosine rankings.';
+        byId('decision').hidden = !deciding;
+        byId('embedding').hidden = deciding;
+        byId('decision-image-field').hidden = !deciding || !config.images;
+        byId('document-image-field').hidden = byId('query-image-field').hidden = deciding || !config.images;
+        run.textContent = deciding ? 'Run decision' : 'Rank documents';
         loadExample();
         byId('workbench').hidden = false;
         stop.disabled = false;
