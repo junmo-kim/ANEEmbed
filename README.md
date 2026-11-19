@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/junmo-kim/ANERun/actions/workflows/ci.yml/badge.svg)](https://github.com/junmo-kim/ANERun/actions/workflows/ci.yml) [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE) ![Platform: macOS 15+ · Apple Silicon](https://img.shields.io/badge/platform-macOS%2015%2B%20%C2%B7%20Apple%20Silicon-lightgrey)
 
-Run local embeddings and decisions on Apple silicon with one Swift executable. Embeddings support macOS 15 and later through the CLI, OpenAI-compatible HTTP API and MCP. Decision models use Core AI on macOS 27. The portable packages below have been verified on Mac Studio (h17d).
+Run local embeddings and decisions on Apple silicon with one Swift executable. Embeddings support macOS 15 and later through the CLI, OpenAI-compatible HTTP API and MCP. Decision models use Core AI on macOS 27. The decision model table lists the hardware verified for each portable package.
 
 ## Embedding models
 
@@ -18,10 +18,11 @@ Each server process serves one model. Select it with `--model ID` or point to a 
 
 Install the model that fits your task. Each command downloads a pinned source package, compiles it on your Mac, and verifies its placement before activation. Installation requires Xcode 27 and the Metal Toolchain. Allow additional disk space for compiled assets and the native cache.
 
-| Decision model | Input | Download | Model license |
-|---|---|---:|---|
-| [Elephant-1](https://huggingface.co/junmo-k/elephant-1-ane) | Text, structured state, optional image | 18.84 GB | MIT; Qwen base terms included |
-| [GLiDE-9B](https://huggingface.co/junmo-k/glide-9b-ane) | Text and structured state | 15.88 GB | Fastino Community License |
+| Decision model | Input | Download | Verified hardware | Model license |
+|---|---|---:|---|---|
+| [Valen-4B](https://huggingface.co/junmo-k/valen-4b-ane) | Text, structured state, optional image | 9.75 GB | M4 Mac mini (h16g) | Apache-2.0 |
+| [Elephant-1](https://huggingface.co/junmo-k/elephant-1-ane) | Text, structured state, optional image | 18.84 GB | M5 Ultra Mac Studio (h17d) | MIT; Qwen base terms included |
+| [GLiDE-9B](https://huggingface.co/junmo-k/glide-9b-ane) | Text and structured state | 15.88 GB | M5 Ultra Mac Studio (h17d) | Fastino Community License |
 
 **Built with Fastino GLiDE.** See the linked model cards for licensing and comparisons with the original checkpoints.
 
@@ -29,6 +30,8 @@ Install the model that fits your task. Each command downloads a pinned source pa
 anerun models install --model elephant-1
 anerun serve --model elephant-1 --port 8391
 ```
+
+On a 16 GiB M4 Mac mini, select Valen explicitly with `anerun models install --model valen-4b` and `anerun serve --model valen-4b --port 8391`. On the final v0.3.1 executable, six short text inputs took 0.76–1.54 s on the first HTTP request to a fresh server and 0.38–0.45 s on the immediate repeat. A 133-token image request took 1.40 s and 0.82 s respectively. A larger image and a 456-token text input each took roughly 1.4–1.5 s on repeat in a separate traced run. Keeping the model loaded saves first-request time and consumes accelerator memory between requests. [Installation, memory and parity measurements](docs/PERFORMANCE.md#valen-4b-on-apple-m4)
 
 For GLiDE-9B, use `anerun models install --model glide-9b` and select `--model glide-9b` when serving.
 

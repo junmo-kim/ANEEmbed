@@ -1,5 +1,33 @@
 # Performance and memory
 
+## Valen-4B on Apple M4
+
+Measured on a 16 GiB M4 Mac mini (h16g), macOS 27.0.1. In the seven-input suite, each case went to a separate, initially unloaded server process. The client measured the whole first HTTP round trip and one immediate repeat. All 14 responses from the final executable matched the pinned publisher FP32 reference on the selected answer and token counts. The largest absolute difference across candidate probabilities was 0.000419, on a Korean negation input.
+
+Each row identifies the measured executable by its SHA-256 prefix. The text ranges span six inputs. Each image row records one pair.
+
+| Signed executable | Input | Input tokens | First request after prepare | Immediate repeat |
+|---|---|---:|---:|---:|
+| `6bbbfc2a` (source-install candidate) | Six English and Korean text inputs | 70–110 | 0.733–0.974 s | 0.381–0.418 s |
+| `6bbbfc2a` | One red-circle image with text | 133 | 1.371 s | 0.821 s |
+| `1bcd833e` (pinned-install candidate) | Same six text inputs | 70–110 | 0.764–1.164 s | 0.381–0.621 s |
+| `1bcd833e` | Same image | 133 | 1.349 s | 0.775 s |
+| `4f41e019` (final v0.3.1) | Same six text inputs | 70–110 | 0.759–1.544 s | 0.382–0.450 s |
+| `4f41e019` | Same image | 133 | 1.400 s | 0.815 s |
+
+Two additional inputs exercised larger device functions with the same final executable. Both requests for each input matched the publisher FP32 reference on the choice and on input, output and compute token counts. Prompt token IDs, role spans and candidate order also matched. Each reference distribution strongly favored one candidate.
+
+| Extended input | Input / output / compute tokens | Answer | Max absolute probability difference | First HTTP | Repeat HTTP |
+|---|---:|---|---:|---:|---:|
+| 512 × 384 PNG, 768 patches | 261 / 0 / 261 | `red_circle` | 0.0000329414457153 | 3.530 s | 1.415 s |
+| Refund-policy text crossing 128-token chunk boundaries | 456 / 0 / 456 | `reject` | 0.0000074493225862 | 2.020 s | 1.489 s |
+
+The image trace recorded `p1024` and `featurescale`. All eight attention layers used `c512` for both extended inputs. These HTTP times are single traced observations with possible concurrent CPU test activity. Numerical parity on hardware was verified through `c512`. The declared `c1024`, `c2048` and `c4096` tiers remain untested for probability parity.
+
+For `6bbbfc2a`, starting with the 9.75 GB source package already on disk, compiling and preparing a new model store took 391.64 s. All 101 assets were compiled for the destination. The OS retained its existing specialization cache. Allow additional space for compiled assets, scratch files and the OS cache.
+
+In a separate run of the same image with `6bbbfc2a`, the highest sampled server RSS during inference was 49.3 MiB. With the model loaded and idle, the system-wide ANE driver reported 8.85 GiB. Five seconds after idle unload it reported 3.11 MiB. Use a positive `--idle-timeout` to release the model between bursts. The next request then pays the load cost again.
+
 ## pplx-embed-v1-0.6b on Apple M4
 
 Measured with the Swift release build on a 16 GiB Mac mini, macOS 27.0.1.
