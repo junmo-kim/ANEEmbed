@@ -5,6 +5,17 @@ import Testing
 @testable import anerun
 
 struct DecisionDownloadTests {
+    @Test func valenDefaultDownloadIsQualifiedOnlyOnH16G() throws {
+        let model = ModelID.decision(.valen4B)
+        let source = try DecisionDownload.source(model: model, architecture: "h16g", repo: nil, revision: nil)
+        #expect(source.repository == "junmo-k/valen-4b-ane")
+        #expect(source.manifestSHA256 == "d54187559829df64b509b96028f91464b56b196d29e2adf7864d2244ac328708")
+        let error = #expect(throws: ServiceError.self) {
+            try DecisionDownload.source(model: model, architecture: "h17d", repo: nil, revision: nil)
+        }
+        #expect(error?.reason == "unpublished_model")
+    }
+
     @Test func sourceRequiresImmutableCommitOrQualifiedArchitecture() throws {
         let model = ModelID.decision(.valen4B)
         let error = #expect(throws: ServiceError.self) {

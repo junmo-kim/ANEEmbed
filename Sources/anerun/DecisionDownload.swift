@@ -6,6 +6,9 @@ enum DecisionDownload {
     static let inventory = "decision-manifest.json"
     // Add a source only after the exact published revision has passed qualification on this architecture.
     static let pins: [ModelID: [String: ModelSource]] = [
+        .decision(.valen4B): ["h16g": ModelSource(
+            repository: "junmo-k/valen-4b-ane", revision: "70c656b1824e1940bb1d530e8c0ee664512b10b5",
+            manifestSHA256: "d54187559829df64b509b96028f91464b56b196d29e2adf7864d2244ac328708")],
         .decision(.glide9B): ["h17d": ModelSource(
             repository: "junmo-k/glide-9b-ane", revision: "6654b0d1789384f4a48ebded47d5e7cdb41ff457",
             manifestSHA256: "2c26646f4fc32da82254d4a32b1db86392e8bcbcec8ac71e096daa9947a62a99")],
