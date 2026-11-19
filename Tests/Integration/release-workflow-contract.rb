@@ -19,7 +19,7 @@ class ReleaseWorkflowContract < Minitest::Test
   def test_publish_waits_for_build_and_macos_15_verification
     build = @jobs.fetch("build")
     verification = @jobs.fetch("verify-macos-15")
-    assert_equal "macos-26", build.fetch("runs-on")
+    assert_equal "xcode-27", build.fetch("runs-on")
     assert_equal "macos-15", verification.fetch("runs-on")
     assert_includes Array(verification.fetch("needs")), "build"
     assert_includes Array(@publisher.fetch("needs")), "build"
