@@ -46,9 +46,16 @@ public struct SHA256Hasher {
         let handle = try FileHandle(forReadingFrom: url)
         defer { try? handle.close() }
         var hasher = SHA256Hasher()
-        while let chunk = try handle.read(upToCount: 4 << 20), !chunk.isEmpty {
-            hasher.update(chunk)
-        }
+        // FileHandle can autorelease its NSData. Drain each read even when the
+        // caller hashes many assets from a single Swift concurrency task.
+        var done = false
+        repeat {
+            done = try autoreleasepool {
+                guard let chunk = try handle.read(upToCount: 4 << 20), !chunk.isEmpty else { return true }
+                hasher.update(chunk)
+                return false
+            }
+        } while !done
         return hasher.finalize()
     }
 }
