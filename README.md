@@ -2,17 +2,64 @@
 
 [![CI](https://github.com/junmo-kim/ANERun/actions/workflows/ci.yml/badge.svg)](https://github.com/junmo-kim/ANERun/actions/workflows/ci.yml) [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE) ![Platform: macOS 15+ · Apple Silicon](https://img.shields.io/badge/platform-macOS%2015%2B%20%C2%B7%20Apple%20Silicon-lightgrey)
 
-Local embeddings on the **Apple Neural Engine** from a single **Swift binary with no third-party dependencies**. Use the CLI, an OpenAI-compatible `/v1/embeddings` server or an MCP server.
+Run local embeddings and decisions on Apple silicon with one Swift executable. Embeddings support macOS 15 and later through the CLI, OpenAI-compatible HTTP API and MCP. Decision models use Core AI on macOS 27. The portable packages below have been verified on Mac Studio (h17d).
+
+## Embedding models
 
 | Model ID | Inputs | Maximum context | Output |
 |---|---|---:|---|
-| `embeddinggemma-2` | Text and images | 8,192 tokens | 768 normalized values, or normalized prefixes of 512, 256 or 128 |
-| `pplx-embed-v1-0.6b` | Text | 32,768 tokens | 1,024 signed int8 values, with prefixes of 1–1,024 |
-| `qwen3-embedding-0.6b` | Text | 32,768 tokens including EOS | Normalized float vector, 32–1,024 dimensions (default 1,024) |
+| [embeddinggemma-2](https://huggingface.co/junmo-k/embeddinggemma-2-ane) | Text and images | 8,192 tokens | 768 normalized values, or normalized prefixes of 512, 256 or 128 |
+| [pplx-embed-v1-0.6b](https://huggingface.co/junmo-k/pplx-embed-v1-0.6b-ane) | Text | 32,768 tokens | 1,024 signed int8 values, with prefixes of 1–1,024 |
+| [qwen3-embedding-0.6b](https://huggingface.co/junmo-k/qwen3-embedding-0.6b-ane) | Text | 32,768 tokens including EOS | Normalized float vector, 32–1,024 dimensions (default 1,024) |
 
 Each server process serves one model. Select it with `--model ID` or point to a verified local package with `--model-dir DIR`. For a v0.1.1 configuration, add `--model embeddinggemma-2` or set `ANERUN_MODEL=embeddinggemma-2` to keep using its existing package. Keep each index and its queries on the same model and dimensions.
 
-## Choosing a model for your memory budget
+## Local decisions
+
+Install the model that fits your task. Each command downloads a pinned source package, compiles it on your Mac, and verifies its placement before activation. Installation requires Xcode 27 and the Metal Toolchain. Allow additional disk space for compiled assets and the native cache.
+
+| Decision model | Input | Download | Model license |
+|---|---|---:|---|
+| [Elephant-1](https://huggingface.co/junmo-k/elephant-1-ane) | Text, structured state, optional image | 18.84 GB | MIT; Qwen base terms included |
+| [GLiDE-9B](https://huggingface.co/junmo-k/glide-9b-ane) | Text and structured state | 15.88 GB | Fastino Community License |
+
+**Built with Fastino GLiDE.** See the linked model cards for licensing and comparisons with the original checkpoints.
+
+```sh
+anerun models install --model elephant-1
+anerun serve --model elephant-1 --port 8391
+```
+
+For GLiDE-9B, use `anerun models install --model glide-9b` and select `--model glide-9b` when serving.
+
+```sh
+curl -sS http://127.0.0.1:8391/v1/decisions -H 'Content-Type: application/json' \
+  -d '{"state":"The buyer wants their money back.","questions":[{"name":"action","kind":"choice","instructions":"Select the requested action.","candidates":[{"key":"refund","description":"Return the payment."},{"key":"replace","description":"Send another item."}]}]}'
+```
+
+Use `anerun playground --model elephant-1` for the local browser interface. The server loads the selected bundle on first request and supports configurable idle unload. See the [DecisionRuntime package](Packages/DecisionRuntime/README.md) for source packing and destination preparation.
+
+### Serve embeddings and decisions together
+
+Start one server per model, using separate terminals and ports. For example, after installing both packages:
+
+```sh
+# Terminal 1: POST /v1/embeddings on port 18180
+anerun serve --model embeddinggemma-2 --port 18180
+```
+
+```sh
+# Terminal 2: POST /v1/decisions on port 8391
+anerun serve --model elephant-1 --port 8391 --idle-timeout 0
+```
+
+The decision server loads on its first request. An idle timeout of zero keeps it resident; set a positive number of seconds to release its memory between requests. Use `glide-9b` on the decision port to run GLiDE alongside the embedding server.
+
+On an M5 Ultra, the same EmbeddingGemma 2 process (64-token cap) stayed loaded while the decision server switched from Elephant-1 to GLiDE-9B. Six pairs of overlapping warm HTTP requests per model returned the same embedding vectors and decision probabilities as separate requests. Median decision latency for the tested text input was 846 ms with Elephant-1 and 507 ms with GLiDE-9B.
+
+With [llama-swap's matrix router](https://github.com/mostlygeek/llama-swap/blob/v273/docs/kb/guides/routing/groups-and-matrix.md), the set `"embeddinggemma-2 & (elephant-1 | glide-9b)"` allows the embedding server to stay loaded while the decision model changes.
+
+## Choosing an embedding model for your memory budget
 
 There are two separate costs: **running the model** on your Mac and **storing its vectors** in your search index. All three models ran on a 16 GB M4 Mac mini. The measurements below cover different workloads, so they establish neither a minimum RAM requirement nor a ranking of total memory use.
 

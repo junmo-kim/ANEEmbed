@@ -23,6 +23,18 @@ unset ANERUN_RUNTIME ANERUN_DATA_DIR ANEEMBED_RUNTIME ANEEMBED_DATA_DIR
 data_dir="$tmpdir/data"
 export ANERUN_RUNTIME=fake ANERUN_DATA_DIR="$data_dir"
 
+if [[ ${ANERUN_CHECK_RELEASE_COREAI:-0} == 1 ]]; then
+  # Conflicting source selectors reach the dispatcher without network access or model execution.
+  if "$binary" models install --model valen-4b --from "$tmpdir" --repo invalid/example --runtime coreml --data-dir "$data_dir" --format json \
+      >"$tmpdir/decision.out" 2>"$tmpdir/decision.err"; then
+    fail "install with no decision source succeeded"
+  fi
+  expected=coreai_unavailable
+  if (( $(sw_vers -productVersion | cut -d. -f1) >= 27 )); then expected=invalid_model_source; fi
+  python3 -c 'import json, sys; assert json.load(sys.stdin)["reason"] == sys.argv[1]' \
+    "$expected" < "$tmpdir/decision.err" || fail "unexpected decision dispatcher response"
+fi
+
 version=$("$binary" --version)
 [[ "$version" =~ ^anerun\ [0-9]+\.[0-9]+\.[0-9]+$ ]] || fail "unexpected version output: $version"
 "$binary" --help > "$tmpdir/help"

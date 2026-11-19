@@ -53,7 +53,19 @@ ANEEMBED_EXTRA_GOLDEN=/tmp/extra.jsonl.xz swift test --filter matchesExtraGolden
 
 ## Releasing
 
-A release is cut by pushing a `vX.Y.Z` tag. `.github/workflows/release.yml` tests and builds the stripped binary on macOS 26, verifies the same packaged tarball (checksum, contents, signature, version, smoke test) on macOS 15, and only then publishes one `anerun-vX.Y.Z-macos-arm64.tar.gz` with its `.sha256`.
+A release is cut by pushing a `vX.Y.Z` tag. `.github/workflows/release.yml` tests and builds the stripped binary with the Core AI SDK, verifies the same packaged tarball (checksum, contents, signature, version, smoke test) on macOS 15, and only then publishes one `anerun-vX.Y.Z-macos-arm64.tar.gz` with its `.sha256`.
+
+For a local ad-hoc-signed release candidate, run the following on Apple silicon with Xcode 27 selected. The archive contains one executable named `anerun`. The signature uses identifier `anerun`. Keep this basename and the final install path for device qualification.
+
+```sh
+swift build -c release --product anerun -Xswiftc -DANERUN_REQUIRE_COREAI -Xlinker -s
+scripts/package-rc.sh .build/release/anerun dist
+(cd dist && shasum -a 256 -c anerun-v0.3.0-macos-arm64.tar.gz.sha256)
+verify=$(mktemp -d)
+tar -xzf dist/anerun-v0.3.0-macos-arm64.tar.gz -C "$verify"
+codesign --verify --strict "$verify/anerun"
+ANERUN_CHECK_RELEASE_COREAI=1 Tests/Integration/release-binary-launch-smoke.sh "$verify/anerun"
+```
 
 1. Bump `aneembedVersion` in `Sources/EmbedCore/Support/Version.swift`.
 2. Rename the unreleased heading to `## vX.Y.Z` in `CHANGELOG.md`; that section becomes the release-notes keynote.

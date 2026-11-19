@@ -45,7 +45,9 @@ class ReleaseWorkflowContract < Minitest::Test
     assert_includes commands, "shasum -a 256 -c"
     assert_includes commands, "tar -xzf"
     assert_includes commands, "codesign --verify --strict"
-    assert_includes commands, "release-binary-launch-smoke.sh verify/anerun"
+    assert_includes commands, "otool -l verify/anerun"
+    assert_includes commands, "LC_LOAD_WEAK_DYLIB"
+    assert_includes commands, "ANERUN_CHECK_RELEASE_COREAI=1 Tests/Integration/release-binary-launch-smoke.sh verify/anerun"
   end
 
   def test_one_asset_per_platform
@@ -53,6 +55,8 @@ class ReleaseWorkflowContract < Minitest::Test
                       .fetch("with").fetch("files")
     assert_equal ["dist/*.tar.gz", "dist/*.tar.gz.sha256"], files.split("\n").map(&:strip).reject(&:empty?)
     build = @jobs.fetch("build").fetch("steps").map { |step| step.fetch("run", "") }.join("\n")
+    assert_includes build, "-DANERUN_REQUIRE_COREAI"
+    assert_includes build, "CoreAI.framework"
     assert_includes build, 'TARBALL="anerun-${GITHUB_REF_NAME}-macos-arm64.tar.gz"'
   end
 
@@ -82,7 +86,7 @@ class ReleaseWorkflowContract < Minitest::Test
   def test_unit_tests_run_before_packaging
     steps = @jobs.fetch("build").fetch("steps").map { |step| step.fetch("run", "") }
     test_index = steps.index { |run| run.match?(/\bswift test\b/) }
-    package_index = steps.index { |run| run.include?("tar -C") }
+    package_index = steps.index { |run| run.include?("scripts/package-rc.sh") }
     refute_nil test_index, "the release build must run the unit tests"
     refute_nil package_index
     assert_operator test_index, :<, package_index

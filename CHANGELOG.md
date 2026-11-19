@@ -1,5 +1,9 @@
 # Changelog
 
+## v0.3.0
+
+ANERun can now answer questions about local data with [Elephant-1](https://huggingface.co/junmo-k/elephant-1-ane) or [GLiDE-9B](https://huggingface.co/junmo-k/glide-9b-ane) on the Apple Neural Engine. Both models accept text and structured state, and Elephant-1 also accepts images. Install a model once, then try it in the browser playground or send a request to `POST /v1/decisions` while your embedding server stays online. On an M5 Ultra Mac Studio running macOS 27, all choices across ten test inputs matched the original models, and every candidate probability was within 0.1 percentage points of its reference.
+
 ## v0.2.0
 
 ANEEmbed is now ANERun. Alongside EmbeddingGemma 2 for text and images, ANERun supports two text embedding models with up to 32,768 tokens: PPLX produces compact int8 vectors, and Qwen3-Embedding supports retrieval instructions and configurable vector dimensions. Use `anerun playground --model ID` to rank your own documents against a query on your Mac. To keep using an existing EmbeddingGemma 2 installation, change the executable to `anerun` and add `--model embeddinggemma-2`.
