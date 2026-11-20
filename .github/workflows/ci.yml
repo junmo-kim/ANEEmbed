@@ -32,6 +32,27 @@ jobs:
       - name: Build (release, stripped)
         run: swift build -c release -Xlinker -s
 
+      - name: Check DecisionRuntime on macOS 26
+        run: |
+          sw_vers -productVersion
+          xcrun --sdk macosx --show-sdk-version
+          test "$(sw_vers -productVersion | cut -d. -f1)" = 26
+          has_ane=$(swift -e 'import CoreML; print(MLModel.availableComputeDevices.contains { if case .neuralEngine = $0 { return true }; return false })')
+          bin="$(swift build -c release --show-bin-path)/anerun"
+          status=0
+          "$bin" decision-capability --format json > "$RUNNER_TEMP/capability.json" 2> "$RUNNER_TEMP/capability-error.json" || status=$?
+          if [[ "$has_ane" == false ]]; then
+            test "$status" -eq 69
+            jq -se 'length == 1 and .[0].reason == "neural_engine_unavailable"' "$RUNNER_TEMP/capability-error.json"
+          elif [[ "$(sysctl -n hw.model)" != Mac16,10 ]]; then
+            test "$status" -eq 69
+            jq -se 'length == 1 and .[0].reason == "unsupported_hardware"' "$RUNNER_TEMP/capability-error.json"
+          else
+            test "$status" -eq 0
+            jq -se 'length == 1 and (.[0] | .backend == "coreml" and .neural_engine and .runtime_attestation == false)' "$RUNNER_TEMP/capability.json"
+          fi
+          swift test --package-path Packages/DecisionRuntime
+
       # CI=true: ModelTests skip (virtualized runners have no Neural Engine and no model).
       - name: Test
         run: swift test
