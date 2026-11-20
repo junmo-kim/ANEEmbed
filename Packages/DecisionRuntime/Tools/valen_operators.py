@@ -50,10 +50,13 @@ class Mixer(nn.Module):
         self.load_state_dict(tensors)
         self.half()
 
+    def score_rows(self, rows):
+        rows = self.projection(self.input_norm(rows)) + self.roles
+        return self.output(self.blocks(rows)[:, 2, :])
+
     def forward(self, pooled):
         rows = pooled.reshape(1, HIDDEN, 4).transpose(1, 2)
-        rows = self.projection(self.input_norm(rows)) + self.roles
-        return self.output(self.blocks(rows)[:, 2, :]).reshape(1, 1, 1, 1)
+        return self.score_rows(rows).reshape(1, 1, 1, 1)
 
 
 class Readout(nn.Module):
@@ -122,17 +125,22 @@ def export(weights, output):
                                       f.get_slice("backbone.language_model.embed_tokens.weight"), output, graph)
 
 
-def export_operator_graphs(keys, get_tensor, table, output, graph):
-    """Build the same Valen operator modules and tables for either serializer."""
+def export_role_graphs(head, graph):
     scalar = (1, 1, 1, 1)
     slots = (1, 256, 1, 1)
-    head = {k.removeprefix("head."): get_tensor(k) for k in keys if k.startswith("head.")}
     result = dict(role_mixer=graph("valenMixer", Mixer(head), {"pooled": (1, HIDDEN, 1, 4)}, "logit"),
                   role_pool=graph("valenPool", RolePool(), dict(hidden=(1, HIDDEN, 1, 128),
                       valid=(1, 1, 1, 128), length=scalar, previous=(1, HIDDEN, 1, 1)), "pooled"),
                   decision_head=graph("readout", Readout(), dict(logits=slots, mask=slots), "probabilities"))
     result["result_stats"] = graph("stats", Stats(), dict(p=slots, **dict.fromkeys(
         ("top_index", "choice_scale", "choice_bias", "mad_scale"), scalar)), "statistics")
+    return result
+
+
+def export_operator_graphs(keys, get_tensor, table, output, graph, *, roles=export_role_graphs):
+    """Build the shared Valen operators and tables, with backend-specific role graphs."""
+    head = {k.removeprefix("head."): get_tensor(k) for k in keys if k.startswith("head.")}
+    result = roles(head, graph)
     position = VisionPosition(get_tensor("backbone.visual.pos_embed.weight"), channels=1024)
     result["vision_position"] = graph("visionpos", position,
         dict.fromkeys(("row", "column", "fy", "fx"), (1, 1, 1, LANES)), "pos")

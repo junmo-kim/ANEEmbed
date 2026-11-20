@@ -5,6 +5,56 @@ import XCTest
 
 @available(macOS 26.0, *)
 final class CoreMLRuntimeTests: XCTestCase {
+  func testPlanConstructionRetriesOnlyAnInternalCoreMLErrorOnce() async throws {
+    let internalError = NSError(domain: MLModelError.errorDomain, code: 0)
+    var calls = 0
+    let value = try await CoreMLDecisionCapability.loadPlan {
+      calls += 1
+      if calls == 1 { throw internalError }
+      return 17
+    }
+    XCTAssertEqual(value, 17)
+    XCTAssertEqual(calls, 2)
+    for (error, expected) in [(internalError, 2), (NSError(domain: NSCocoaErrorDomain, code: 0), 1)] {
+      calls = 0
+      do {
+        let _: Int = try await CoreMLDecisionCapability.loadPlan { calls += 1; throw error }
+        XCTFail("Plan generation should fail")
+      } catch let reported as NSError {
+        XCTAssertEqual(reported.domain, error.domain)
+        XCTAssertEqual(reported.code, error.code)
+      }
+      XCTAssertEqual(calls, expected)
+    }
+  }
+
+  func testPlacementMayTryOneOtherSpecializationAndRequiresItsOwnPlan() async throws {
+    var strategies = [MLOptimizationHints.SpecializationStrategy]()
+    let count: Int = try await CoreMLDecisionCapability.withPreferredPlacement { config in
+      XCTAssertEqual(config.computeUnits, .cpuAndNeuralEngine)
+      strategies.append(config.optimizationHints.specializationStrategy)
+      if strategies.count == 1 { throw CoreMLPlacementError(description: "CPU") }
+      return 381
+    }
+    XCTAssertEqual(count, 381)
+    XCTAssertEqual(strategies, [.default, .fastPrediction])
+
+    for (error, expectedCalls): (Error, Int) in [
+      (CoreMLPlacementError(description: "CPU"), 2), (DecisionError("Invalid manifest ABI"), 1),
+    ] {
+      var calls = 0
+      do {
+        let _: Int = try await CoreMLDecisionCapability.withPreferredPlacement { _ in
+          calls += 1
+          throw error
+        }
+        XCTFail("Neither rejected placement nor an invalid interface may enable this function")
+      } catch {
+        XCTAssertEqual(calls, expectedCalls)
+      }
+    }
+  }
+
   func testEligibilityRequiresBothTargetMacAndExposedANE() throws {
     XCTAssertThrowsError(try CoreMLDecisionCapability.requireHardware(neuralEngine: false, model: "Mac16,10"))
     XCTAssertThrowsError(try CoreMLDecisionCapability.requireHardware(neuralEngine: true, model: "unknown"))
@@ -27,6 +77,18 @@ final class CoreMLRuntimeTests: XCTestCase {
     second.write { pointer, strides in pointer[strides[1] + 2 * strides[3]] = 9 }
     XCTAssertEqual(first.read { $0[$1[1] + 2 * $1[3]] }, 7)
     XCTAssertEqual(second.read { $0[$1[1] + 2 * $1[3]] }, 9)
+  }
+
+  func testPredictionBuffersForwardTheCoreMLArrayAndDetachOnWrite() {
+    let tensor = MLMultiArray(shape: [1, 2, 1, 3], dataType: .float16, strides: [10, 5, 3, 1])
+    tensor[[0, 1, 0, 2] as [NSNumber]] = 7
+    let input = CoreMLBuffer(output: tensor)
+    XCTAssertTrue(input.multiArray === tensor)
+    XCTAssertEqual(input.read { $0[$1[1] + 2 * $1[3]] }, 7)
+    var copy = input
+    copy.write { $0[$1[1] + 2 * $1[3]] = 9 }
+    XCTAssertEqual(copy.read { $0[$1[1] + 2 * $1[3]] }, 9)
+    XCTAssertEqual(tensor[[0, 1, 0, 2] as [NSNumber]].floatValue, 7)
   }
 
   func testPoolMaskKeepsOverlappingRolesAcrossChunks() {

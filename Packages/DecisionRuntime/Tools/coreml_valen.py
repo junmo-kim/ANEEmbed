@@ -87,6 +87,68 @@ def export_fixture(destination):
     export_function(destination, layer, {"hidden_in": (1, 2, 1, 2)}, ["hidden_out"])
 
 
+def feature_scale_graph():
+    """Represent the exact 64x scale with a dense diagonal ANE-planned convolution."""
+    import torch
+    from torch.nn import functional as F
+
+    class FeatureScale(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.register_buffer("weight", torch.eye(128).reshape(128, 128, 1, 1) * 64)
+
+        def forward(self, features):
+            tiles = features.reshape(1, 128, 20, 256)
+            return F.conv2d(tiles, self.weight).reshape(1, 2560, 1, 256)
+
+    return FeatureScale()
+
+
+def role_graphs(head):
+    """Batch role masks and fuse scoring with the learned Mixer for ANE placement."""
+    import torch
+
+    from elephant.operators import Stats
+    from valen_operators import Mixer
+
+    class RolePool(torch.nn.Module):
+        def forward(self, hidden, valid, length, previous):
+            masks = (valid / length.clamp(min=1)).reshape(1, 128, 288)
+            pooled = hidden.reshape(1, 2560, 128) @ masks
+            return previous + pooled.reshape(1, 2560, 1, 288)
+
+    class Score(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.mixer = Mixer(head)
+            self.stats = Stats()
+
+        def forward(self, pooled, mask, choice_scale, choice_bias, mad_scale):
+            rows = pooled.permute(3, 2, 1, 0).reshape(256, 4, 2560)
+            logits = self.mixer.score_rows(rows).reshape(1, 256, 1, 1)
+            probabilities = torch.softmax(logits + mask, dim=1).to(torch.float16)
+            ties = probabilities == probabilities.amax(dim=1, keepdim=True)
+            first = torch.where(ties, self.stats.indices, 256.0).amin(dim=1, keepdim=True)
+            statistics = self.stats(probabilities, first, choice_scale, choice_bias, mad_scale)
+            return probabilities, statistics
+
+    return RolePool(), Score().half()
+
+
+def export_role_graphs(head, graph):
+    pool, score = role_graphs(head)
+    scalar = (1, 1, 1, 1)
+    return dict(
+        role_pool=graph("valenPool288", pool, dict(
+            hidden=(1, 2560, 1, 128), valid=(1, 1, 128, 288), length=(1, 1, 1, 288),
+            previous=(1, 2560, 1, 288)), ["pooled"]),
+        role_mixer=graph("valenScore", score, dict(
+            pooled=(1, 2560, 4, 256), mask=(1, 256, 1, 1),
+            **dict.fromkeys(("choice_scale", "choice_bias", "mad_scale"), scalar)),
+            ["probabilities", "statistics"]),
+    )
+
+
 def package_digest(package):
     """Bind the logical manifest entry to all files in its Core ML package."""
     sha = hashlib.sha256()
@@ -128,11 +190,14 @@ def export_bundle(checkpoint, destination, small_vision, tiers=TIERS):
         functions = {}
         hashes = {}
 
-        def convert(name, module, inputs, outputs):
+        def convert(name, module, inputs, outputs, *, linear_scan=False):
             path = output / f"{name}.mlpackage"
             if name in functions:
                 raise ValueError(f"Duplicate logical function: {name}")
             export_function(path, module, inputs, outputs)
+            if linear_scan:
+                from coreml_scan_pipeline import partition_scan
+                partition_scan(path)
             functions[name] = path.name
             hashes[name] = package_digest(path)
             print(name, hashes[name], flush=True)
@@ -144,7 +209,9 @@ def export_bundle(checkpoint, destination, small_vision, tiers=TIERS):
             return dict(asset=f"{group}.aimodel", functions=names, source_hash=fingerprint.hexdigest())
 
         def operator(name, module, inputs, result):
-            convert(name, module, inputs, [result])
+            if name == "featurescale":
+                module = feature_scale_graph()
+            convert(name, module, inputs, [result] if isinstance(result, str) else result)
             return asset(name, [name])
 
         stages = []
@@ -152,13 +219,16 @@ def export_bundle(checkpoint, destination, small_vision, tiers=TIERS):
             names = []
             for name, module, inputs, outputs in stage_functions(
                     backbone, start, end, index, tiers, block_mask=True):
-                convert(name, module, inputs, outputs)
+                convert(name, module, inputs, outputs, linear_scan=cfg.layer_types[end] == "linear_attention")
                 names.append(name)
             stages.append(asset(f"stage{index}", names))
         embedding = "backbone.language_model.embed_tokens.weight"
         reader = backbone.reader
         with safe_open(checkpoint / reader.files[embedding], framework="pt", device="cpu") as shard:
-            extras = export_operator_graphs(reader.files, reader.get_tensor, shard.get_slice(embedding), output, operator)
+            extras = export_operator_graphs(
+                reader.files, reader.get_tensor, shard.get_slice(embedding), output, operator,
+                roles=export_role_graphs,
+            )
 
         vision = VisionGraph(reader, "backbone.visual.", vision_cfg)
         convert("p1024", vision, vision_inputs(vision_cfg), ["features"])

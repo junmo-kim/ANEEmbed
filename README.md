@@ -92,7 +92,9 @@ anerun --version
 
 On an M4 Mac mini, build this branch with the macOS 26 SDK and run `anerun decision-capability --format json` to check whether Core ML exposes the Neural Engine. To inspect a local Valen function, run `anerun decision-capability --plan /path/to/scan0.mlpackage --format json`. The command exits with status 69 if any executable operation lacks a preferred Neural Engine placement. Core ML reports a static execution plan and provides no per-prediction device attestation.
 
-The published Valen bundle requires macOS 27. Full-model Valen inference on macOS 26 is still under evaluation. The hosted CI job compiles a small Core ML fixture and checks its output against a fixed reference. End-to-end model probabilities and latency require a physical Mac.
+The default Valen bundle uses Core AI on macOS 27. The experimental Core ML bundle has run one recurrent layer on a MacBook with macOS 26.7. The hosted CI job compiles and predicts with a small fixture. Full-model support on macOS 26 is still under evaluation.
+
+On an M4 Mac mini running macOS 27.0.1, a resident Core ML server matched the publisher’s labels and token counts on all seven test inputs. Six met the maximum per-option probability difference of 0.001. On the Korean policy input, the publisher returned 0.023554 and Core ML returned 0.021606. Fresh servers also returned HTTP 503 when Core ML could not produce an all-ANE-preferred plan for a function that passed in isolation.
 
 ### Select a model
 

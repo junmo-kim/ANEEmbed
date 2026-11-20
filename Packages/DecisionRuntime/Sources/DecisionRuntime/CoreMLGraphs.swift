@@ -3,6 +3,11 @@ import Darwin
 import Foundation
 
 @available(macOS 26.0, *)
+struct CoreMLPlacementError: Error, CustomStringConvertible {
+  let description: String
+}
+
+@available(macOS 26.0, *)
 public enum CoreMLDecisionCapability {
   public static var hardwareModel: String {
     var size = 0
@@ -26,39 +31,90 @@ public enum CoreMLDecisionCapability {
     }
   }
 
-  static func configuration() -> MLModelConfiguration {
+  static func configuration(_ strategy: MLOptimizationHints.SpecializationStrategy = .default)
+    -> MLModelConfiguration
+  {
     let config = MLModelConfiguration()
     config.computeUnits = .cpuAndNeuralEngine
+    config.optimizationHints.specializationStrategy = strategy
     return config
   }
 
   /// The plan is a static device preference. Core ML does not expose per-prediction device attestation.
   public static func plannedOperations(at compiled: URL) async throws -> Int {
     try requireHardware()
-    return try await checkPlan(compiled, configuration())
+    let asset = try MLModelAsset(url: compiled)
+    return try await withPreferredPlacement { config in
+      try await checkPlan(asset, url: compiled, config)
+    }
   }
 
-  static func checkPlan(_ url: URL, _ config: MLModelConfiguration) async throws -> Int {
-    let plan = try await MLComputePlan.load(contentsOf: url, configuration: config)
-    guard case .program(let program) = plan.modelStructure, program.functions.count == 1,
-          let function = program.functions["main"] else {
-      throw DecisionError("Expected a single main ML Program in " + url.lastPathComponent)
+  // Different specialization strategies can produce different segmentations.
+  // Only return a result from a configuration whose entire plan passed.
+  static func withPreferredPlacement<T>(_ run: (MLModelConfiguration) async throws -> T) async throws -> T {
+    do { return try await run(configuration()) }
+    catch is CoreMLPlacementError {
+      try Task.checkCancellation()
+      return try await run(configuration(.fastPrediction))
+    }
+  }
+
+  // Core ML can fail to construct segmentation analytics for a loaded scan.
+  // Retry plan construction once. Every successful plan still goes through the
+  // complete operation-by-operation placement check.
+  static func loadPlan<T>(_ load: () async throws -> T) async throws -> T {
+    do { return try await load() }
+    catch let error as NSError where error.domain == MLModelError.errorDomain && error.code == 0 {
+      try Task.checkCancellation()
+      return try await load()
+    }
+  }
+
+  static func checkPlan(_ asset: MLModelAsset, url: URL, _ config: MLModelConfiguration) async throws -> Int {
+    let plan: MLComputePlan
+    do {
+      plan = try await loadPlan { try await MLComputePlan.load(asset: asset, configuration: config) }
+    } catch let error as NSError where error.domain == MLModelError.errorDomain && error.code == 0 {
+      throw CoreMLPlacementError(description: "Could not construct the execution plan for "
+        + url.lastPathComponent + ": " + error.localizedDescription)
     }
     func inspect(_ block: MLModelStructure.Program.Block) throws -> Int {
       var count = 0
       for op in block.operations {
+        for child in op.blocks { count += try inspect(child) }
         // Literal constants encode parameters; they do not execute a model operation.
         if op.operatorName != "const" {
-          guard let usage = plan.deviceUsage(for: op), case .neuralEngine = usage.preferred else {
-            throw DecisionError("Missing preferred Neural Engine placement for " + op.operatorName + " in " + url.lastPathComponent)
+          let rejected: String
+          switch plan.deviceUsage(for: op)?.preferred {
+          case .neuralEngine?: count += 1; continue
+          case .cpu?: rejected = "CPU"
+          case .gpu?: rejected = "GPU"
+          case nil: rejected = "unspecified"
+          @unknown default: rejected = "unknown"
           }
-          count += 1
+          throw CoreMLPlacementError(description: "Expected preferred Neural Engine placement for " + op.operatorName
+            + " in " + url.lastPathComponent + " (reported " + rejected + ")")
         }
-        for child in op.blocks { count += try inspect(child) }
       }
       return count
     }
-    let count = try inspect(function.block)
+    func countOperations(_ structure: MLModelStructure) throws -> Int {
+      switch structure {
+      case .program(let program):
+        guard program.functions.count == 1, let function = program.functions["main"] else {
+          throw DecisionError("Expected a single main ML Program in " + url.lastPathComponent)
+        }
+        return try inspect(function.block)
+      case .pipeline(let pipeline):
+        guard !pipeline.subModels.isEmpty else {
+          throw DecisionError("Empty Core ML pipeline in " + url.lastPathComponent)
+        }
+        return try pipeline.subModels.reduce(0) { try $0 + countOperations($1) }
+      default:
+        throw DecisionError("Unsupported model structure in " + url.lastPathComponent)
+      }
+    }
+    let count = try countOperations(plan.modelStructure)
     guard count > 0 else { throw DecisionError("No planned model operations in " + url.lastPathComponent) }
     return count
   }
@@ -66,14 +122,31 @@ public enum CoreMLDecisionCapability {
 
 @available(macOS 26.0, *)
 struct CoreMLBuffer: DecisionBuffer {
-  var value: MLShapedArray<Float16>
-  var shape: [Int] { value.shape }
-  static func zeros(_ shape: [Int]) -> Self { Self(value: .init(repeating: 0, shape: shape)) }
+  // Keep prediction outputs in Core ML's native layout between consecutive
+  // models. Only materialize a Swift-owned buffer when a caller writes to it.
+  private var owned: MLShapedArray<Float16>?
+  private var output: MLMultiArray?
+
+  init(output: MLMultiArray) { self.output = output }
+  private init(owned: MLShapedArray<Float16>) { self.owned = owned }
+  var shape: [Int] { owned?.shape ?? output!.shape.map(\.intValue) }
+  var multiArray: MLMultiArray { output ?? MLMultiArray(owned!) }
+
+  static func zeros(_ shape: [Int]) -> Self { Self(owned: .init(repeating: 0, shape: shape)) }
   func read<T>(_ body: (UnsafePointer<Float16>, [Int]) -> T) -> T {
-    value.withUnsafeShapedBufferPointer { buffer, _, strides in body(buffer.baseAddress!, strides) }
+    if let output {
+      return output.withUnsafeBytes { bytes in
+        body(bytes.bindMemory(to: Float16.self).baseAddress!, output.strides.map(\.intValue))
+      }
+    }
+    return owned!.withUnsafeShapedBufferPointer { buffer, _, strides in body(buffer.baseAddress!, strides) }
   }
   mutating func write(_ body: (UnsafeMutablePointer<Float16>, [Int]) -> Void) {
-    value.withUnsafeMutableShapedBufferPointer { buffer, _, strides in body(buffer.baseAddress!, strides) }
+    if let output {
+      owned = MLShapedArray<Float16>(output)
+      self.output = nil
+    }
+    owned!.withUnsafeMutableShapedBufferPointer { buffer, _, strides in body(buffer.baseAddress!, strides) }
   }
 }
 
@@ -85,7 +158,7 @@ struct CoreMLResults: DecisionOutputs {
           array.dataType == .float16, array.shape.count == 4, array.count > 0 else {
       throw DecisionError("Invalid FP16 output: " + name)
     }
-    return CoreMLBuffer(value: MLShapedArray<Float16>(array))
+    return CoreMLBuffer(output: array)
   }
 }
 
@@ -106,7 +179,7 @@ struct CoreMLFunction: DecisionFunction {
     var features = [String: MLFeatureValue]()
     for (name, buffer) in inputs {
       guard buffer.shape == (try inputShape(name)) else { throw DecisionError("Input shape mismatch: " + name) }
-      features[name] = MLFeatureValue(multiArray: MLMultiArray(buffer.value))
+      features[name] = MLFeatureValue(multiArray: buffer.multiArray)
     }
     let provider = try MLDictionaryFeatureProvider(dictionary: features)
     return CoreMLResults(provider: try await model.prediction(from: provider))
@@ -126,11 +199,13 @@ final class CoreMLGraphs: DecisionDevice {
     }
     try CoreMLDecisionCapability.requireHardware()
     let url = try root.bundleChild(path)
-    let config = CoreMLDecisionCapability.configuration()
-    _ = try await CoreMLDecisionCapability.checkPlan(url, config)
-    let model = try await MLModel.load(contentsOf: url, configuration: config)
-    try validateFeatures(model.modelDescription, entry: logical)
-    return CoreMLFunction(model: model)
+    let modelAsset = try MLModelAsset(url: url)
+    return try await CoreMLDecisionCapability.withPreferredPlacement { config in
+      let model = try await MLModel.load(asset: modelAsset, configuration: config)
+      _ = try await CoreMLDecisionCapability.checkPlan(modelAsset, url: url, config)
+      try validateFeatures(model.modelDescription, entry: logical)
+      return CoreMLFunction(model: model)
+    }
   }
 
   // Packages are independently compiled. Validate the interface before any revision can become active.
