@@ -2,6 +2,8 @@
 
 A Swift library for macOS 27 on Apple silicon. It accepts a resolved local bundle URL. Valen-4B and Elephant-1 accept text with an optional image. GLiDE-2B, GLiDE-9B, K-Decision, KnowLine and Jeffan accept text. Each request preserves the order of questions and candidates. Pass JSON state as its serialized text, preserving the desired property order and whitespace.
 
+An experimental local Core ML Valen export can declare `tiers: [256]` and `context: 256`. The context is the maximum length of the assembled prompt, including image tokens. Larger exports can select a strictly increasing subset of 256, 512, 1024, 2048 and 4096, starting at 256. Every attention stage must supply a function for each declared tier. Both rotary tables retain all 4096 positions. Numerical and latency results apply only to the model, device and prompt lengths actually measured.
+
 ## Prepare a bundle
 
 To export Valen-4B or GLiDE-2B/9B, use a local snapshot of the pinned Hugging Face model. The snapshot needs model data and tokenizer files. The exporter checks the snapshot against the published file digests in `Tools/checkpoints.json`. Run the following from this package directory on an Apple silicon Mac with Xcode 27 and Apple's Core AI Python conversion SDK. The exporters use PyTorch and safetensors. The optional text exporters and CPU comparisons also use Transformers.

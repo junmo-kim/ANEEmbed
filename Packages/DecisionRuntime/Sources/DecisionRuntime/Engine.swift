@@ -1,16 +1,26 @@
-#if canImport(CoreAI)
-import CoreAI
 import DecisionProfiles
 import Foundation
 
-@available(macOS 27.0, *)
-final class Session {
-  let manifest: Manifest, builder: PromptBuilder, backbone: Backbone,
+private struct ReadoutConfig: Decodable {
+  let codes: [String]
+  let temperature: Double
+}
+
+@available(macOS 26.0, *)
+protocol DecisionSession {
+  func prepare() async throws
+  func decide(_ request: DecisionInput) async throws -> DecisionResponse
+}
+
+@available(macOS 26.0, *)
+final class Session<Device: DecisionDevice>: DecisionSession {
+  typealias Buffer = Device.Function.ResultTensors.Buffer
+  func prepare() async throws { try await backbone.prepare() }
+  let manifest: Manifest, builder: PromptBuilder, backbone: Backbone<Device>,
     readout: Linear?, vision: Vision?
   let temperature: Double
-  init(_ root: URL) throws {
+  init(_ root: URL, _ m: Manifest) throws {
     guard root.isFileURL else { throw DecisionError("Expected a resolved local bundle URL") }
-    let m = try Manifest.validated(at: root)
     let weights =
       m.embeddingLookup == nil
       ? try Weights(root.appendingPathComponent("model.safetensors")) : nil
@@ -32,11 +42,7 @@ final class Session {
       temperature = 1
       vision = Vision(elephant: false)
     } else {
-      struct Config: Decodable {
-        let codes: [String]
-        let temperature: Double
-      }
-      let c = try root.decode("decision_config.json", as: Config.self)
+      let c = try root.decode("decision_config.json", as: ReadoutConfig.self)
       guard c.temperature.isFinite, c.temperature > 0 else {
         throw DecisionError("Invalid readout calibration")
       }
@@ -74,7 +80,7 @@ final class Session {
       phases[phase, default: 0] += now - last
       last = now
     }
-    let visual: VisualFeatures?
+    let visual: VisualFeatures<Buffer>?
     if let image = request.image {
       guard let vision else {
         throw DecisionError("This model bundle does not support images", input: true)
@@ -182,21 +188,21 @@ final class Session {
     guard hidden.count == manifest.hidden, (1...256).contains(count) else {
       throw DecisionError("Invalid readout input shape")
     }
-    var input = NDArray.zeros([1, manifest.hidden, 1, 1])
+    var input = Buffer.zeros([1, manifest.hidden, 1, 1])
     input.write { p, strides in
       for i in hidden.indices { p[i * strides[1]] = Float16(hidden[i]) }
     }
-    var mask = NDArray.zeros([1, 256, 1, 1])
+    var mask = Buffer.zeros([1, 256, 1, 1])
     mask.write { p, strides in
       for i in count..<256 { p[i * strides[1]] = -30000 }
     }
     let f = try await backbone.function("readout", in: head.asset)
-    var out = try await f.run(inputs: ["hidden": input, "mask": mask])
+    var out = try await f.evaluate(["hidden": input, "mask": mask])
     let output = try out.tensor("probabilities")
     return try await formatDeviceAnswer(output, branch: branch)
   }
 
-  func formatDeviceAnswer(_ output: NDArray, branch: Branch) async throws -> DecisionAnswer {
+  func formatDeviceAnswer(_ output: Buffer, branch: Branch) async throws -> DecisionAnswer {
     let count = branch.candidates.count
     guard output.shape == [1, 256, 1, 1] else { throw DecisionError("Invalid probability shape") }
     let values = output.read { p, strides in (0..<256).map { Double(p[$0 * strides[1]]) } }
@@ -208,8 +214,8 @@ final class Session {
     let p = Array(values.prefix(count))
     let k = branch.question.kind
     let top = p.firstIndex(of: p.max()!)!
-    func scalar(_ value: Float16) -> NDArray {
-      var tensor = NDArray.zeros([1, 1, 1, 1])
+    func scalar(_ value: Float16) -> Buffer {
+      var tensor = Buffer.zeros([1, 1, 1, 1])
       tensor.write { p, _ in p[0] = value }
       return tensor
     }
@@ -218,7 +224,7 @@ final class Session {
     }
     let sf = try await backbone.function("stats", in: stats.asset)
     let constants = ElephantDeviceConstants.stats[count - 1]
-    var result = try await sf.run(inputs: [
+    var result = try await sf.evaluate([
       "p": output, "top_index": scalar(Float16(top)),
       "choice_scale": scalar(constants[0]), "choice_bias": scalar(constants[1]),
       "mad_scale": scalar(constants[2]),
@@ -245,16 +251,16 @@ final class Session {
     guard hidden.count == manifest.hidden, (1...255).contains(count) else {
       throw DecisionError("Invalid readout input shape")
     }
-    var input = NDArray.zeros([1, manifest.hidden, 1, 1])
+    var input = Buffer.zeros([1, manifest.hidden, 1, 1])
     input.write { p, strides in
       for i in hidden.indices { p[i * strides[1]] = Float16(hidden[i]) }
     }
-    var mask = NDArray.zeros([1, 255, 1, 1])
+    var mask = Buffer.zeros([1, 255, 1, 1])
     mask.write { p, strides in
       for i in count..<255 { p[i * strides[1]] = -30000 }
     }
     let f = try await backbone.function("readout", in: head.asset)
-    var out = try await f.run(inputs: ["hidden": input, "mask": mask])
+    var out = try await f.evaluate(["hidden": input, "mask": mask])
     let output = try out.tensor("probabilities")
     guard output.shape == [1, 255, 1, 1] else { throw DecisionError("Invalid probability shape") }
     let values = output.read { p, strides in (0..<255).map { Double(p[$0 * strides[1]]) } }
@@ -267,10 +273,10 @@ final class Session {
     guard let stats = manifest.resultStats, let maximum = p.max(),
       let top = p.firstIndex(of: maximum)
     else { throw DecisionError("Missing device statistics") }
-    var excluded = NDArray.zeros([1, 255, 1, 1])
+    var excluded = Buffer.zeros([1, 255, 1, 1])
     excluded.write { ptr, stride in ptr[top * stride[1]] = -30000 }
     let statsFunction = try await backbone.function("readoutStats", in: stats.asset)
-    var statsOut = try await statsFunction.run(inputs: ["p": output, "exclude": excluded])
+    var statsOut = try await statsFunction.evaluate(["p": output, "exclude": excluded])
     let fields = try statsOut.tensor("statistics")
     guard fields.shape == [1, 3, 1, 1] else { throw DecisionError("Invalid device statistics") }
     let numbers = fields.read { ptr, stride in (0..<3).map { Double(ptr[$0 * stride[1]]) } }
@@ -325,11 +331,11 @@ final class Session {
 
 /// Serializes the whole request, including Core AI suspension points. Unload waits for the
 /// running decision; subsequent requests recreate the session at the same stable asset path.
-@available(macOS 27.0, *)
+@available(macOS 26.0, *)
 public actor DecisionEngine {
   public let bundleURL: URL
   let idleTimeout: Duration?
-  private var session: Session?, busy = false, waiters = [CheckedContinuation<Void, Never>]()
+  private var session: (any DecisionSession)?, busy = false, waiters = [CheckedContinuation<Void, Never>]()
   private var timer: Task<Void, Never>?, generation: UInt = 0
   public init(bundleURL: URL, idleTimeout: Duration? = nil) {
     self.bundleURL = bundleURL
@@ -365,19 +371,31 @@ public actor DecisionEngine {
       timer = nil
     }
   }
-  private func resident() throws -> Session {
+  private func makeSession(preparing: Bool = false) throws -> any DecisionSession {
+    let manifest = try Manifest.validated(at: bundleURL)
+    if manifest.backend == "coreml" {
+      return try Session<CoreMLGraphs>(bundleURL, manifest)
+    }
+    #if canImport(CoreAI)
+    if #available(macOS 27.0, *) {
+      let session = try Session<CoreAIGraphs>(bundleURL, manifest)
+      if preparing || manifest.embeddingLookup != nil { try session.backbone.device.verifyPlacement() }
+      return session
+    }
+    #endif
+    throw DecisionError("Core AI bundles require macOS 27 and the Core AI SDK")
+  }
+  private func resident() throws -> any DecisionSession {
     if let session { return session }
-    let new = try Session(bundleURL)
-    if new.manifest.embeddingLookup != nil { try new.backbone.verifyPlacement() }
+    let new = try makeSession()
     session = new
     return new
   }
   public func prepare() async throws {
     await acquire()
     defer { release() }
-    let temporary = try Session(bundleURL)
-    try temporary.backbone.verifyPlacement()
-    try await temporary.backbone.prepare()
+    let temporary = try makeSession(preparing: true)
+    try await temporary.prepare()
   }
   public func load() async throws {
     await acquire()
@@ -396,4 +414,3 @@ public actor DecisionEngine {
     session = nil
   }
 }
-#endif

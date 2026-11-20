@@ -140,7 +140,8 @@ public struct DecisionResponse: Codable, Sendable {
 
 struct Manifest: Decodable {
   enum CodingKeys: String, CodingKey {
-    case architecture
+    case architecture, backend
+    case coreMLFunctions = "coreml_functions"
     case source
     case assets
     case execution
@@ -193,6 +194,8 @@ struct Manifest: Decodable {
     let revision: String
   }
   let architecture: String
+  let backend: String?
+  let coreMLFunctions: [String: String]?
   let source: Source
   let assets: [Asset], execution: [Block], stageKinds: [String]
   let hidden: Int, width: Int, context: Int, tiers: [Int], rotaryDim: Int
@@ -233,22 +236,66 @@ struct Manifest: Decodable {
   var causal: Bool { kDecision || knowLine }
   var elephant: Bool { DecisionProfile(repository: source.repo) == .elephant1 }
   var valen: Bool { DecisionProfile(repository: source.repo) == .valen4B }
-  #if canImport(CoreAI)
-  @available(macOS 27.0, *)
+  @available(macOS 26.0, *)
   static func validated(at directory: URL) throws -> Manifest {
     let manifest = try directory.decode("model.json", as: Manifest.self)
     try manifest.validate()
     return manifest
   }
 
-  @available(macOS 27.0, *)
+  // The packed rotary tables retain the publisher context even when the export omits larger attention tiers.
+  static let valenRotaryPositions = 4096
+  static func validateCoreMLTiers(_ tiers: [Int], context: Int) throws {
+    let supported = [256, 512, 1024, 2048, valenRotaryPositions]
+    guard tiers.first == 256, tiers.last == context,
+      tiers == supported.filter(tiers.contains) else {
+      throw DecisionError("Core ML Valen tiers must start at 256, increase through supported capacities, and end at context")
+    }
+  }
+
+  func validateCoreMLBindings() throws {
+    try Self.validateCoreMLTiers(tiers, context: context)
+    guard assets.count == stageKinds.count else {
+      throw DecisionError("Invalid Core ML stage layout")
+    }
+    for (index, asset) in assets.enumerated() {
+      var required = ["scan\(index)"]
+      if stageKinds[index] == "attention" { required += tiers.map { "attend\(index)c\($0)" } }
+      guard Set(asset.functions.map(Self.logicalFunction)) == Set(required) else {
+        throw DecisionError("Incomplete Core ML function schedule for stage \(index)")
+      }
+    }
+    let logical = (assets + deviceExtras).flatMap(\.functions).map(Self.logicalFunction)
+      + (visionFunctions ?? []).map(Self.logicalFunction)
+    guard valen, let bindings = coreMLFunctions, !logical.isEmpty,
+      Set(logical).count == logical.count, Set(bindings.keys) == Set(logical),
+      bindings.allSatisfy({ $0.value == $0.key + ".mlmodelc" && URL(fileURLWithPath: $0.value).lastPathComponent == $0.value })
+    else { throw DecisionError("Incomplete or unsafe Core ML Valen function map") }
+  }
+
+  @available(macOS 26.0, *)
   func validate() throws {
+    let chip: String
+    if backend == "coreml" {
+      try CoreMLDecisionCapability.requireHardware()
+      chip = "h16g"
+      try validateCoreMLBindings()
+    } else {
+      guard backend == nil || backend == "coreai", coreMLFunctions == nil else {
+        throw DecisionError("Unsupported decision backend")
+      }
+      #if canImport(CoreAI)
+      if #available(macOS 27.0, *) { chip = AIModel.deviceArchitectureName }
+      else { throw DecisionError("Core AI bundles require macOS 27") }
+      #else
+      throw DecisionError("Core AI SDK unavailable; select a Core ML Valen bundle")
+      #endif
+    }
     if !valen && (rolePool != nil || roleMixer != nil || smallVision != nil) {
       throw DecisionError("Unexpected Valen role operators")
     }
     if valen {
       if embeddingLookup == nil && rolePool == nil && roleMixer == nil {
-        let chip = AIModel.deviceArchitectureName
         let migration = chip == "h16g"
           ? "Reinstall with anerun models install --model valen-4b."
           : "Build a device-operator bundle for \(chip) and install it with anerun models install --model valen-4b --from DIR."
@@ -256,7 +303,7 @@ struct Manifest: Decodable {
       }
       let expected = [(rolePool, "valenPool"), (roleMixer, "valenMixer"), (decisionHead, "readout"),
                       (resultStats, "stats"), (visionPosition, "visionpos"), (featureScale, "featurescale")]
-      guard hidden == 2560, context == 4096, width == 128, visionFunctions?.map(Self.logicalFunction) == ["p1024"],
+      guard hidden == 2560, (backend == "coreml" || context == Self.valenRotaryPositions), width == 128, visionFunctions?.map(Self.logicalFunction) == ["p1024"],
         smallVision.map({ $0.functions.map(Self.logicalFunction) == ["p256"] }) ?? true,
         visionAsset != nil, visionFractions == "vision-fractions.fp16",
         rotaryTables == ["text": "text-rotary.fp16", "vision": "vision-rotary.fp16"],
@@ -344,7 +391,7 @@ struct Manifest: Decodable {
       ? Array(repeating: 1, count: 4) + [2, 2, 2] + Array(repeating: 1, count: 16)
       : [1, 2, 2, 2, 1, 1, 1, 1]
     guard let profile = DecisionProfile(repository: source.repo),
-      architecture == AIModel.deviceArchitectureName, profile.revision == source.revision,
+      architecture == chip, profile.revision == source.revision,
       width == 128, (1...8192).contains(hidden),
       rotaryDim == 64, context == tiers.last, context <= 16384, !tiers.isEmpty,
       tiers == tiers.sorted(), tiers.allSatisfy({ $0 >= width && $0 % width == 0 }),
@@ -366,11 +413,10 @@ struct Manifest: Decodable {
       execution.flatMap(\.stages) == Array(assets.indices),
       execution.allSatisfy({ (1...8).contains($0.passes) }),
       ((assets + deviceExtras).map(\.asset) + [visionAsset].compactMap { $0 }).allSatisfy({
-        $0.hasSuffix(".aimodelc") && URL(fileURLWithPath: $0).lastPathComponent == $0
+        ($0.hasSuffix(".aimodelc") || (backend == "coreml" && $0.hasSuffix(".aimodel"))) && URL(fileURLWithPath: $0).lastPathComponent == $0
       })
     else { throw DecisionError("Unsupported decision bundle manifest") }
   }
-  #endif
 }
 extension URL {
   func bundleChild(_ name: String) throws -> URL {

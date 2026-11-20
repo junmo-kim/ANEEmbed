@@ -1,12 +1,10 @@
-#if canImport(CoreAI)
-import CoreAI
 import CoreGraphics
 import Foundation
 import ImageIO
 
-@available(macOS 27.0, *)
-struct VisualFeatures { let tensor: NDArray, count: Int, columns: Int }
-@available(macOS 27.0, *)
+@available(macOS 26.0, *)
+struct VisualFeatures<Buffer: DecisionBuffer> { let tensor: Buffer, count: Int, columns: Int }
+@available(macOS 26.0, *)
 struct Vision {
   // FP16 encoding of each decoded sRGB byte after normalization to [-1, 1].
   static let pixelBits: [UInt16] = [
@@ -48,7 +46,8 @@ struct Vision {
     channels = elephant ? 1152 : 1024
     rotaryQuarter = elephant ? 18 : 16
   }
-  func encode(_ data: Data, using backbone: Backbone) async throws -> VisualFeatures {
+  func encode<D: DecisionDevice>(_ data: Data, using backbone: Backbone<D>) async throws -> VisualFeatures<D.Function.ResultTensors.Buffer> {
+    typealias Buffer = D.Function.ResultTensors.Buffer
     guard let source = CGImageSourceCreateWithData(data as CFData, nil),
       let props = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
       let width = props[kCGImagePropertyPixelWidth] as? Int,
@@ -99,11 +98,11 @@ struct Vision {
       ctx.interpolationQuality = .high
       ctx.draw(image, in: CGRect(x: 0, y: 0, width: w, height: h))
     }
-    var pixels = NDArray.zeros([1, 1536, 1, capacity])
-    var pos = NDArray.zeros([1, channels, 1, capacity])
-    var cos = NDArray.zeros([1, 1, rotaryQuarter * 2, capacity])
+    var pixels = Buffer.zeros([1, 1536, 1, capacity])
+    var pos = Buffer.zeros([1, channels, 1, capacity])
+    var cos = Buffer.zeros([1, 1, rotaryQuarter * 2, capacity])
     var sin = cos
-    var mask = NDArray.zeros([1, 1, 1, capacity])
+    var mask = Buffer.zeros([1, 1, 1, capacity])
     mask.write { p, s in for i in patches..<capacity { p[i * s[3]] = -30000 } }
     for i in 0..<patches {
       let group = i / 4
@@ -156,9 +155,9 @@ struct Vision {
         return Float16(bitPattern: UInt16(littleEndian: fractions[i]))
       }
       for start in stride(from: 0, to: patches, by: 16) {
-        var inputs = [String: NDArray]()
+        var inputs = [String: Buffer]()
         for key in ["row", "column", "fy", "fx"] {
-          var arr = NDArray.zeros([1, 1, 1, 16])
+          var arr = Buffer.zeros([1, 1, 1, 16])
           arr.write { a, s in
             for t in 0..<16 {
               let i = min(start + t, patches - 1)
@@ -177,7 +176,7 @@ struct Vision {
           }
           inputs[key] = arr
         }
-        var result = try await project.run(inputs: inputs)
+        var result = try await project.evaluate(inputs)
         let lanes = try result.tensor("pos")
         guard lanes.shape == [1, channels, 1, 16] else {
           throw DecisionError("Vision position lane shape")
@@ -194,13 +193,13 @@ struct Vision {
       }
     }
     let f = try await backbone.function("p\(capacity)", in: small?.asset ?? fullAsset)
-    var out = try await f.run(inputs: [
+    var out = try await f.evaluate([
       "pixel_values": pixels, "cos": cos, "sin": sin, "attn_mask": mask, "pos_embeds": pos,
     ])
     var hidden = try out.tensor("features")
     if small == nil, let scale = backbone.manifest.featureScale {
       let f = try await backbone.function("featurescale", in: scale.asset)
-      var result = try await f.run(inputs: ["features": hidden])
+      var result = try await f.evaluate(["features": hidden])
       hidden = try result.tensor("scaled")
     }
     let hsize = backbone.manifest.hidden
@@ -210,4 +209,3 @@ struct Vision {
     return VisualFeatures(tensor: hidden, count: patches / 4, columns: gw / 2)
   }
 }
-#endif

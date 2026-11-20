@@ -1,0 +1,60 @@
+import CoreML
+import Foundation
+import XCTest
+@testable import DecisionRuntime
+
+@available(macOS 26.0, *)
+final class CoreMLRuntimeTests: XCTestCase {
+  func testEligibilityRequiresBothTargetMacAndExposedANE() throws {
+    XCTAssertThrowsError(try CoreMLDecisionCapability.requireHardware(neuralEngine: false, model: "Mac16,10"))
+    XCTAssertThrowsError(try CoreMLDecisionCapability.requireHardware(neuralEngine: true, model: "unknown"))
+    try CoreMLDecisionCapability.requireHardware(neuralEngine: true, model: "Mac16,10")
+    XCTAssertEqual(CoreMLDecisionCapability.configuration().computeUnits, .cpuAndNeuralEngine)
+  }
+
+  func testRotaryAndCacheCopiesKeepIndependentValues() {
+    var first = CoreMLBuffer.zeros([1, 2, 1, 3])
+    first.write { pointer, strides in pointer[strides[1] + 2 * strides[3]] = 7 }
+    var second = first
+    second.write { pointer, strides in pointer[strides[1] + 2 * strides[3]] = 9 }
+    XCTAssertEqual(first.read { $0[$1[1] + 2 * $1[3]] }, 7)
+    XCTAssertEqual(second.read { $0[$1[1] + 2 * $1[3]] }, 9)
+  }
+
+  func testCoreMLValenCanShipOnlyItsExportedAttentionTiers() throws {
+    try Manifest.validateCoreMLTiers([256], context: 256)
+    try Manifest.validateCoreMLTiers([256, 1024], context: 1024)
+    try Manifest.validateCoreMLTiers([256, 512, 1024, 2048, 4096], context: 4096)
+    XCTAssertEqual(Manifest.valenRotaryPositions, 4096)
+    for tiers in [[], [0, 256], [512], [256, 256], [256, 1024, 512], [256, 768], [256, 8192]] {
+      XCTAssertThrowsError(try Manifest.validateCoreMLTiers(tiers, context: tiers.last ?? 0))
+    }
+    XCTAssertThrowsError(try Manifest.validateCoreMLTiers([256], context: 4096))
+  }
+
+  func testFunctionBindingsRequireMatchingLogicalNamesAndAllAttentionTiers() throws {
+    func validate(_ entries: [String], _ bindings: [String: String]) throws {
+      let manifest: [String: Any] = [
+        "source": ["repo": "Valen-Team/Valen-Decision-1.5-4B", "revision": "test"],
+        "architecture": "h16g", "backend": "coreml", "coreml_functions": bindings,
+        "assets": [["asset": "stage0.aimodel", "source_hash": "test", "functions": entries]],
+        "execution": [["stages": [0], "passes": 1]], "stage_kinds": ["attention"],
+        "width": 128, "hidden": 2560, "context": 512, "tiers": [256, 512],
+        "heads": 16, "kv_heads": 4, "head_dim": 256, "rotary_dim": 64, "block_mask": true
+      ]
+      let data = try JSONSerialization.data(withJSONObject: manifest)
+      try JSONDecoder().decode(Manifest.self, from: data).validateCoreMLBindings()
+    }
+    let logical = ["scan0", "attend0c256", "attend0c512"]
+    let entries = ["scan0_" + String(repeating: "a", count: 64)] + logical.dropFirst()
+    let bindings = Dictionary(uniqueKeysWithValues: logical.map { ($0, $0 + ".mlmodelc") })
+    try validate(entries, bindings)
+    let missingTier = bindings.filter { $0.key != "attend0c512" }
+    XCTAssertThrowsError(try validate(Array(entries.dropLast()), missingTier))
+    XCTAssertThrowsError(try validate(entries, missingTier))
+    var escape = bindings
+    escape["scan0"] = "../scan0.mlmodelc"
+    XCTAssertThrowsError(try validate(entries, escape))
+    XCTAssertThrowsError(try validate(entries + ["scan0"], bindings))
+  }
+}
