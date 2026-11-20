@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/junmo-kim/ANERun/actions/workflows/ci.yml/badge.svg)](https://github.com/junmo-kim/ANERun/actions/workflows/ci.yml) [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE) ![Platform: macOS 15+ · Apple Silicon](https://img.shields.io/badge/platform-macOS%2015%2B%20%C2%B7%20Apple%20Silicon-lightgrey)
 
-Run local embeddings and decisions on Apple silicon with one Swift executable. Embeddings support macOS 15 and later through the CLI, OpenAI-compatible HTTP API and MCP. Decision models use Core AI on macOS 27. The decision model table lists the hardware verified for each portable package.
+Run local embeddings and decisions on Apple silicon with one Swift executable. Embeddings support macOS 15 and later through the CLI, OpenAI-compatible HTTP API and MCP. The published decision packages use Core AI on macOS 27. The decision model table lists the hardware verified for each portable package.
 
 ## Embedding models
 
@@ -87,6 +87,14 @@ install -m 755 .build/release/anerun "$HOME/.local/bin/anerun"
 export PATH="$HOME/.local/bin:$PATH"
 anerun --version
 ```
+
+### Experimental Core ML decisions on macOS 26
+
+On an M4 Mac mini, build this branch with the macOS 26 SDK and run `anerun decision-capability --format json` to check whether Core ML exposes the Neural Engine. To inspect a local Valen function, run `anerun decision-capability --plan /path/to/scan0.mlpackage --format json`. The command exits with status 69 if any executable operation lacks a preferred Neural Engine placement. Core ML reports a static execution plan and provides no per-prediction device attestation.
+
+The published Valen bundle requires macOS 27. Full-model Valen inference on macOS 26 is still under evaluation. The hosted CI job compiles a small Core ML fixture and checks its output against a fixed reference. End-to-end model probabilities and latency require a physical Mac.
+
+### Select a model
 
 Choose one model ID from the table above. Set it once in your shell for install,
 diagnostics and serving. For example, to use Qwen3:
