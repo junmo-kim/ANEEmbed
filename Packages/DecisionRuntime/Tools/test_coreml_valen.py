@@ -7,7 +7,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
-from coreml_valen import export_bundle, export_function, feature_scale_graph, role_graphs
+from coreml_valen import export_bundle, export_feature_scale, export_function, role_graphs
 
 
 class CoreMLValenExportTests(unittest.TestCase):
@@ -73,12 +73,26 @@ class CoreMLValenExportTests(unittest.TestCase):
                 self.assertTrue((output / path).is_dir())
             self.assertFalse((output / "model.safetensors").exists())
 
-    def test_dense_feature_scale_preserves_the_vision_abi(self):
-        import torch
+    @unittest.skipUnless(find_spec("coremltools"), "Apple coremltools required for conversion")
+    def test_feature_scale_preserves_rank_and_uses_one_linear_activation(self):
+        from coremltools.models.utils import load_spec
+        from coremltools.proto import FeatureTypes_pb2
 
-        rng = torch.Generator().manual_seed(749)
-        x = torch.randn((1, 2560, 1, 256), generator=rng).half()
-        torch.testing.assert_close(feature_scale_graph().half()(x), x * 64, rtol=0, atol=0)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "featurescale.mlpackage"
+            shape = (1, 2560, 1, 256)
+            export_feature_scale(path, {"features": shape}, ["scaled"])
+            model = load_spec(str(path))
+            for fields, name in ((model.description.input, "features"), (model.description.output, "scaled")):
+                feature, = fields
+                self.assertEqual(feature.name, name)
+                self.assertEqual(tuple(feature.type.multiArrayType.shape), shape)
+                self.assertEqual(feature.type.multiArrayType.dataType, FeatureTypes_pb2.ArrayFeatureType.FLOAT16)
+            layer, = model.neuralNetwork.layers
+            self.assertEqual(list(layer.input), ["features"])
+            self.assertEqual(list(layer.output), ["scaled"])
+            self.assertEqual(layer.activation.WhichOneof("NonlinearityType"), "linear")
+            self.assertEqual((layer.activation.linear.alpha, layer.activation.linear.beta), (64, 0))
 
     def test_role_accumulation_and_first_winner_from_masked_probabilities(self):
         import torch

@@ -87,21 +87,25 @@ def export_fixture(destination):
     export_function(destination, layer, {"hidden_in": (1, 2, 1, 2)}, ["hidden_out"])
 
 
-def feature_scale_graph():
-    """Represent the exact 64x scale with a dense diagonal ANE-planned convolution."""
-    import torch
-    from torch.nn import functional as F
+def export_feature_scale(path, inputs, outputs):
+    """Scale the visual residual with a single shape-preserving FP16 activation."""
+    from coremltools.models.utils import save_spec
+    from coremltools.proto import FeatureTypes_pb2, Model_pb2, NeuralNetwork_pb2
+    from decision_graph import RESIDUAL_SCALE
 
-    class FeatureScale(torch.nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.register_buffer("weight", torch.eye(128).reshape(128, 128, 1, 1) * 64)
-
-        def forward(self, features):
-            tiles = features.reshape(1, 128, 20, 256)
-            return F.conv2d(tiles, self.weight).reshape(1, 2560, 1, 256)
-
-    return FeatureScale()
+    if inputs != {"features": (1, 2560, 1, 256)} or outputs != ["scaled"]:
+        raise ValueError("Unexpected Valen visual residual interface")
+    model = Model_pb2.Model(specificationVersion=7)
+    network = model.neuralNetwork
+    network.arrayInputShapeMapping = NeuralNetwork_pb2.EXACT_ARRAY_MAPPING
+    network.imageInputShapeMapping = NeuralNetwork_pb2.RANK4_IMAGE_MAPPING
+    for fields, name in ((model.description.input, "features"), (model.description.output, "scaled")):
+        feature = fields.add(name=name).type.multiArrayType
+        feature.dataType = FeatureTypes_pb2.ArrayFeatureType.FLOAT16
+        feature.shape.extend(inputs["features"])
+    layer = network.layers.add(name="scale64", input=["features"], output=["scaled"])
+    layer.activation.linear.alpha = RESIDUAL_SCALE
+    save_spec(model, str(path))
 
 
 def role_graphs(head):
@@ -194,7 +198,10 @@ def export_bundle(checkpoint, destination, small_vision, tiers=TIERS):
             path = output / f"{name}.mlpackage"
             if name in functions:
                 raise ValueError(f"Duplicate logical function: {name}")
-            export_function(path, module, inputs, outputs)
+            if name == "featurescale":
+                export_feature_scale(path, inputs, outputs)
+            else:
+                export_function(path, module, inputs, outputs)
             if linear_scan:
                 from coreml_scan_pipeline import partition_scan
                 partition_scan(path)
@@ -209,8 +216,6 @@ def export_bundle(checkpoint, destination, small_vision, tiers=TIERS):
             return dict(asset=f"{group}.aimodel", functions=names, source_hash=fingerprint.hexdigest())
 
         def operator(name, module, inputs, result):
-            if name == "featurescale":
-                module = feature_scale_graph()
             convert(name, module, inputs, [result] if isinstance(result, str) else result)
             return asset(name, [name])
 
