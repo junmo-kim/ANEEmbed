@@ -1,6 +1,7 @@
 import hashlib
 import json
 from pathlib import Path
+import struct
 import subprocess
 import sys
 import tempfile
@@ -48,6 +49,25 @@ class SharedWeightsTests(unittest.TestCase):
     def test_recipe_without_aliases(self):
         self.assertEqual(self.repack().returncode, 0)
         self.assertEqual((self.dest / "weight.bin").read_bytes(), b"weights")
+
+    def test_repackages_stage_slices_in_bank_order(self):
+        first = struct.pack("<2e", -0.5, 2.0)
+        second = struct.pack("<2e", 1.0, -3.0)
+        weights = self.original / "weight.bin"
+        weights.write_bytes(b"head" + first + second)
+        self.recipe["base"] = {}
+
+        def tensor(offset, data, scale):
+            return {"source": {"file": weights.name, "offset": offset, "size": len(data)},
+                    "sha256": hashlib.sha256(data).hexdigest(), "scale": scale}
+
+        self.recipe["stages"] = {"0": {"u0": tensor(8, second, 1),
+                                       "qkv": tensor(4, first, 64),
+                                       "g0": tensor(4, first, 1)}}
+        result = self.repack()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((self.dest / "valenDelta0.fp16").read_bytes(), struct.pack("<2e", -32, 128))
+        self.assertEqual((self.dest / "valenMLP0.fp16").read_bytes(), first + second)
 
     def test_invalid_alias_preserves_destination(self):
         for target, source in [("short.bin", "missing.bin"), ("../escape", "weight.bin"),

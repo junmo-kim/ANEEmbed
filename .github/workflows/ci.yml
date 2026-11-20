@@ -5,6 +5,7 @@ on:
     branches:
       - main
       - "feature/**"
+      - experiment/macos26-macbook-valen
   pull_request:
     branches: [main]
 
@@ -52,6 +53,7 @@ jobs:
             jq -se 'length == 1 and (.[0] | .backend == "coreml" and .neural_engine and .runtime_attestation == false)' "$RUNNER_TEMP/capability.json"
           fi
           swift test --package-path Packages/DecisionRuntime
+          python3 -m unittest discover -s Packages/DecisionRuntime/Tools -p test_repack_coreml_valen.py
 
       # CI=true: ModelTests skip (virtualized runners have no Neural Engine and no model).
       - name: Test
