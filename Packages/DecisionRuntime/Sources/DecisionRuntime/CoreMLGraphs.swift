@@ -165,6 +165,10 @@ struct CoreMLResults: DecisionOutputs {
 @available(macOS 26.0, *)
 struct CoreMLFunction: DecisionFunction {
   let model: MLModel
+  var prefixWeights: [String: MLFeatureValue] = [:]
+  var tail: MLModel?
+  var tailWeights: [String: MLFeatureValue] = [:]
+
   func inputShape(_ name: String) throws -> [Int] {
     guard let constraint = model.modelDescription.inputDescriptionsByName[name]?.multiArrayConstraint,
           constraint.dataType == .float16, constraint.shape.count == 4, constraint.shape.allSatisfy({ $0.intValue > 0 }) else {
@@ -173,16 +177,26 @@ struct CoreMLFunction: DecisionFunction {
     return constraint.shape.map(\.intValue)
   }
   func evaluate(_ inputs: [String: CoreMLBuffer]) async throws -> CoreMLResults {
-    guard Set(inputs.keys) == Set(model.modelDescription.inputDescriptionsByName.keys) else {
+    guard Set(inputs.keys) == Set(model.modelDescription.inputDescriptionsByName.keys).subtracting(prefixWeights.keys) else {
       throw DecisionError("Core ML function input names differ from manifest ABI")
     }
-    var features = [String: MLFeatureValue]()
+    var features = prefixWeights
     for (name, buffer) in inputs {
       guard buffer.shape == (try inputShape(name)) else { throw DecisionError("Input shape mismatch: " + name) }
       features[name] = MLFeatureValue(multiArray: buffer.multiArray)
     }
     let provider = try MLDictionaryFeatureProvider(dictionary: features)
-    return CoreMLResults(provider: try await model.prediction(from: provider))
+    let prefix = try await model.prediction(from: provider)
+    guard let tail else { return CoreMLResults(provider: prefix) }
+    guard let residual = prefix.featureValue(for: "hidden_out"), let state = prefix.featureValue(for: "packed_state_out") else {
+      throw DecisionError("Missing shared scan result")
+    }
+    var mlpInputs = tailWeights
+    mlpInputs["residual"] = residual
+    let output = try await tail.prediction(from: MLDictionaryFeatureProvider(dictionary: mlpInputs))
+    guard let hidden = output.featureValue(for: "hidden_out") else { throw DecisionError("Missing shared MLP result") }
+    let result = try MLDictionaryFeatureProvider(dictionary: ["hidden_out": hidden, "packed_state_out": state])
+    return CoreMLResults(provider: result)
   }
 }
 
@@ -192,20 +206,40 @@ final class CoreMLGraphs: DecisionDevice {
   var functions = [String: CoreMLFunction]()
   init(root: URL, manifest: Manifest) { self.root = root; self.manifest = manifest }
 
-  private func checkedFunction(_ entry: String) async throws -> CoreMLFunction {
-    let logical = Manifest.logicalFunction(entry)
+  private var weightLayouts = [String: CoreMLValenWeights]()
+
+  private func checkedModel(_ logical: String) async throws -> MLModel {
     guard let path = manifest.coreMLFunctions?[logical], path.hasSuffix(".mlmodelc") else {
       throw DecisionError("Missing installed Core ML function: " + logical)
     }
     try CoreMLDecisionCapability.requireHardware()
     let url = try root.bundleChild(path)
-    let modelAsset = try MLModelAsset(url: url)
+    let asset = try MLModelAsset(url: url)
     return try await CoreMLDecisionCapability.withPreferredPlacement { config in
-      let model = try await MLModel.load(asset: modelAsset, configuration: config)
-      _ = try await CoreMLDecisionCapability.checkPlan(modelAsset, url: url, config)
-      try validateFeatures(model.modelDescription, entry: logical)
-      return CoreMLFunction(model: model)
+      let model = try await MLModel.load(asset: asset, configuration: config)
+      _ = try await CoreMLDecisionCapability.checkPlan(asset, url: url, config)
+      return model
     }
+  }
+
+  private func sharedLayout(_ logical: String) async throws -> CoreMLValenWeights {
+    if let cached = weightLayouts[logical] { return cached }
+    let layout = try await CoreMLValenWeights(model: checkedModel(logical), mlp: logical == "valenMLP")
+    weightLayouts[logical] = layout
+    return layout
+  }
+
+  private func checkedFunction(_ entry: String, verifyOnly: Bool = false) async throws -> CoreMLFunction {
+    let logical = Manifest.logicalFunction(entry)
+    if let stage = manifest.sharedScanIndex(logical) {
+      let delta = try await sharedLayout(stage == 0 ? "valenDeltaFirst" : "valenDelta")
+      let tail = try await sharedLayout("valenMLP")
+      return try CoreMLFunction(model: delta.model, prefixWeights: delta.read(stage: stage, root: root, verifyOnly: verifyOnly),
+                                tail: tail.model, tailWeights: tail.read(stage: stage, root: root, verifyOnly: verifyOnly))
+    }
+    let model = try await checkedModel(logical)
+    try validateFeatures(model.modelDescription, entry: logical)
+    return CoreMLFunction(model: model)
   }
 
   // Packages are independently compiled. Validate the interface before any revision can become active.
@@ -264,12 +298,14 @@ final class CoreMLGraphs: DecisionDevice {
   func function(_ entry: String, asset: String) async throws -> CoreMLFunction {
     if let f = functions[entry] { return f }
     let f = try await checkedFunction(entry)
-    functions[entry] = f
+    // The physical models are shared. Release the per-stage weight buffers after prediction
+    // so that the filesystem cache can hold clean bank pages on smaller machines.
+    if manifest.sharedScanIndex(Manifest.logicalFunction(entry)) == nil { functions[entry] = f }
     return f
   }
   func prepare(_ entry: String, asset: String) async throws {
     // Audit the whole model without keeping every tier's weights resident.
-    _ = try await checkedFunction(entry)
+    _ = try await checkedFunction(entry, verifyOnly: true)
   }
 
   // A Core ML package holds one function. Load each on demand at its first evaluation.

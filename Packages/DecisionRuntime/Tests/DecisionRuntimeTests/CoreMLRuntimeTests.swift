@@ -144,6 +144,31 @@ final class CoreMLRuntimeTests: XCTestCase {
     XCTAssertThrowsError(try Manifest.validateCoreMLTiers([256], context: 4096))
   }
 
+  func testSharedRecurrentStagesRequireBothPrefixesAndTheSharedMLP() throws {
+    let stages = ["linear", "linear", "attention"]
+    let functions = [["scan0"], ["scan1"], ["scan2", "attend2c256"]]
+    let physical = ["valenDeltaFirst", "valenDelta", "valenMLP", "scan2", "attend2c256"]
+    func check(_ names: [String]) throws {
+      let bindings = Dictionary(uniqueKeysWithValues: names.map { ($0, $0 + ".mlmodelc") })
+      let model: [String: Any] = [
+        "source": ["repo": "Valen-Team/Valen-Decision-1.5-4B", "revision": "test"],
+        "architecture": "h16g", "backend": "coreml", "coreml_functions": bindings,
+        "coreml_recurrent_layout": "shared-v1", "stage_kinds": stages,
+        "assets": functions.enumerated().map { i, entries in
+          ["asset": "stage\(i).aimodel", "source_hash": "test", "functions": entries] as [String: Any]
+        },
+        "execution": [["stages": [0, 1, 2], "passes": 1]], "width": 128, "hidden": 2560,
+        "context": 256, "tiers": [256], "heads": 16, "kv_heads": 4, "head_dim": 256,
+        "rotary_dim": 64, "block_mask": true
+      ]
+      let data = try JSONSerialization.data(withJSONObject: model)
+      try JSONDecoder().decode(Manifest.self, from: data).validateCoreMLBindings()
+    }
+    try check(physical)
+    for missing in physical { XCTAssertThrowsError(try check(physical.filter { $0 != missing })) }
+    XCTAssertThrowsError(try check(physical + ["scan1"]))
+  }
+
   func testFunctionBindingsRequireMatchingLogicalNamesAndAllAttentionTiers() throws {
     func validate(_ entries: [String], _ bindings: [String: String]) throws {
       let manifest: [String: Any] = [

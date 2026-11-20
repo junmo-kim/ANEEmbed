@@ -142,6 +142,7 @@ struct Manifest: Decodable {
   enum CodingKeys: String, CodingKey {
     case architecture, backend
     case coreMLFunctions = "coreml_functions"
+    case coreMLRecurrentLayout = "coreml_recurrent_layout"
     case source
     case assets
     case execution
@@ -196,6 +197,7 @@ struct Manifest: Decodable {
   let architecture: String
   let backend: String?
   let coreMLFunctions: [String: String]?
+  let coreMLRecurrentLayout: String?
   let source: Source
   let assets: [Asset], execution: [Block], stageKinds: [String]
   let hidden: Int, width: Int, context: Int, tiers: [Int], rotaryDim: Int
@@ -256,6 +258,13 @@ struct Manifest: Decodable {
     }
   }
 
+  func sharedScanIndex(_ logical: String) -> Int? {
+    guard coreMLRecurrentLayout == "shared-v1", logical.hasPrefix("scan"),
+      let i = Int(logical.dropFirst(4)), logical == "scan\(i)", stageKinds.indices.contains(i),
+      stageKinds[i] == "linear" else { return nil }
+    return i
+  }
+
   func validateCoreMLBindings() throws {
     try Self.validateCoreMLTiers(tiers, context: context)
     guard assets.count == stageKinds.count else {
@@ -270,8 +279,15 @@ struct Manifest: Decodable {
     }
     let logical = (assets + deviceExtras).flatMap(\.functions).map(Self.logicalFunction)
       + (visionFunctions ?? []).map(Self.logicalFunction)
+    var physical = Set(logical)
+    if let layout = coreMLRecurrentLayout {
+      guard layout == "shared-v1", valen, stageKinds.first == "linear",
+        stageKinds.dropFirst().contains("linear") else { throw DecisionError("Unsupported Core ML recurrent layout") }
+      physical = Set(logical.filter { sharedScanIndex($0) == nil })
+      physical.formUnion(["valenDeltaFirst", "valenDelta", "valenMLP"])
+    }
     guard valen, let bindings = coreMLFunctions, !logical.isEmpty,
-      Set(logical).count == logical.count, Set(bindings.keys) == Set(logical),
+      Set(logical).count == logical.count, Set(bindings.keys) == physical,
       bindings.allSatisfy({ $0.value == $0.key + ".mlmodelc" && URL(fileURLWithPath: $0.value).lastPathComponent == $0.value })
     else { throw DecisionError("Incomplete or unsafe Core ML Valen function map") }
   }
@@ -284,7 +300,7 @@ struct Manifest: Decodable {
       chip = "h16g"
       try validateCoreMLBindings()
     } else {
-      guard backend == nil || backend == "coreai", coreMLFunctions == nil else {
+      guard backend == nil || backend == "coreai", coreMLFunctions == nil, coreMLRecurrentLayout == nil else {
         throw DecisionError("Unsupported decision backend")
       }
       #if canImport(CoreAI)

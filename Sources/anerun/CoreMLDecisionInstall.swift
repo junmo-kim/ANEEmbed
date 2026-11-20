@@ -40,7 +40,8 @@ enum CoreMLDecisionInstall {
             try JSONSerialization.data(withJSONObject: model, options: .sortedKeys).write(to: descriptor, options: .atomic)
             try DecisionEngine.validateManifest(at: stage)
             // A rejected recurrent scan cannot serve any request. Check it before compiling the other tiers.
-            let names = ["scan0"] + bindings.keys.filter { $0 != "scan0" }.sorted()
+            let first = model["coreml_recurrent_layout"] == nil ? "scan0" : "valenDeltaFirst"
+            let names = [first] + bindings.keys.filter { $0 != first }.sorted()
             for key in names {
                 guard let name = bindings[key] else { throw ServiceError(.invalidInput, "invalid_bundle", "missing " + key) }
                 try Task.checkCancellation()
