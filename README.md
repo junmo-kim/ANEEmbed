@@ -90,11 +90,20 @@ anerun --version
 
 ### Experimental Core ML decisions on macOS 26
 
-On an M4 Mac mini, build this branch with the macOS 26 SDK and run `anerun decision-capability --format json` to check whether Core ML exposes the Neural Engine. To inspect a local Valen function, run `anerun decision-capability --plan /path/to/scan0.mlpackage --format json`. The command exits with status 69 if any executable operation lacks a preferred Neural Engine placement. Core ML reports a static execution plan and provides no per-prediction device attestation.
+Valen-4B has an experimental 256-token Core ML bundle for Apple silicon. The default Valen install continues to use Core AI on macOS 27. On a macOS 26.7 MacBook, one recurrent layer passed loading and prediction. The full model still needs a run on this OS.
 
-The default Valen bundle uses Core AI on macOS 27. The experimental Core ML bundle has run one recurrent layer on a MacBook with macOS 26.7. The hosted CI job compiles and predicts with a small fixture. Full-model support on macOS 26 is still under evaluation.
+To test on a MacBook that already has the trial bundle, open a terminal in the directory containing its `model/` folder and run:
 
-On an M4 Mac mini running macOS 27.0.1, a resident Core ML server matched the publisher’s labels and token counts on all seven test inputs. Six met the maximum per-option probability difference of 0.001. On the Korean policy input, the publisher returned 0.023554 and Core ML returned 0.021606. Fresh servers also returned HTTP 503 when Core ML could not produce an all-ANE-preferred plan for a function that passed in isolation.
+```sh
+curl -fL https://huggingface.co/junmo-k/valen-4b-ane/resolve/1c89e2c165aa00fb9a44aaa2c972c4ed988bd274/valen-macos26-check.tar.gz -o valen-macos26-check.tar.gz &&
+echo '061e72798b1acf1aca6d2506407aa736fb0e0533169665bb9ed01dba6dec90ca  valen-macos26-check.tar.gz' | shasum -a 256 -c - &&
+tar -xzf valen-macos26-check.tar.gz &&
+./valen-macos26-check/try-valen --check ./model
+```
+
+The 1.4 MB kit repacks the existing trial weights locally and installs them in a separate store. It starts a fresh server for each of seven inputs, sends each input twice, and prints the results directory. A passing run requires matching labels and token counts, a maximum per-option probability difference of 0.001, and responses within 2 seconds on the first request and 1 second on the repeat. Core ML exposes static device preferences for each executable operation. Per-prediction device attestation is unavailable.
+
+On a 16 GiB M4 Mac mini running macOS 27.0.1, the kit's executable returned matching labels and token counts for all 14 responses. The maximum per-option probability difference was 0.000218462. In this single-server run, the first request took 72.88 seconds and the seven immediate repeats had a median of 5.19 seconds. The latency targets remain unmet.
 
 ### Select a model
 
