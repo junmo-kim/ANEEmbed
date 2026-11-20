@@ -18,6 +18,13 @@ struct DecideCommand: Command {
 }
 
 enum DecisionCommands {
+    static var coreAIArchitecture: String? {
+        #if canImport(CoreAI)
+        if #available(macOS 27.0, *) { return AIModel.deviceArchitectureName }
+        #endif
+        return nil
+    }
+
     static func run(_ command: String, arguments: ParsedArguments, config: Config, model: ModelID,
                     format: OutputFormat) async throws(ServiceError) -> ExitCode {
         if command.hasPrefix("models "), arguments.positionals.count != 1 {
@@ -28,10 +35,9 @@ enum DecisionCommands {
             return .success
         }
         guard !config.useFakeRuntime else {
-            throw .badRequest("fake_runtime", "decision models require CoreAI", param: "runtime")
+            throw .badRequest("fake_runtime", "decision models require the native runtime", param: "runtime")
         }
-        #if canImport(CoreAI)
-        if #available(macOS 27.0, *) {
+        if #available(macOS 26.0, *) {
             switch command {
             case "models install":
                 let store = ModelStore(dataDirectory: config.dataDirectory, model: model)
@@ -41,9 +47,12 @@ enum DecisionCommands {
                         throw .badRequest("invalid_model_source", "supply --from DIR without --repo or --revision")
                     }
                     let source = URL(fileURLWithPath: (from as NSString).expandingTildeInPath).standardizedFileURL.resolvingSymlinksInPath()
-                    target = try await DecisionInstall.install(source, model: model, store: store, architecture: AIModel.deviceArchitectureName, prepare: prepareForInstall)
+                    target = try await DecisionInstall.install(source, model: model, store: store, architecture: coreAIArchitecture, prepare: prepareForInstall)
                 } else {
-                    let architecture = AIModel.deviceArchitectureName
+                    guard let architecture = coreAIArchitecture else {
+                        throw ServiceError(.unavailable, "unpublished_model", "no pinned macOS 26 decision package",
+                                           hint: "install an experimental Core ML Valen bundle with --model valen-4b --from DIR")
+                    }
                     let source = try DecisionDownload.source(model: model, architecture: architecture,
                                                              repo: arguments.value("repo"), revision: arguments.value("revision"))
                     target = try await DecisionDownload.install(source, model: model, architecture: architecture, store: store,
@@ -82,28 +91,24 @@ enum DecisionCommands {
             }
             return .success
         }
-        #endif
-        throw ServiceError(.unavailable, "coreai_unavailable", "decision models require macOS 27 and a build with CoreAI")
+        throw ServiceError(.unavailable, "coreai_unavailable", "Core ML decisions require macOS 26; Core AI decisions require macOS 27")
     }
 
-    #if canImport(CoreAI)
-    @available(macOS 27.0, *)
+    @available(macOS 26.0, *)
     static func prepareForInstall(_ directory: URL) async throws {
         do { try await DecisionEngine(bundleURL: directory).prepare() }
         catch let failure as CompiledFunctionLoadFailure { throw failure }
         catch { throw ServiceError(.unavailable, "prepare_failed", "cannot prepare \(directory.path): \(error)") }
     }
 
-    @available(macOS 27.0, *)
+    @available(macOS 26.0, *)
     static func prepare(_ directory: URL) async throws(ServiceError) {
         do { try await DecisionEngine(bundleURL: directory).prepare() }
         catch { throw ServiceError(.unavailable, "prepare_failed", "cannot prepare \(directory.path): \(error)") }
     }
-    #endif
 }
 
-#if canImport(CoreAI)
-@available(macOS 27.0, *)
+@available(macOS 26.0, *)
 struct DecisionRouter: HTTPRouting {
     let engine: DecisionEngine
     let model: String
@@ -168,4 +173,3 @@ struct DecisionRouter: HTTPRouting {
         }
     }
 }
-#endif

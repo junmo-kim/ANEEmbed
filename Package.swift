@@ -2,7 +2,7 @@
 import PackageDescription
 
 // ANERun serves embeddings on macOS 15+ and Core AI decision bundles on macOS 27+.
-// Both use the same command-line executable.
+// Experimental local Core ML Valen bundles use the same executable on eligible macOS 26+ hardware.
 //
 // Release builds use the default -O. Unlike a short-lived CLI, this is a long-running server whose
 // own code (tokenizer, gathers, bias building, JSON encoding) sits on the request path, so speed is

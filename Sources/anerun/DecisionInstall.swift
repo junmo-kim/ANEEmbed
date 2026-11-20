@@ -3,7 +3,7 @@ import EmbedCore
 import Foundation
 
 enum DecisionInstall {
-    static func install(_ source: URL, model: ModelID, store: ModelStore, architecture: String? = nil,
+    static func install(_ source: URL, model: ModelID, store: ModelStore, architecture: String?,
                         compile: PortableDecision.Compiler = PortableDecision.compile,
                         nativeAudit: PortableDecision.NativeAudit = PortableDecision.verifyForActivation,
                         recovery: PortableRecovery = .live,
@@ -14,7 +14,21 @@ enum DecisionInstall {
         guard namespace != source.path, !namespace.hasPrefix(source.path + "/") else {
             throw ServiceError.badRequest("invalid_model_source", "the source cannot contain the model store")
         }
-        if let architecture, fm.fileExists(atPath: source.appendingPathComponent(DecisionDownload.inventory).path) {
+        if #available(macOS 26.0, *) {
+            struct Header: Decodable { let backend: String? }
+            let descriptor = source.appendingPathComponent("model.json")
+            let header = try? JSONDecoder().decode(Header.self, from: SmallFile.read(descriptor, limit: DownloadLimit.manifestBytes))
+            if header?.backend == "coreml" {
+                guard model == .decision(.valen4B) else { throw ServiceError(.invalidInput, "unsupported_model", "Core ML Decisions support Valen-4B") }
+                do { return try await CoreMLDecisionInstall.install(source, store: store, prepare: prepare) }
+                catch let error as ServiceError { throw error }
+                catch { throw ServiceError(.unavailable, "coreml_install_failed", "Core ML Valen installation failed: \(error)") }
+            }
+        }
+        guard let architecture else {
+            throw ServiceError(.unavailable, "coreai_unavailable", "this bundle requires macOS 27 and Core AI; use a local Core ML Valen bundle on macOS 26")
+        }
+        if fm.fileExists(atPath: source.appendingPathComponent(DecisionDownload.inventory).path) {
             let bytes: Data
             do { bytes = try SmallFile.read(source.appendingPathComponent(DecisionDownload.inventory), limit: DownloadLimit.manifestBytes) }
             catch { throw ServiceError(.invalidInput, "invalid_manifest", error.describe(DecisionDownload.inventory)) }

@@ -30,10 +30,10 @@ if [[ ${ANERUN_CHECK_RELEASE_COREAI:-0} == 1 ]]; then
     fail "install with no decision source succeeded"
   fi
   expected=coreai_unavailable
-  if (( $(sw_vers -productVersion | cut -d. -f1) >= 27 )); then expected=invalid_model_source; fi
+  if (( $(sw_vers -productVersion | cut -d. -f1) >= 26 )); then expected=invalid_model_source; fi
   python3 -c 'import json, sys; assert json.load(sys.stdin)["reason"] == sys.argv[1]' \
     "$expected" < "$tmpdir/decision.err" || fail "unexpected decision dispatcher response"
-  if [[ "$expected" == invalid_model_source ]]; then
+  if (( $(sw_vers -productVersion | cut -d. -f1) >= 27 )); then
     # An installed v0.3.0 backbone-only Valen descriptor must fail before serve starts listening.
     python3 - "$binary" "$tmpdir" <<'PYLEGACY'
 import json, pathlib, subprocess, sys

@@ -11,6 +11,7 @@ enum CLI {
           anerun similarity A B [--image-a PATH] [--image-b PATH] [--prompt query|document]
                          [--prompt-a ...] [--prompt-b ...] [--no-truncate] [--dimensions N] [--format yaml|json]
           anerun tokenize [TEXT ...] [--stdin] [--prompt query|document] [--show-tokens] [--format yaml|json]
+          anerun decision-capability [--plan FUNCTION.mlpackage] [--format yaml|json]
           anerun decide --stdin    Decision request as JSON (state, questions, optional base64 image)
           anerun doctor [--verify] [--format yaml|json]
           anerun models path | verify | warm
@@ -50,6 +51,7 @@ enum CLI {
         do throws(ServiceError) {
             let handler: Command
             switch command {
+            case "decision-capability": handler = DecisionCapabilityCommand()
             case "decide": handler = DecideCommand()
             case "embed": handler = EmbedCommand()
             case "similarity": handler = SimilarityCommand()
@@ -89,6 +91,7 @@ enum CLI {
                 Output.data(inspected.printable, format: format)
                 return ExitCode.success.rawValue
             }
+            if command == "decision-capability" { return try await handler.run(parsed, config: config, format: format).rawValue }
             let selected = try config.selectingModel(for: commandName, requiresName: isInstall, required: needsModel)
             if command != "doctor", command != "playground", let model = selected.modelID, model.isDecision {
                 return try await DecisionCommands.run(commandName, arguments: parsed, config: selected, model: model, format: format).rawValue

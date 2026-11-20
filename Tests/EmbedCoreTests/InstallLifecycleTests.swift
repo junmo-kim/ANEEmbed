@@ -97,12 +97,12 @@ struct InstallLifecycleTests {
         let payload = Data("working".utf8)
         try payload.write(to: source.appendingPathComponent("payload"))
         let store = ModelStore(dataDirectory: base, model: model)
-        let original = try await DecisionInstall.install(source, model: model, store: store, prepare: { _ in })
+        let original = try await DecisionInstall.install(source, model: model, store: store, architecture: "test-chip", prepare: { _ in })
         try Data("damaged".utf8).write(to: original.appendingPathComponent("payload"))
 
         var pending: URL?
         let error = await #expect(throws: ServiceError.self) {
-            try await DecisionInstall.install(source, model: model, store: store) { directory throws(ServiceError) in
+            try await DecisionInstall.install(source, model: model, store: store, architecture: "test-chip") { directory throws(ServiceError) in
                 pending = directory
                 throw ServiceError(.unavailable, "prepare_failed", "simulated interruption")
             }
@@ -111,12 +111,39 @@ struct InstallLifecycleTests {
         let repair = try #require(pending)
         #expect(repair != original)
         #expect(try store.resolveDirectory() == original)
-        let installed = try await DecisionInstall.install(source, model: model, store: store) { directory in
+        let installed = try await DecisionInstall.install(source, model: model, store: store, architecture: "test-chip") { directory in
             #expect(directory == repair)
         }
         #expect(installed == repair)
         #expect(try store.resolveDirectory() == repair)
         #expect(try Data(contentsOf: repair.appendingPathComponent("payload")) == payload)
+    }
+
+    @Test func rejectedCoreMLSourcePreservesActiveValen() async throws {
+        guard #available(macOS 26.0, *) else { return }
+        let base = try directory()
+        defer { try? FileManager.default.removeItem(at: base) }
+        let profile = DecisionProfile.valen4B
+        let model = ModelID.decision(profile)
+        let store = ModelStore(dataDirectory: base, model: model)
+        let previous = String(repeating: "a", count: 40)
+        let active = try store.directory(for: previous)
+        try FileManager.default.createDirectory(at: active, withIntermediateDirectories: true)
+        try store.activate(revision: previous)
+        let source = base.appendingPathComponent("incomplete-coreml")
+        try FileManager.default.createDirectory(at: source, withIntermediateDirectories: false)
+        let header: JSONValue = [
+            "backend": "coreml", "source": ["repo": .string(profile.repository), "revision": .string(profile.revision)],
+            "coreml_functions": ["scan0": "../scan0.mlpackage"]
+        ]
+        try header.jsonData().write(to: source.appendingPathComponent("model.json"))
+        var prepared = false
+        let error = await #expect(throws: ServiceError.self) {
+            try await DecisionInstall.install(source, model: model, store: store, architecture: nil) { _ in prepared = true }
+        }
+        #expect(["invalid_bundle", "coreml_install_failed"].contains(error?.reason ?? ""))
+        #expect(!prepared)
+        #expect(try store.resolveDirectory() == active)
     }
 
     @Test func retriesSelectOnlyTheVerifiedActiveRepairOfTheRequestedRevision() throws {

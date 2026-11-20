@@ -125,17 +125,15 @@ private actor PlaygroundInference {
         let task = Task<Result<any HTTPRouting, ServiceError>, Never> { [config, model] in
             if model.isDecision {
                 guard !config.useFakeRuntime else {
-                    return .failure(.badRequest("fake_runtime", "decision models require CoreAI", param: "runtime"))
+                    return .failure(.badRequest("fake_runtime", "decision models require the native runtime", param: "runtime"))
                 }
-                #if canImport(CoreAI)
-                if #available(macOS 27.0, *) {
+                if #available(macOS 26.0, *) {
                     // The engine serializes the first session load and owns model residency.
                     return .success(DecisionRouter(engine: DecisionEngine(bundleURL: config.modelDirectory),
                                                    model: config.modelName))
                 }
-                #endif
                 return .failure(ServiceError(.unavailable, "coreai_unavailable",
-                                             "decision models require macOS 27 and a build with CoreAI"))
+                                             "Core ML decisions require macOS 26; Core AI decisions require macOS 27"))
             }
             let state = ServerState()
             await load(into: state, config: config)

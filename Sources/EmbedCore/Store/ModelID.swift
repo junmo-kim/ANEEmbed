@@ -88,6 +88,7 @@ public enum ModelID: RawRepresentable, CaseIterable, Hashable, Sendable {
 
     public static var catalog: String {
         """
+        Experimental macOS 26+ Core ML Valen on M4 Mac mini requires a local --from bundle.
         On macOS 27, valen-4b (recommended for corporate use) has a pinned download for M4 h16g.
         elephant-1 and glide-9b have pinned downloads for h17d. Use --from DIR for a matching local decision bundle.
         embeddinggemma-2 downloads about 1 GB. First install took about 4–5 minutes on M4.
