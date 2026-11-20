@@ -108,15 +108,20 @@ struct Vision {
       let group = i / 4
       let row = (group / (gw / 2)) * 2 + (i % 4) / 2
       let col = (group % (gw / 2)) * 2 + i % 2
-      pixels.write { p, s in
+      let firstPixel = row * 16 * w + col * 16
+      pixels.write { (pixels: UnsafeMutablePointer<Float16>, strides: [Int]) in
+        let patchOffset = i * strides[3]
+        let channelStride = strides[1]
         for c in 0..<3 {
           for y in 0..<16 {
+            let rowStart = firstPixel + y * w
             for x in 0..<16 {
               let channel = c * 512 + y * 16 + x
-              let byte = rgba[((row * 16 + y) * w + col * 16 + x) * 4 + c]
+              let byte = rgba[(rowStart + x) * 4 + c]
               let value = Float16(bitPattern: Self.pixelBits[Int(byte)])
-              p[channel * s[1] + i * s[3]] = value
-              p[(channel + 256) * s[1] + i * s[3]] = value
+              let offset = channel * channelStride + patchOffset
+              pixels[offset] = value
+              pixels[offset + 256 * channelStride] = value
             }
           }
         }
