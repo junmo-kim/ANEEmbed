@@ -235,6 +235,9 @@ struct Manifest: Decodable {
   var jeffan: Bool { DecisionProfile(repository: source.repo) == .jeffan9B }
   var causal: Bool { kDecision || knowLine }
   var elephant: Bool { DecisionProfile(repository: source.repo) == .elephant1 }
+  var batchedValenScore: Bool {
+    backend == "coreml" && roleMixer?.functions.map(Self.logicalFunction) == ["valenScore"]
+  }
   var valen: Bool { DecisionProfile(repository: source.repo) == .valen4B }
   @available(macOS 26.0, *)
   static func validated(at directory: URL) throws -> Manifest {
@@ -301,8 +304,15 @@ struct Manifest: Decodable {
           : "Build a device-operator bundle for \(chip) and install it with anerun models install --model valen-4b --from DIR."
         throw DecisionError("Legacy Valen bundle requires migration. " + migration)
       }
-      let expected = [(rolePool, "valenPool"), (roleMixer, "valenMixer"), (decisionHead, "readout"),
-                      (resultStats, "stats"), (visionPosition, "visionpos"), (featureScale, "featurescale")]
+      var expected: [(Asset?, String)] = [(visionPosition, "visionpos"), (featureScale, "featurescale")]
+      if batchedValenScore {
+        guard decisionHead == nil, resultStats == nil else {
+          throw DecisionError("valenScore already supplies probabilities and statistics")
+        }
+        expected += [(rolePool, "valenPool288"), (roleMixer, "valenScore")]
+      } else {
+        expected += [(rolePool, "valenPool"), (roleMixer, "valenMixer"), (decisionHead, "readout"), (resultStats, "stats")]
+      }
       guard hidden == 2560, (backend == "coreml" || context == Self.valenRotaryPositions), width == 128, visionFunctions?.map(Self.logicalFunction) == ["p1024"],
         smallVision.map({ $0.functions.map(Self.logicalFunction) == ["p256"] }) ?? true,
         visionAsset != nil, visionFractions == "vision-fractions.fp16",

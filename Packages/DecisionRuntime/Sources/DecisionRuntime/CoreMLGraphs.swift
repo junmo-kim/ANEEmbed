@@ -145,7 +145,8 @@ final class CoreMLGraphs: DecisionDevice {
       inputs = ["hidden_in", "query", "gate", "key", "value", "mask"]; outputs = ["hidden_out"]
     } else {
       switch entry {
-      case "valenPool": inputs = ["hidden", "valid", "length", "previous"]; outputs = ["pooled"]
+      case "valenScore": inputs = ["pooled", "mask", "choice_scale", "choice_bias", "mad_scale"]; outputs = ["probabilities", "statistics"]
+      case "valenPool", "valenPool288": inputs = ["hidden", "valid", "length", "previous"]; outputs = ["pooled"]
       case "valenMixer": inputs = ["pooled"]; outputs = ["logit"]
       case "readout": inputs = ["logits", "mask"]; outputs = ["probabilities"]
       case "stats": inputs = ["p", "top_index", "choice_scale", "choice_bias", "mad_scale"]; outputs = ["statistics"]
@@ -158,6 +159,23 @@ final class CoreMLGraphs: DecisionDevice {
     let incoming = description.inputDescriptionsByName, outgoing = description.outputDescriptionsByName
     guard Set(incoming.keys) == inputs, Set(outgoing.keys) == outputs else {
       throw DecisionError("Unexpected input/output names in " + entry)
+    }
+    if entry == "valenPool288" || entry == "valenScore" {
+      let expected: [String: [Int]]
+      if entry == "valenPool288" {
+        expected = ["hidden": [1,2560,1,128], "valid": [1,1,128,288], "length": [1,1,1,288],
+                    "previous": [1,2560,1,288], "pooled": [1,2560,1,288]]
+      } else {
+        expected = ["pooled": [1,2560,4,256], "mask": [1,256,1,1], "choice_scale": [1,1,1,1],
+                    "choice_bias": [1,1,1,1], "mad_scale": [1,1,1,1], "probabilities": [1,256,1,1],
+                    "statistics": [1,3,1,1]]
+      }
+      for (name, shape) in expected {
+        let feature = incoming[name] ?? outgoing[name]
+        guard feature?.multiArrayConstraint?.shape.map(\.intValue) == shape else {
+          throw DecisionError("Unexpected shape for " + name + " in " + entry)
+        }
+      }
     }
     for feature in Array(incoming.values) + Array(outgoing.values) {
       guard let array = feature.multiArrayConstraint, array.dataType == .float16,

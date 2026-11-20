@@ -21,6 +21,48 @@ final class CoreMLRuntimeTests: XCTestCase {
     XCTAssertEqual(second.read { $0[$1[1] + 2 * $1[3]] }, 9)
   }
 
+  func testPoolMaskKeepsOverlappingRolesAcrossChunks() {
+    let spans = [0..<1, 126..<130, 128..<133, 132..<133]
+    let first: CoreMLBuffer = ValenRoleBatch.mask(spans: spans, chunk: 0, width: 128)
+    let second: CoreMLBuffer = ValenRoleBatch.mask(spans: spans, chunk: 1, width: 128)
+    for (chunk, mask) in [first, second].enumerated() {
+      XCTAssertEqual(mask.shape, [1, 1, 128, 288])
+      mask.read { values, strides in
+        for token in 0..<128 {
+          for role in 0...spans.count {
+            let active = role < spans.count && spans[role].contains(128 * chunk + token)
+            XCTAssertEqual(values[token * strides[2] + role * strides[3]], active ? 1 : 0)
+          }
+        }
+      }
+    }
+  }
+
+  func testScoreLanesPreserveRoleAndCandidateOrderAndPadding() {
+    var pooled = CoreMLBuffer.zeros([1, 2, 1, 288])
+    pooled.write { values, strides in
+      for channel in 0..<2 {
+        for role in 0..<288 {
+          values[channel * strides[1] + role * strides[3]] = Float16(512 * channel + role)
+        }
+      }
+    }
+    for count in [2, 3, 256] {
+      let packed = ValenRoleBatch.candidateRoles(pooled, count: count)
+      XCTAssertEqual(packed.shape, [1, 2, 4, 256])
+      packed.read { values, strides in
+        for channel in 0..<2 {
+          for slot in 0..<256 {
+            for (role, column) in [0, 1, 2 + slot, 2 + count].enumerated() {
+              let expected = slot < count ? Float16(512 * channel + column) : 0
+              XCTAssertEqual(values[channel * strides[1] + role * strides[2] + slot * strides[3]], expected)
+            }
+          }
+        }
+      }
+    }
+  }
+
   func testCoreMLValenCanShipOnlyItsExportedAttentionTiers() throws {
     try Manifest.validateCoreMLTiers([256], context: 256)
     try Manifest.validateCoreMLTiers([256, 1024], context: 1024)

@@ -202,7 +202,19 @@ final class Session<Device: DecisionDevice>: DecisionSession {
     return try await formatDeviceAnswer(output, branch: branch)
   }
 
-  func formatDeviceAnswer(_ output: Buffer, branch: Branch) async throws -> DecisionAnswer {
+  private func scalar(_ value: Float16) -> Buffer {
+    var tensor = Buffer.zeros([1, 1, 1, 1])
+    tensor.write { p, _ in p[0] = value }
+    return tensor
+  }
+
+  func statsCalibration(_ count: Int) -> [String: Buffer] {
+    let constants = ElephantDeviceConstants.stats[count - 1]
+    return ["choice_scale": scalar(constants[0]), "choice_bias": scalar(constants[1]),
+            "mad_scale": scalar(constants[2])]
+  }
+
+  func formatDeviceAnswer(_ output: Buffer, branch: Branch, statistics: Buffer? = nil) async throws -> DecisionAnswer {
     let count = branch.candidates.count
     guard output.shape == [1, 256, 1, 1] else { throw DecisionError("Invalid probability shape") }
     let values = output.read { p, strides in (0..<256).map { Double(p[$0 * strides[1]]) } }
@@ -214,22 +226,18 @@ final class Session<Device: DecisionDevice>: DecisionSession {
     let p = Array(values.prefix(count))
     let k = branch.question.kind
     let top = p.firstIndex(of: p.max()!)!
-    func scalar(_ value: Float16) -> Buffer {
-      var tensor = Buffer.zeros([1, 1, 1, 1])
-      tensor.write { p, _ in p[0] = value }
-      return tensor
+    let tensor: Buffer
+    if let statistics {
+      tensor = statistics
+    } else {
+      guard let stats = manifest.resultStats else { throw DecisionError("Missing device statistics") }
+      let sf = try await backbone.function("stats", in: stats.asset)
+      var inputs = statsCalibration(count)
+      inputs["p"] = output
+      inputs["top_index"] = scalar(Float16(top))
+      var result = try await sf.evaluate(inputs)
+      tensor = try result.tensor("statistics")
     }
-    guard let stats = manifest.resultStats else {
-      throw DecisionError("Missing Elephant statistics")
-    }
-    let sf = try await backbone.function("stats", in: stats.asset)
-    let constants = ElephantDeviceConstants.stats[count - 1]
-    var result = try await sf.evaluate([
-      "p": output, "top_index": scalar(Float16(top)),
-      "choice_scale": scalar(constants[0]), "choice_bias": scalar(constants[1]),
-      "mad_scale": scalar(constants[2]),
-    ])
-    let tensor = try result.tensor("statistics")
     guard tensor.shape == [1, 3, 1, 1] else { throw DecisionError("Invalid decision statistics") }
     let v = tensor.read { a, s in (0..<3).map { Double(a[$0 * s[1]]) } }
     guard v.allSatisfy({ $0.isFinite }) else { throw DecisionError("Nonfinite device statistics") }
