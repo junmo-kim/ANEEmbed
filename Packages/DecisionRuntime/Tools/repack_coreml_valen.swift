@@ -18,6 +18,7 @@ struct Recipe: Decodable {
     let emptyDirectories: [String]
     let original: String
     let base, overlay: [String: String]
+    let sharedFiles: [String: String]?
     let stages: [String: [String: Tensor]]
 }
 
@@ -101,6 +102,21 @@ func run() throws {
             guard try hash(target) == digest else { throw Invalid("File digest mismatch: " + relative) }
         }
     }
+    // Two fixed-shape programs may reference identical immutable weights.
+    for (relative, existing) in recipe.sharedFiles ?? [:] {
+        guard recipe.base[existing] != nil || recipe.overlay[existing] != nil else {
+            throw Invalid("Shared file must refer to a verified payload: " + existing)
+        }
+        let source = try child(temp, existing), target = try child(temp, relative)
+        try fm.createDirectory(at: target.deletingLastPathComponent(), withIntermediateDirectories: true)
+        if link(source.path, target.path) != 0 {
+            let code = errno
+            guard code == ENOTSUP || code == EPERM || code == EXDEV || code == EMLINK else {
+                throw POSIXError(POSIXErrorCode(rawValue: code) ?? .EIO)
+            }
+            try fm.copyItem(at: source, to: target)
+        }
+    }
     for relative in recipe.emptyDirectories {
         try fm.createDirectory(at: child(temp, relative), withIntermediateDirectories: true)
     }
@@ -109,7 +125,9 @@ func run() throws {
         guard let index = Int(stage), index >= 0, String(index) == stage else { throw Invalid("Invalid stage") }
         for mlp in [false, true] {
             let file = temp.appendingPathComponent((mlp ? "valenMLP" : "valenDelta") + stage + ".fp16")
-            guard fm.createFile(atPath: file.path, contents: nil) else { throw Invalid("Cannot create weight bank") }
+            guard !fm.fileExists(atPath: file.path), fm.createFile(atPath: file.path, contents: nil) else {
+                throw Invalid("Cannot create weight bank " + file.lastPathComponent)
+            }
             let writer = try FileHandle(forWritingTo: file)
             defer { try? writer.close() }
             for name in tensors.keys.sorted() where mlpNames.contains(name) == mlp {
