@@ -58,11 +58,9 @@ def export_vision(reader, prefix, cfg, output, repo, license_name):
     return dict(vision_asset=path.name, vision_functions=[name], vision_source_hash=digest)
 
 
-def export_stage(backbone, start, end, index, tiers, output, *, block_mask, repo, license_name, bind_weights=False):
-    from coreai_torch import TorchConverter
-
+def stage_functions(backbone, start, end, index, tiers, *, block_mask):
+    """Yield the fixed Valen/GLiDE/Elephant stage ABI used by both exporters."""
     cfg = backbone.cfg
-    converter = TorchConverter(mode=TorchConverter.Mode.RELEASE)
     scan = ScanStage(backbone, start, end)
     attends = cfg.layer_types[end] == "full_attention"
     hidden = (1, cfg.hidden, 1, CHUNK)
@@ -73,8 +71,7 @@ def export_stage(backbone, start, end, index, tiers, output, *, block_mask, repo
         scan_inputs.update(cos=rotary, sin=rotary)
         scan_outputs.extend(["query", "gate", "key", "value"])
     scan_inputs["packed_state"] = (1, scan.channels, 1, CHUNK)
-    names = [add_entry(converter, f"scan{index}", scan, scan_inputs, scan_outputs + ["packed_state_out"],
-                       bind_weights=bind_weights)]
+    yield f"scan{index}", scan, scan_inputs, scan_outputs + ["packed_state_out"]
     if attends:
         q = (1, cfg.heads, CHUNK, cfg.head_dim)
         for cap in tiers:
@@ -82,8 +79,18 @@ def export_stage(backbone, start, end, index, tiers, output, *, block_mask, repo
             kv = (1, cfg.kv_heads, cap, cfg.head_dim)
             inputs = dict(hidden_in=hidden, query=q, gate=q, key=kv, value=kv,
                           mask=(1, 1, CHUNK if block_mask else 1, cap))
-            names.append(add_entry(converter, name, AttendStage(backbone, end, cap), inputs, ["hidden_out"],
-                                   bind_weights=bind_weights))
+            yield name, AttendStage(backbone, end, cap), inputs, ["hidden_out"]
+
+
+def export_stage(backbone, start, end, index, tiers, output, *, block_mask, repo, license_name, bind_weights=False):
+    from coreai_torch import TorchConverter
+
+    converter = TorchConverter(mode=TorchConverter.Mode.RELEASE)
+    names = [
+        add_entry(converter, name, module, inputs, outputs, bind_weights=bind_weights)
+        for name, module, inputs, outputs in stage_functions(
+            backbone, start, end, index, tiers, block_mask=block_mask)
+    ]
     path = output / f"stage{index}.aimodel"
     digest = save_asset(converter, path, repo, license_name)
     print(f"Exported {path.name} (layers {start}..{end})", flush=True)

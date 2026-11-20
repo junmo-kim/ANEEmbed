@@ -167,3 +167,32 @@ or audit may leave a complete inactive derived revision for retry. Budget space 
 staged source, growing AOT and the separate native cache; same-volume APFS clones may
 reduce source-copy costs. An existing prepared AOT directory can still be installed
 with `--from` as a separate packed installation.
+
+### Local Valen Core ML source export
+
+On a Mac with an offline copy of the pinned publisher checkpoint, install
+`coremltools==9.0`, `torch==2.7.1`, and `safetensors==0.8.0` in the conversion
+environment. Run from this package directory.
+
+```sh
+python Tools/coreml_valen.py bundle /path/to/pinned/Valen-Decision-1.5-4B /path/to/valen-coreml-source
+```
+
+The converter emits one ML Program package per logical operation with fixed
+rank-four FP16 tensors. Its manifest records `backend: "coreml"`,
+`architecture: "h16g"`, and the logical function-to-package map. It retains
+the 32-stage schedule, all five context tiers, tokenizer and preprocessing tables.
+The full vision graph is included. Add `--vision-256` to also export the
+optional scaled 256-patch tier. A bounded bundle can select an increasing
+subset starting at 256 using `--tiers 256`; both rotary tables still cover
+4,096 rows. Budget for each attention tier's package to
+carry its own weight payload. Python dependencies are conversion-time only.
+
+Run the hosted fixture test from the repository root. It compiles a small
+ML Program with the public SDK and checks its FP16 feature ABI and reference
+prediction with a test-only CPU configuration. Device eligibility and Valen
+parity require separate physical validation.
+
+```sh
+swift test --package-path Packages/DecisionRuntime --filter CoreMLFixtureTests
+```

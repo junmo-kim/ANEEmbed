@@ -117,26 +117,31 @@ def export(weights, output):
         print(name, digest, flush=True)
         return item
 
+    with safe_open(weights, framework="pt", device="cpu") as f:
+        return export_operator_graphs(f.keys(), f.get_tensor,
+                                      f.get_slice("backbone.language_model.embed_tokens.weight"), output, graph)
+
+
+def export_operator_graphs(keys, get_tensor, table, output, graph):
+    """Build the same Valen operator modules and tables for either serializer."""
     scalar = (1, 1, 1, 1)
     slots = (1, 256, 1, 1)
-    with safe_open(weights, framework="pt", device="cpu") as f:
-        head = {k.removeprefix("head."): f.get_tensor(k) for k in f.keys() if k.startswith("head.")}
-        result = dict(role_mixer=graph("valenMixer", Mixer(head), {"pooled": (1, HIDDEN, 1, 4)}, "logit"),
-                      role_pool=graph("valenPool", RolePool(), dict(hidden=(1, HIDDEN, 1, 128),
-                          valid=(1, 1, 1, 128), length=scalar, previous=(1, HIDDEN, 1, 1)), "pooled"),
-                      decision_head=graph("readout", Readout(), dict(logits=slots, mask=slots), "probabilities"))
-        result["result_stats"] = graph("stats", Stats(), dict(p=slots, **dict.fromkeys(
-            ("top_index", "choice_scale", "choice_bias", "mad_scale"), scalar)), "statistics")
-        position = VisionPosition(f.get_tensor("backbone.visual.pos_embed.weight"), channels=1024)
-        result["vision_position"] = graph("visionpos", position,
-            dict.fromkeys(("row", "column", "fy", "fx"), (1, 1, 1, LANES)), "pos")
-        result["feature_scale"] = graph("featurescale", FeatureScale(), {"features": (1, HIDDEN, 1, 256)}, "scaled")
-        table = f.get_slice("backbone.language_model.embed_tokens.weight")
-        if table.get_shape() != [VOCAB, HIDDEN]:
-            raise ValueError("Unexpected Valen embedding shape")
-        banks = [graph(f"lookup{i}", Lookup(table[start:start+BANK], 1),
-                       {"one_hot": (1, min(BANK, VOCAB-start), 1, LANES)}, "hidden_out")
-                 for i, start in enumerate(range(0, VOCAB, BANK))]
+    head = {k.removeprefix("head."): get_tensor(k) for k in keys if k.startswith("head.")}
+    result = dict(role_mixer=graph("valenMixer", Mixer(head), {"pooled": (1, HIDDEN, 1, 4)}, "logit"),
+                  role_pool=graph("valenPool", RolePool(), dict(hidden=(1, HIDDEN, 1, 128),
+                      valid=(1, 1, 1, 128), length=scalar, previous=(1, HIDDEN, 1, 1)), "pooled"),
+                  decision_head=graph("readout", Readout(), dict(logits=slots, mask=slots), "probabilities"))
+    result["result_stats"] = graph("stats", Stats(), dict(p=slots, **dict.fromkeys(
+        ("top_index", "choice_scale", "choice_bias", "mad_scale"), scalar)), "statistics")
+    position = VisionPosition(get_tensor("backbone.visual.pos_embed.weight"), channels=1024)
+    result["vision_position"] = graph("visionpos", position,
+        dict.fromkeys(("row", "column", "fy", "fx"), (1, 1, 1, LANES)), "pos")
+    result["feature_scale"] = graph("featurescale", FeatureScale(), {"features": (1, HIDDEN, 1, 256)}, "scaled")
+    if table.get_shape() != [VOCAB, HIDDEN]:
+        raise ValueError("Unexpected Valen embedding shape")
+    banks = [graph(f"lookup{i}", Lookup(table[start:start+BANK], 1),
+                   {"one_hot": (1, min(BANK, VOCAB-start), 1, LANES)}, "hidden_out")
+             for i, start in enumerate(range(0, VOCAB, BANK))]
     result["embedding_lookup"] = dict(bank_size=BANK, lane_width=LANES, vocab_size=VOCAB, assets=banks)
     result["vision_fractions"] = "vision-fractions.fp16"
     (output/result["vision_fractions"]).write_bytes(
