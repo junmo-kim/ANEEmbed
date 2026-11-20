@@ -1,8 +1,26 @@
 import CoreML
+@testable import DecisionRuntime
 import Foundation
 import XCTest
 
 final class CoreMLFixtureTests: XCTestCase {
+  @available(macOS 26.0, *)
+  func testFlatLookupRejectsCPUPlacement() async throws {
+    let source = try XCTUnwrap(Bundle.module.url(
+      forResource: "FlatLookup", withExtension: "mlmodel", subdirectory: "Fixtures"))
+    let compiled = try await MLModel.compileModel(at: source)
+    defer { try? FileManager.default.removeItem(at: compiled) }
+
+    let config = MLModelConfiguration()
+    config.computeUnits = .cpuOnly
+    do {
+      _ = try await CoreMLDecisionCapability.checkPlan(MLModelAsset(url: compiled), url: compiled, config)
+      XCTFail("Accepted a CPU-only embedding lookup")
+    } catch let error as CoreMLPlacementError {
+      XCTAssertTrue(error.description.contains("embed"), error.description)
+    }
+  }
+
   func testCompilesWithExactFloat16ABI() throws {
     let source = try XCTUnwrap(Bundle.module.url(
       forResource: "ValenCoreMLFixture", withExtension: "mlpackage", subdirectory: "Fixtures"))

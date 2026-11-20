@@ -114,22 +114,27 @@ public enum CoreMLDecisionCapability {
       throw CoreMLPlacementError(description: "Could not construct the execution plan for "
         + url.lastPathComponent + ": " + error.localizedDescription)
     }
+    func requireANE(_ device: MLComputeDevice?, for name: String) throws {
+      let reported: String
+      switch device {
+      case .neuralEngine?: return
+      case .cpu?: reported = "CPU"
+      case .gpu?: reported = "GPU"
+      case nil: reported = "unspecified"
+      @unknown default: reported = "unknown"
+      }
+      throw CoreMLPlacementError(description: "Expected preferred Neural Engine placement for " + name
+        + " in " + url.lastPathComponent + " (reported " + reported + ")", missingDevice: device == nil)
+    }
+
     func inspect(_ block: MLModelStructure.Program.Block) throws -> Int {
       var count = 0
       for op in block.operations {
         for child in op.blocks { count += try inspect(child) }
         // Literal constants encode parameters; they do not execute a model operation.
         if op.operatorName != "const" {
-          let rejected: String
-          switch plan.deviceUsage(for: op)?.preferred {
-          case .neuralEngine?: count += 1; continue
-          case .cpu?: rejected = "CPU"
-          case .gpu?: rejected = "GPU"
-          case nil: rejected = "unspecified"
-          @unknown default: rejected = "unknown"
-          }
-          throw CoreMLPlacementError(description: "Expected preferred Neural Engine placement for " + op.operatorName
-            + " in " + url.lastPathComponent + " (reported " + rejected + ")", missingDevice: rejected == "unspecified")
+          try requireANE(plan.deviceUsage(for: op)?.preferred, for: op.operatorName)
+          count += 1
         }
       }
       return count
@@ -141,6 +146,18 @@ public enum CoreMLDecisionCapability {
           throw DecisionError("Expected a single main ML Program in " + url.lastPathComponent)
         }
         return try inspect(function.block)
+      case .neuralNetwork(let network):
+        for layer in network.layers {
+          // The neural network structure exposes a flat list. Only accept the
+          // primitive layer types used by the Valen projections and MLP.
+          switch layer.type {
+          case "convolution", "reshape", "activation", "elementwise", "load_constant":
+            try requireANE(plan.deviceUsage(for: layer)?.preferred, for: layer.name)
+          default:
+            throw DecisionError("Unsupported Core ML layer " + layer.type + " in " + url.lastPathComponent)
+          }
+        }
+        return network.layers.count
       case .pipeline(let pipeline):
         guard !pipeline.subModels.isEmpty else {
           throw DecisionError("Empty Core ML pipeline in " + url.lastPathComponent)
