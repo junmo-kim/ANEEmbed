@@ -5,6 +5,40 @@ import Foundation
 @available(macOS 26.0, *)
 struct CoreMLPlacementError: Error, CustomStringConvertible {
   let description: String
+  var missingDevice = false
+}
+
+/// Core ML can return an empty operation-to-device map for one URL of a compiled asset.
+/// A second URL refers to the same files. Its complete plan must independently pass.
+@available(macOS 26.0, *)
+final class CoreMLAssetPaths {
+  private var directory: URL?
+  private var aliases: [URL: URL] = [:]
+
+  deinit {
+    if let directory { try? FileManager.default.removeItem(at: directory) }
+  }
+
+  func withResolvedPlan<T>(at url: URL, load: (URL) async throws -> T) async throws -> T {
+    if let alias = aliases[url] { return try await load(alias) }
+    do { return try await load(url) }
+    catch let error as CoreMLPlacementError where error.missingDevice {
+      try Task.checkCancellation()
+      let base: URL
+      if let directory { base = directory }
+      else {
+        base = FileManager.default.temporaryDirectory.appendingPathComponent("anerun-plan-" + UUID().uuidString)
+        try FileManager.default.createDirectory(at: base, withIntermediateDirectories: false,
+                                               attributes: [.posixPermissions: 0o700])
+        directory = base
+      }
+      let alias = base.appendingPathComponent(UUID().uuidString + ".mlmodelc")
+      try FileManager.default.createSymbolicLink(at: alias, withDestinationURL: url)
+      let result = try await load(alias)
+      aliases[url] = alias
+      return result
+    }
+  }
 }
 
 @available(macOS 26.0, *)
@@ -43,9 +77,11 @@ public enum CoreMLDecisionCapability {
   /// The plan is a static device preference. Core ML does not expose per-prediction device attestation.
   public static func plannedOperations(at compiled: URL) async throws -> Int {
     try requireHardware()
-    let asset = try MLModelAsset(url: compiled)
-    return try await withPreferredPlacement { config in
-      try await checkPlan(asset, url: compiled, config)
+    return try await CoreMLAssetPaths().withResolvedPlan(at: compiled) { url in
+      let asset = try MLModelAsset(url: url)
+      return try await withPreferredPlacement { config in
+        try await checkPlan(asset, url: url, config)
+      }
     }
   }
 
@@ -93,7 +129,7 @@ public enum CoreMLDecisionCapability {
           @unknown default: rejected = "unknown"
           }
           throw CoreMLPlacementError(description: "Expected preferred Neural Engine placement for " + op.operatorName
-            + " in " + url.lastPathComponent + " (reported " + rejected + ")")
+            + " in " + url.lastPathComponent + " (reported " + rejected + ")", missingDevice: rejected == "unspecified")
         }
       }
       return count
@@ -206,6 +242,7 @@ final class CoreMLGraphs: DecisionDevice {
   var functions = [String: CoreMLFunction]()
   init(root: URL, manifest: Manifest) { self.root = root; self.manifest = manifest }
 
+  private let paths = CoreMLAssetPaths()
   private var weightLayouts = [String: CoreMLValenWeights]()
 
   private func checkedModel(_ logical: String) async throws -> MLModel {
@@ -214,11 +251,13 @@ final class CoreMLGraphs: DecisionDevice {
     }
     try CoreMLDecisionCapability.requireHardware()
     let url = try root.bundleChild(path)
-    let asset = try MLModelAsset(url: url)
-    return try await CoreMLDecisionCapability.withPreferredPlacement { config in
-      let model = try await MLModel.load(asset: asset, configuration: config)
-      _ = try await CoreMLDecisionCapability.checkPlan(asset, url: url, config)
-      return model
+    return try await paths.withResolvedPlan(at: url) { candidate in
+      let asset = try MLModelAsset(url: candidate)
+      return try await CoreMLDecisionCapability.withPreferredPlacement { config in
+        let model = try await MLModel.load(asset: asset, configuration: config)
+        _ = try await CoreMLDecisionCapability.checkPlan(asset, url: candidate, config)
+        return model
+      }
     }
   }
 

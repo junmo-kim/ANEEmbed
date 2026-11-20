@@ -55,6 +55,47 @@ final class CoreMLRuntimeTests: XCTestCase {
     }
   }
 
+  func testUnresolvedPlacementRechecksTheSameFilesBeforeRememberingAnAlias() async throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + ".mlmodelc")
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: false)
+    defer { try? FileManager.default.removeItem(at: root) }
+    var paths: CoreMLAssetPaths? = CoreMLAssetPaths()
+    var calls = [URL]()
+    let resolved = try await paths!.withResolvedPlan(at: root) { candidate -> URL in
+      calls.append(candidate)
+      if candidate == root { throw CoreMLPlacementError(description: "unspecified", missingDevice: true) }
+      XCTAssertEqual(candidate.resolvingSymlinksInPath().path, root.resolvingSymlinksInPath().path)
+      return candidate
+    }
+    XCTAssertEqual(calls, [root, resolved])
+    let cached = try await paths!.withResolvedPlan(at: root) { candidate in
+      calls.append(candidate)
+      return candidate
+    }
+    XCTAssertEqual(cached, resolved)
+    XCTAssertEqual(calls, [root, resolved, resolved])
+    paths = nil
+    XCTAssertFalse(FileManager.default.fileExists(atPath: resolved.path))
+    XCTAssertTrue(FileManager.default.fileExists(atPath: root.path))
+  }
+
+  func testReportedCPUAndUnresolvedSecondPathFailClosed() async throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    for unresolved in [false, true] {
+      let paths = CoreMLAssetPaths()
+      var attempts = 0
+      do {
+        let _: Int = try await paths.withResolvedPlan(at: root) { _ in
+          attempts += 1
+          throw CoreMLPlacementError(description: "rejected", missingDevice: unresolved)
+        }
+        XCTFail("Rejected placement must stop the load")
+      } catch is CoreMLPlacementError {
+        XCTAssertEqual(attempts, unresolved ? 2 : 1)
+      }
+    }
+  }
+
   func testEligibilityRequiresBothTargetMacAndExposedANE() throws {
     XCTAssertThrowsError(try CoreMLDecisionCapability.requireHardware(neuralEngine: false, model: "Mac16,10"))
     XCTAssertThrowsError(try CoreMLDecisionCapability.requireHardware(neuralEngine: true, model: "unknown"))
