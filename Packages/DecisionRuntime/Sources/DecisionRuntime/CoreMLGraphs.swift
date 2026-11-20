@@ -15,12 +15,13 @@ public enum CoreMLDecisionCapability {
     MLModel.availableComputeDevices.contains { if case .neuralEngine = $0 { return true }; return false }
   }
   public static func requireHardware() throws {
-    try requireHardware(neuralEngine: hasNeuralEngine, model: hardwareModel)
+    try requireHardware(neuralEngine: hasNeuralEngine, model: hardwareModel,
+                        trialModel: ProcessInfo.processInfo.environment["ANERUN_COREML_TRIAL_MODEL"])
   }
 
-  static func requireHardware(neuralEngine: Bool, model: String) throws {
+  static func requireHardware(neuralEngine: Bool, model: String, trialModel: String? = nil) throws {
     guard neuralEngine else { throw DecisionError("Core ML Decisions require an available Neural Engine") }
-    guard model == "Mac16,10" else {
+    guard model == "Mac16,10" || (model.hasPrefix("Mac") && model == trialModel) else {
       throw DecisionError("Unsupported Core ML Valen hardware: " + model + " (experimental target: M4 Mac mini)")
     }
   }

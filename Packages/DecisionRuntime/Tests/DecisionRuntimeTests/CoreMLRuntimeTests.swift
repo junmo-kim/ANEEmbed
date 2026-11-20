@@ -12,6 +12,14 @@ final class CoreMLRuntimeTests: XCTestCase {
     XCTAssertEqual(CoreMLDecisionCapability.configuration().computeUnits, .cpuAndNeuralEngine)
   }
 
+  func testTrialRequiresTheSelectedMacAndAnAvailableNeuralEngine() throws {
+    let laptop = "MacBookPro18,3"
+    XCTAssertThrowsError(try CoreMLDecisionCapability.requireHardware(neuralEngine: true, model: laptop))
+    XCTAssertThrowsError(try CoreMLDecisionCapability.requireHardware(neuralEngine: true, model: laptop, trialModel: "Mac16,10"))
+    XCTAssertThrowsError(try CoreMLDecisionCapability.requireHardware(neuralEngine: false, model: laptop, trialModel: laptop))
+    try CoreMLDecisionCapability.requireHardware(neuralEngine: true, model: laptop, trialModel: laptop)
+  }
+
   func testRotaryAndCacheCopiesKeepIndependentValues() {
     var first = CoreMLBuffer.zeros([1, 2, 1, 3])
     first.write { pointer, strides in pointer[strides[1] + 2 * strides[3]] = 7 }
