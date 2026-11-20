@@ -5,13 +5,11 @@ import Foundation
 
 /// Each stage bank stores contiguous FP16 inputs in lexicographic name order.
 @available(macOS 26.0, *)
-struct CoreMLValenWeights {
-  let model: MLModel
-  let inputs: [(String, [NSNumber], Int)]
+struct CoreMLValenWeights: Sendable {
+  let inputs: [(String, [Int], Int)]
   let filePrefix: String
 
   init(model: MLModel, mlp: Bool) throws {
-    self.model = model
     filePrefix = mlp ? "valenMLP" : "valenDelta"
     var shapes: [String: [Int]]
     if mlp {
@@ -43,7 +41,7 @@ struct CoreMLValenWeights {
     }
     inputs = names.map { name in
       let shape = shapes[name]!
-      return (name, shape.map { NSNumber(value: $0) }, shape.reduce(2, *))
+      return (name, shape, shape.reduce(2, *))
     }
   }
 
@@ -57,7 +55,9 @@ struct CoreMLValenWeights {
       info.st_size == inputs.reduce(0, { $0 + $1.2 }) else { throw DecisionError("Invalid weight bank " + url.lastPathComponent) }
     if verifyOnly { return [:] }
     var result = [String: MLFeatureValue]()
-    for (name, shape, size) in inputs {
+    for (name, dimensions, size) in inputs {
+      try Task.checkCancellation()
+      let shape = dimensions.map { NSNumber(value: $0) }
       let value: MLMultiArray
       if size >= 1 << 20 {
         let width = shape.last!.intValue
@@ -82,5 +82,50 @@ struct CoreMLValenWeights {
       result[name] = MLFeatureValue(multiArray: value)
     }
     return result
+  }
+}
+
+// Each read allocates new feature buffers. Only the consuming stage receives them,
+// and it passes them to Core ML as immutable inputs.
+@available(macOS 26.0, *)
+struct ValenStageInputs: @unchecked Sendable {
+  let prefix: [String: MLFeatureValue]
+  let tail: [String: MLFeatureValue]
+}
+
+@available(macOS 26.0, *)
+final class ValenStageReads {
+  private var pending: (index: Int, task: Task<ValenStageInputs, Error>)?
+
+  deinit { pending?.task.cancel() }
+
+  func discard() async {
+    guard let prior = pending else { return }
+    pending = nil
+    prior.task.cancel()
+    _ = await prior.task.result
+  }
+
+  func take(_ stage: Int, followedBy next: Int?,
+            read: @escaping @Sendable (Int) throws -> ValenStageInputs) async throws -> ValenStageInputs {
+    try Task.checkCancellation()
+    let inputs: ValenStageInputs
+    if let prior = pending, prior.index == stage {
+      pending = nil
+      inputs = try await withTaskCancellationHandler {
+        try await prior.task.value
+      } onCancel: { prior.task.cancel() }
+    } else {
+      await discard()
+      inputs = try read(stage)
+    }
+    try Task.checkCancellation()
+    if let next {
+      pending = (next, Task.detached(priority: Task.currentPriority) {
+        try Task.checkCancellation()
+        return try read(next)
+      })
+    }
+    return inputs
   }
 }

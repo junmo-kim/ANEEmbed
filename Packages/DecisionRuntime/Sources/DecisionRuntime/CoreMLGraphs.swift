@@ -243,7 +243,9 @@ final class CoreMLGraphs: DecisionDevice {
   init(root: URL, manifest: Manifest) { self.root = root; self.manifest = manifest }
 
   private let paths = CoreMLAssetPaths()
-  private var weightLayouts = [String: CoreMLValenWeights]()
+  private typealias Program = (model: MLModel, weights: CoreMLValenWeights)
+  private var weightLayouts = [String: Program]()
+  private let stageReads = ValenStageReads()
 
   private func checkedModel(_ logical: String) async throws -> MLModel {
     guard let path = manifest.coreMLFunctions?[logical], path.hasSuffix(".mlmodelc") else {
@@ -261,9 +263,10 @@ final class CoreMLGraphs: DecisionDevice {
     }
   }
 
-  private func sharedLayout(_ logical: String) async throws -> CoreMLValenWeights {
+  private func sharedLayout(_ logical: String) async throws -> Program {
     if let cached = weightLayouts[logical] { return cached }
-    let layout = try await CoreMLValenWeights(model: checkedModel(logical), mlp: logical == "valenMLP")
+    let model = try await checkedModel(logical)
+    let layout = try (model, CoreMLValenWeights(model: model, mlp: logical == "valenMLP"))
     weightLayouts[logical] = layout
     return layout
   }
@@ -273,8 +276,19 @@ final class CoreMLGraphs: DecisionDevice {
     if let stage = manifest.sharedScanIndex(logical) {
       let delta = try await sharedLayout(stage == 0 ? "valenDeltaFirst" : "valenDelta")
       let tail = try await sharedLayout("valenMLP")
-      return try CoreMLFunction(model: delta.model, prefixWeights: delta.read(stage: stage, root: root, verifyOnly: verifyOnly),
-                                tail: tail.model, tailWeights: tail.read(stage: stage, root: root, verifyOnly: verifyOnly))
+      let directory = root, prefix = delta.weights, mlp = tail.weights
+      let read: @Sendable (Int) throws -> ValenStageInputs = { index in
+        try ValenStageInputs(prefix: prefix.read(stage: index, root: directory, verifyOnly: verifyOnly),
+                             tail: mlp.read(stage: index, root: directory, verifyOnly: verifyOnly))
+      }
+      let inputs: ValenStageInputs
+      if verifyOnly {
+        inputs = try read(stage)
+      } else {
+        let next = manifest.stageKinds.indices.dropFirst(stage + 1).first { manifest.stageKinds[$0] == "linear" }
+        inputs = try await stageReads.take(stage, followedBy: next, read: read)
+      }
+      return CoreMLFunction(model: delta.model, prefixWeights: inputs.prefix, tail: tail.model, tailWeights: inputs.tail)
     }
     let model = try await checkedModel(logical)
     try validateFeatures(model.modelDescription, entry: logical)
@@ -348,6 +362,7 @@ final class CoreMLGraphs: DecisionDevice {
   }
 
   // A Core ML package holds one function. Load each on demand at its first evaluation.
+  func discardStageRead() async { await stageReads.discard() }
   func needsPrefetch(_ asset: String) -> Bool { false }
   func loadAssets(_ needed: [(Manifest.Asset, [String])]) async throws -> [Never] { [] }
   func cache(_ assets: [Never]) {}

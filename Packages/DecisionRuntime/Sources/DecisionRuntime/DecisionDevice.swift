@@ -27,10 +27,13 @@ protocol DecisionDevice: AnyObject {
   func needsPrefetch(_ asset: String) -> Bool
   func loadAssets(_ needed: [(Manifest.Asset, [String])]) async throws -> [LoadedAsset]
   func cache(_ assets: [LoadedAsset])
+  func discardStageRead() async
   func verifyPlacement() throws
 }
 
 extension DecisionDevice {
+  func discardStageRead() async {}
+
   func prepare(_ entry: String, asset: String) async throws {
     _ = try await function(entry, asset: asset)
   }

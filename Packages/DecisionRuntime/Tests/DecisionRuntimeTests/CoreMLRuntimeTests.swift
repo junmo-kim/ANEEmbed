@@ -5,6 +5,40 @@ import XCTest
 
 @available(macOS 26.0, *)
 final class CoreMLRuntimeTests: XCTestCase {
+  func testWeightReadAheadUsesOnlyTheRequestedStageInTheCurrentPass() async throws {
+    let reads = ValenStageReads()
+    let original: @Sendable (Int) throws -> ValenStageInputs = { stage in
+      ValenStageInputs(prefix: ["stage": MLFeatureValue(int64: Int64(stage))], tail: [:])
+    }
+    let changed: @Sendable (Int) throws -> ValenStageInputs = { stage in
+      ValenStageInputs(prefix: ["stage": MLFeatureValue(int64: -Int64(stage))], tail: [:])
+    }
+    _ = try await reads.take(0, followedBy: 1, read: original)
+    let hit = try await reads.take(1, followedBy: 2, read: changed)
+    XCTAssertEqual(hit.prefix["stage"]?.int64Value, 1)
+    let skipped = try await reads.take(4, followedBy: 5, read: original)
+    XCTAssertEqual(skipped.prefix["stage"]?.int64Value, 4)
+    await reads.discard()
+    let restarted = try await reads.take(5, followedBy: nil, read: changed)
+    XCTAssertEqual(restarted.prefix["stage"]?.int64Value, -5)
+  }
+
+  func testPrefetchedWeightReadFailureReachesItsStage() async throws {
+    let reads = ValenStageReads()
+    let empty = ValenStageInputs(prefix: [:], tail: [:])
+    _ = try await reads.take(0, followedBy: 1) { index in
+      if index == 1 { throw CocoaError(.fileReadCorruptFile) }
+      return empty
+    }
+    do {
+      _ = try await reads.take(1, followedBy: nil) { _ in empty }
+      XCTFail("Expected the prefetched bank error")
+    } catch let error as CocoaError {
+      XCTAssertEqual(error.code, .fileReadCorruptFile)
+    }
+    _ = try await reads.take(1, followedBy: nil) { _ in empty }
+  }
+
   func testPlanConstructionRetriesOnlyAnInternalCoreMLErrorOnce() async throws {
     let internalError = NSError(domain: MLModelError.errorDomain, code: 0)
     var calls = 0

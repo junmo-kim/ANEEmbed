@@ -105,6 +105,15 @@ final class Backbone<Device: DecisionDevice> {
     }
   }
   func run(_ prompt: Prompt, vision: VisualFeatures<Buffer>?) async throws -> [Buffer] {
+    do {
+      return try await runStages(prompt, vision: vision)
+    } catch {
+      await device.discardStageRead()
+      throw error
+    }
+  }
+
+  private func runStages(_ prompt: Prompt, vision: VisualFeatures<Buffer>?) async throws -> [Buffer] {
     let m = manifest
     let w = m.width
     let h = m.hidden
