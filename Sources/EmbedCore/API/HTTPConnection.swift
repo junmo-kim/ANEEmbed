@@ -21,11 +21,26 @@ public struct HTTPConnectionLimits: Sendable {
     /// While a body arrives: the longest pause between received bytes. Every chunk restarts it, so a slow upload
     /// that keeps arriving is not cut, and a stalled one is.
     public var bodyIdleTimeout: Duration
+    /// Sending a response: `sendTimeout` plus one second per `sendMinimumRate` bytes of it, from the start of the
+    /// send. The transport reports only when everything was sent, not progress, so this is one deadline that grows
+    /// with the response rather than a limit on pauses. A client that stops reading is cut when it passes, which
+    /// releases its connection slot.
+    public var sendTimeout: Duration
+    public var sendMinimumRate: Int
 
-    public init(maxBody: Int, headTimeout: Duration = .seconds(60), bodyIdleTimeout: Duration = .seconds(60)) {
+    public init(maxBody: Int, headTimeout: Duration = .seconds(60), bodyIdleTimeout: Duration = .seconds(60),
+                sendTimeout: Duration = .seconds(60), sendMinimumRate: Int = 64 << 10)
+    {
         self.maxBody = maxBody
         self.headTimeout = headTimeout
         self.bodyIdleTimeout = bodyIdleTimeout
+        self.sendTimeout = sendTimeout
+        self.sendMinimumRate = max(1, sendMinimumRate)
+    }
+
+    /// The deadline for sending `bytes`.
+    public func sendDeadline(for bytes: Int) -> Duration {
+        sendTimeout + .milliseconds(bytes / sendMinimumRate * 1000 + bytes % sendMinimumRate * 1000 / sendMinimumRate)
     }
 }
 
@@ -192,21 +207,25 @@ public enum HTTPConnection {
     /// Bodies over `budget.unreservedLimit` share `budget` with every other connection's.
     public static func accept(_ transport: some HTTPTransport, limiter: ConnectionLimiter, budget: BodyBudget? = nil,
                               limits: HTTPConnectionLimits,
+                              sleep: @escaping @Sendable (Duration) async throws -> Void = { try await Task.sleep(for: $0) },
                               handler: @Sendable (consuming HTTPRequest) async -> HTTPResponse) async
     {
         guard limiter.tryAcquire() else {
-            _ = await transport.send(retryLater(ServiceError(
-                .unavailable, "too_many_connections", "the server has \(limiter.limit) open connections, its limit; retry shortly")))
+            let timer = ConnectionTimer(transport, sleep: sleep)
+            _ = await send(retryLater(ServiceError(
+                .unavailable, "too_many_connections", "the server has \(limiter.limit) open connections, its limit; retry shortly")),
+                on: transport, timer: timer, limits: limits)
             transport.cancel()
             return
         }
         defer { limiter.release() }
-        await serve(transport, limits: limits, budget: budget, handler: handler)
+        await serve(transport, limits: limits, budget: budget, sleep: sleep, handler: handler)
     }
 
     /// Serves requests on `transport` until the peer closes, a request asks to close, or a limit is hit. A body over
     /// `budget.unreservedLimit` is read only once `budget` has room for it (no budget: every body is read at once);
     /// after waiting `limits.bodyIdleTimeout` for that, it is answered `503 body_budget_busy` (Retry-After: 1).
+    /// Every response is sent within `limits.sendDeadline` of its size, or the connection is cancelled.
     /// `sleep` waits out a timeout; tests pass a clock they advance by hand. `handler` owns the request: a closure
     /// that passes it on should `consume` it, or the closure keeps the body alive until it returns.
     public static func serve(_ transport: some HTTPTransport, limits: HTTPConnectionLimits, budget: BodyBudget? = nil,
@@ -237,9 +256,10 @@ public enum HTTPConnection {
                             do {
                                 reservation = try await budget.reserve(length, waitingAtMost: limits.bodyIdleTimeout, sleep: sleep)
                             } catch is BodyBudget.WaitTimedOut {
-                                _ = await transport.send(retryLater(ServiceError(
+                                _ = await send(retryLater(ServiceError(
                                     .unavailable, "body_budget_busy",
-                                    "the server is receiving other large request bodies; retry shortly")))
+                                    "the server is receiving other large request bodies; retry shortly")),
+                                    on: transport, timer: timer, limits: limits)
                                 return
                             } catch {
                                 return
@@ -258,7 +278,8 @@ public enum HTTPConnection {
                 }
             } catch {
                 let failure = ServiceError(error.status == 413 ? .payloadTooLarge : .badRequest, "bad_http", error.message)
-                _ = await transport.send(HTTPResponse.openAIError(failure).with(status: error.status).serialized(keepAlive: false))
+                _ = await send(HTTPResponse.openAIError(failure).with(status: error.status).serialized(keepAlive: false),
+                               on: transport, timer: timer, limits: limits)
                 return
             }
             timer.stop()
@@ -267,8 +288,17 @@ public enum HTTPConnection {
             let response = await handler(consume request)
             reservation?.release()
             let bytes = response.serialized(keepAlive: keepAlive, includeBody: includeBody)
-            guard await transport.send(bytes), keepAlive else { return }
+            guard await send(bytes, on: transport, timer: timer, limits: limits), keepAlive else { return }
         }
+    }
+
+    /// Sends `bytes` within `limits.sendDeadline(for:)`; past it `timer` cancels the transport, which ends the send.
+    static func send(_ bytes: Data, on transport: some HTTPTransport, timer: ConnectionTimer,
+                     limits: HTTPConnectionLimits) async -> Bool
+    {
+        timer.start(limits.sendDeadline(for: bytes.count))
+        defer { timer.stop() }
+        return await transport.send(bytes)
     }
 
     /// `error` with `Retry-After: 1`, for a connection that is closed after it.

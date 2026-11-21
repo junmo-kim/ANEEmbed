@@ -16,6 +16,11 @@ final class HTTPServer: @unchecked Sendable {
     static let headTimeout: Duration = .seconds(60)
     /// Longest pause while a body arrives (restarted by every received chunk).
     static let bodyIdleTimeout: Duration = .seconds(60)
+    /// Sending a response: the same 60 s, plus one second per 64 KiB (about 0.5 Mbit/s, slower than any link a client
+    /// of this server is likely to read over). The largest response, 2048 vectors of 768 floats as JSON (about
+    /// 20 MB), gets about 6 minutes; a client that stops reading holds its connection slot no longer than that.
+    static let sendTimeout: Duration = .seconds(60)
+    static let sendMinimumRate = 64 << 10
     private var listener: NWListener?
     private let stopped = AsyncStream<Int32>.makeStream()
 
@@ -65,7 +70,8 @@ final class HTTPServer: @unchecked Sendable {
     // MARK: Connections
 
     private func serve(_ connection: NWConnection) async {
-        let limits = HTTPConnectionLimits(maxBody: maxBody, headTimeout: Self.headTimeout, bodyIdleTimeout: Self.bodyIdleTimeout)
+        let limits = HTTPConnectionLimits(maxBody: maxBody, headTimeout: Self.headTimeout, bodyIdleTimeout: Self.bodyIdleTimeout,
+                                          sendTimeout: Self.sendTimeout, sendMinimumRate: Self.sendMinimumRate)
         await HTTPConnection.accept(NetworkTransport(connection), limiter: connections, budget: bodies,
                                     limits: limits) { [router] request in
             await router.handle(consume request)  // without `consume` the closure would keep the body to the end

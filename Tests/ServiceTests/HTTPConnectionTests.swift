@@ -11,7 +11,9 @@ final class MemoryTransport: HTTPTransport, @unchecked Sendable {
     private var closedByClient = false
     private var output = Data()
     private(set) var cancelled = false
-    private var cancelWaiters: [CheckedContinuation<Void, Never>] = []
+    private var holdingSends = false
+    /// Sends of a client that does not read: each waits, with its size, until the connection is cancelled.
+    private var heldSends: [(bytes: Int, continuation: CheckedContinuation<Bool, Never>)] = []
 
     /// Bytes from the client.
     func write(_ data: Data) {
@@ -51,26 +53,42 @@ final class MemoryTransport: HTTPTransport, @unchecked Sendable {
         }
     }
 
+    /// The client stops reading: from now on a send does not complete until the connection is cancelled, and then
+    /// fails, as a send into a full TCP window does.
+    func stopReading() {
+        lock.withLock { holdingSends = true }
+    }
+
     func send(_ data: Data) async -> Bool {
-        lock.withLock {
-            guard !cancelled else { return false }
-            output.append(data)
-            return true
+        await withCheckedContinuation { continuation in
+            let result = lock.withLock { () -> Bool? in
+                guard !cancelled else { return false }
+                if holdingSends {
+                    heldSends.append((data.count, continuation))
+                    return nil
+                }
+                output.append(data)
+                return true
+            }
+            if let result { continuation.resume(returning: result) }
         }
     }
 
     func cancel() {
-        let (resumed, waiters) = lock.withLock { () -> (CheckedContinuation<Data?, Never>?, [CheckedContinuation<Void, Never>]) in
+        let (resumed, held) = lock.withLock { () -> (CheckedContinuation<Data?, Never>?, [CheckedContinuation<Bool, Never>]) in
             cancelled = true
             defer {
                 waiting = nil
-                cancelWaiters = []
+                heldSends = []
             }
-            return (waiting, cancelWaiters)
+            return (waiting, heldSends.map(\.continuation))
         }
         resumed?.resume(returning: nil)
-        waiters.forEach { $0.resume() }
+        held.forEach { $0.resume(returning: false) }
     }
+
+    /// The size of the send that waits for the client, once there is one.
+    var heldSendBytes: Int? { lock.withLock { heldSends.first?.bytes } }
 
     var sent: Data { lock.withLock { output } }
     var isCancelled: Bool { lock.withLock { cancelled } }
@@ -312,6 +330,60 @@ struct HTTPConnectionTests {
             idleClock.advance(by: .seconds(1))
         }
         #expect(idle.isCancelled && parseResponses(idle.sent, methods: ["GET"]).responses.map(\.status) == [200])
+    }
+
+    /// A client that stops reading cannot hold its connection: the send is cut once its deadline passes, which grows
+    /// with the size of the response, and the connection's slot is free again.
+    @Test(.timeLimit(.minutes(1))) func aClientThatStopsReadingIsCutAndFreesItsSlot() async throws {
+        let clock = ManualClock()
+        let limiter = ConnectionLimiter(limit: 1)
+        let limits = HTTPConnectionLimits(maxBody: 1 << 20, headTimeout: .seconds(1), bodyIdleTimeout: .seconds(1),
+                                          sendTimeout: .seconds(1), sendMinimumRate: 100)
+        let body = #"{"input":["a","b","c","d","e","f","g","h"]}"#
+        let transport = MemoryTransport()
+        transport.stopReading()
+        transport.write("POST /v1/embeddings HTTP/1.1\r\nContent-Length: \(body.utf8.count)\r\n\r\n\(body)")
+        let server = Task {
+            await HTTPConnection.accept(transport, limiter: limiter, limits: limits, sleep: { try await clock.sleep(for: $0) }) {
+                await Self.router.handle($0)
+            }
+        }
+        while transport.heldSendBytes == nil { try await Task.sleep(for: .milliseconds(1)) }
+        let bytes = try #require(transport.heldSendBytes)
+        let deadline = limits.sendDeadline(for: bytes)
+        #expect(bytes > 10_000 && deadline == .seconds(1) + .milliseconds(bytes * 10))  // 100 bytes per second
+        try await clock.waitUntilArmed(moreThan: 1)  // the head deadline, then the send deadline
+        clock.advance(by: deadline - .milliseconds(1))
+        #expect(!transport.isCancelled && limiter.active == 1)
+        clock.advance(by: .milliseconds(1))
+        try await Self.untilCancelled(transport)
+        await server.value
+        #expect(limiter.active == 0)
+    }
+
+    /// The refusal of a connection beyond the limit is bounded the same way.
+    @Test(.timeLimit(.minutes(1))) func aRefusedClientThatDoesNotReadIsCut() async throws {
+        let clock = ManualClock()
+        let limiter = ConnectionLimiter(limit: 0)
+        let limits = HTTPConnectionLimits(maxBody: 1 << 20, sendTimeout: .seconds(1), sendMinimumRate: 100)
+        let transport = MemoryTransport()
+        transport.stopReading()
+        let refusal = Task {
+            await HTTPConnection.accept(transport, limiter: limiter, limits: limits, sleep: { try await clock.sleep(for: $0) }) {
+                await Self.router.handle($0)
+            }
+        }
+        while transport.heldSendBytes == nil { try await Task.sleep(for: .milliseconds(1)) }
+        try await clock.waitUntilArmed(moreThan: 0)  // the send deadline
+        clock.advance(by: limits.sendDeadline(for: try #require(transport.heldSendBytes)))
+        try await Self.untilCancelled(transport)
+        await refusal.value
+    }
+
+    /// Waits for the deadline's task to cancel `transport`, failing (instead of hanging) if it does not within 10 s.
+    static func untilCancelled(_ transport: MemoryTransport) async throws {
+        for _ in 0..<10_000 where !transport.isCancelled { try await Task.sleep(for: .milliseconds(1)) }
+        try #require(transport.isCancelled, "the send outlived its deadline")
     }
 
     /// Connections beyond the limit get a 503 and are closed; a slot frees when a connection ends.
