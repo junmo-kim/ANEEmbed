@@ -37,6 +37,17 @@ public final class GemmaTokenizer: Sendable {
     public let prefixIDs: [Int32]
     public let suffixIDs: [Int32]
     public let unknownID: Int32?
+    /// The longest vocabulary entry or added token in bytes (93 for EmbeddingGemma 2): no token stands for more input
+    /// bytes than that, so a text of n bytes has at least n / maxBytesPerToken tokens. Why this holds:
+    /// - an added token is cut from the raw text and stands for exactly its own bytes;
+    /// - the normalizer only lengthens the rest (" " becomes the 3-byte "▁"), so the raw bytes of a piece are at most
+    ///   its normalized bytes;
+    /// - a BPE symbol starts as one normalized scalar whose entry is that scalar's bytes, or as one byte token
+    ///   (`<0xXX>`, a 6-byte entry for 1 input byte), and a merge's entry is its two parts' entries joined (`init`
+    ///   checks it is in the vocabulary), so every token's entry is at least as long as the input it stands for.
+    /// nil when some byte has no `<0xXX>` token: then a scalar outside the vocabulary becomes `<unk>`, fused with its
+    /// unknown neighbours, or is dropped, and one token can stand for any length of text.
+    public let maxBytesPerToken: Int?
 
     /// Single-scalar vocabulary entries: BMP scalars in a flat table, the rest in a dictionary.
     private let bmpIDs: [Int32]
@@ -126,6 +137,8 @@ public final class GemmaTokenizer: Sendable {
         addedFirstBytes = first
         prefixIDs = parsed.prefixIDs
         suffixIDs = parsed.suffixIDs
+        let longest = max(bytesByID.map(\.count).max() ?? 0, added.map(\.content.count).max() ?? 0)
+        maxBytesPerToken = bytes.allSatisfy({ $0 >= 0 }) && longest > 0 ? longest : nil
     }
 
     // MARK: - Encoding

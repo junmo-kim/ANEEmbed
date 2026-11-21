@@ -39,6 +39,59 @@ struct ServiceTests {
         }
     }
 
+    /// Counts the texts it encodes.
+    final class CountingTokenizer: TextTokenizer, @unchecked Sendable {
+        private let lock = NSLock()
+        private var count = 0
+        let base = ByteTokenizer()
+
+        var encoded: Int { lock.withLock { count } }
+        var maxBytesPerToken: Int? { base.maxBytesPerToken }
+
+        func encode(_ text: String) -> [Int32] {
+            lock.withLock { count += 1 }
+            return base.encode(text)
+        }
+    }
+
+    /// A text with more bytes than the limit's tokens can cover is refused before any text of the request is
+    /// tokenized, so a huge body costs no tokenizer time or memory.
+    @Test func aTextTooLongForAnyTokenizationIsRejectedUnread() async {
+        let tokenizer = CountingTokenizer()
+        let service = EmbeddingService(tokenizer: tokenizer, runtime: FakeRuntime.make(maxTokens: 512),
+                                       limits: { var limits = ServiceLimits(); limits.maxTokens = 512; return limits }())
+        let huge = String(repeating: "z", count: 8 << 20)
+        for inputType in [nil, InputType.query] {
+            do {
+                _ = try await service.embedTexts(["ok", huge], inputType: inputType)
+                Issue.record("an over-long text was embedded")
+            } catch {
+                #expect(error.reason == "context_length_exceeded" && error.httpStatus == 400)
+                let atLeast = huge.utf8.count + (inputType?.prefix.utf8.count ?? 0)
+                #expect(error.message == "input[1] has at least \(atLeast) tokens; this model's maximum context length is 512 tokens")
+            }
+        }
+        #expect(tokenizer.encoded == 0)
+    }
+
+    /// Around the limit nothing changes: a text whose bytes could still fit is tokenized and counted exactly.
+    @Test func textsNearTheLimitAreCountedExactly() async throws {
+        let tokenizer = CountingTokenizer()
+        let service = EmbeddingService(tokenizer: tokenizer, runtime: FakeRuntime.make(maxTokens: 512),
+                                       limits: { var limits = ServiceLimits(); limits.maxTokens = 512; return limits }())
+        // ByteTokenizer: one token per byte plus <bos>/<eos>, so 510 bytes are exactly 512 tokens.
+        #expect(try await service.embedTexts([String(repeating: "a", count: 510)]).tokenCounts == [512])
+        for (bytes, message) in [(511, "has 513 tokens"), (512, "has 514 tokens"), (513, "has at least 513 tokens")] {
+            do {
+                _ = try await service.embedTexts([String(repeating: "a", count: bytes)])
+                Issue.record("\(bytes) bytes were embedded")
+            } catch {
+                #expect(error.reason == "context_length_exceeded" && error.message == "input[0] \(message); this model's maximum context length is 512 tokens")
+            }
+        }
+        #expect(tokenizer.encoded == 3)
+    }
+
     /// A tokenizer without <bos>/<eos> framing (post_processor null) turns "" into no ids: a 400, not a trap.
     @Test func anEmptyTokenSequenceIsRejected() async throws {
         struct Unframed: TextTokenizer { func encode(_ text: String) -> [Int32] { text.utf8.map { Int32($0) + 3 } } }

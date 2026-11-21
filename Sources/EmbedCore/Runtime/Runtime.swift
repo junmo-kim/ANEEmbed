@@ -53,6 +53,14 @@ public protocol EmbeddingRuntime: Sendable {
 /// Text to token ids. `GemmaTokenizer` is the real one; tests and the fake runtime may use others.
 public protocol TextTokenizer: Sendable {
     func encode(_ text: String) -> [Int32]
+    /// The most UTF-8 bytes of input text that one token can stand for; nil when there is no such bound. With it, a
+    /// text of more than `limit × maxBytesPerToken` bytes is known to have more than `limit` tokens without
+    /// encoding it.
+    var maxBytesPerToken: Int? { get }
+}
+
+extension TextTokenizer {
+    public var maxBytesPerToken: Int? { nil }
 }
 
 extension GemmaTokenizer: TextTokenizer {

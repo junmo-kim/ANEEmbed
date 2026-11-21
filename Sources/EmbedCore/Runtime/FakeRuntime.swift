@@ -113,4 +113,6 @@ public struct ByteTokenizer: TextTokenizer {
     public func encode(_ text: String) -> [Int32] {
         [SpecialTokens.bos] + text.utf8.map { Int32($0) + 3 } + [SpecialTokens.eos]
     }
+
+    public var maxBytesPerToken: Int? { 1 }
 }

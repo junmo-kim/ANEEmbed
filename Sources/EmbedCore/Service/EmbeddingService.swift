@@ -67,14 +67,25 @@ public final class EmbeddingService: Sendable {
         guard texts.count <= limits.maxInputs else {
             throw .badRequest("too_many_inputs", "at most \(limits.maxInputs) inputs per request", param: "input")
         }
-        let tokenized = texts.map { tokenize($0, inputType: inputType) }
         let limit = maxTokens
+        func tooLong(_ index: Int, _ tokens: String) -> ServiceError {
+            ServiceError(.invalidInput, "context_length_exceeded",
+                         "input[\(index)] has \(tokens) tokens; this model's maximum context length is \(limit) tokens",
+                         param: "input",
+                         hint: limit < runtime.info.maxTokens ? "raise --max-tokens (up to \(runtime.info.maxTokens))" : nil)
+        }
+        // Tokenizing costs time and memory in proportion to the text, so a text that cannot fit is refused from its
+        // byte count first (no token stands for more than maxBytesPerToken bytes; see GemmaTokenizer).
+        if let bytesPerToken = tokenizer.maxBytesPerToken {
+            let prefixBytes = inputType?.prefix.utf8.count ?? 0
+            if let over = texts.firstIndex(where: { $0.utf8.count + prefixBytes > limit * bytesPerToken }) {
+                let bytes = texts[over].utf8.count + prefixBytes
+                throw tooLong(over, "at least \((bytes + bytesPerToken - 1) / bytesPerToken)")
+            }
+        }
+        let tokenized = texts.map { tokenize($0, inputType: inputType) }
         if let over = tokenized.firstIndex(where: { $0.count > limit }) {
-            throw ServiceError(
-                .invalidInput, "context_length_exceeded",
-                "input[\(over)] has \(tokenized[over].count) tokens; this model's maximum context length is \(limit) tokens",
-                param: "input",
-                hint: limit < runtime.info.maxTokens ? "raise --max-tokens (up to \(runtime.info.maxTokens))" : nil)
+            throw tooLong(over, "\(tokenized[over].count)")
         }
         let short = tokenized.indices.filter { tokenized[$0].count <= limits.shortTokens }
         let long = tokenized.indices.filter { tokenized[$0].count > limits.shortTokens }

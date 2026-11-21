@@ -43,6 +43,23 @@ struct TokenizerGoldenTests {
         print("tokenizer golden: \(checked) texts, \(ids) ids, \(mismatches.count == 0 ? "all equal" : "MISMATCH")")
     }
 
+    /// No token of the real tokenizer stands for more bytes than its longest entry, so every golden text has at least
+    /// bytes / maxBytesPerToken tokens (the bound the service checks before tokenizing).
+    @Test func noTokenStandsForMoreThanTheLongestEntry() throws {
+        let tokenizer = try #require(RealTokenizer.shared)
+        let bound = try #require(tokenizer.maxBytesPerToken)
+        #expect(bound == 93)
+        let lines = try Fixtures.data("tokenizer-golden.jsonl.xz").split(separator: UInt8(ascii: "\n"))
+        var violations = 0
+        for line in lines where !line.isEmpty {
+            let record = try JSONValue.parse(Data(line))
+            let text = try #require(record["text"]?.stringValue)
+            let ids = try #require(record["ids"]?.arrayValue).count - 2  // without <bos>/<eos>
+            if ids * bound < text.utf8.count { violations += 1 }
+        }
+        #expect(violations == 0)
+    }
+
     /// Optional large local corpus (not stored in the repository), e.g. from
     /// `make_tokenizer_golden.py --lines`: ANEEMBED_EXTRA_GOLDEN=/path/to/golden.jsonl[.xz]
     @Test(.enabled(if: ProcessInfo.processInfo.environment["ANEEMBED_EXTRA_GOLDEN"] != nil))

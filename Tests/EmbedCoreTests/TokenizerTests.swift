@@ -121,6 +121,18 @@ struct TokenizerRuleTests {
         #expect(table.lookup(Array("absent".utf8)) == nil)
     }
 
+    /// The bound is the longest entry, added tokens included; without a byte token for every byte a run of unknown
+    /// text can become one token, so there is none.
+    @Test func boundsTheBytesOneTokenStandsFor() throws {
+        let tokenizer = try tinyTokenizer()
+        #expect(tokenizer.maxBytesPerToken == 9)  // "<|image|>"
+        for text in ["", "aaaa bc", "é😀 ab", "<|image|><|image|>", "\u{F900}\u{8C48}"] {
+            #expect(tokenizer.encode(text).count - 2 >= (text.utf8.count + 8) / 9)
+        }
+        let partial = try tinyTokenizer { $0.replacingOccurrences(of: #""<0x41>": 165, "#, with: "") }
+        #expect(partial.maxBytesPerToken == nil)
+    }
+
     @Test func rejectsUnsupportedConfiguration() {
         let json = #"{"model": {"type": "Unigram", "vocab": []}}"#
         #expect(throws: TokenizerError.self) { try GemmaTokenizer(data: Data(json.utf8)) }
