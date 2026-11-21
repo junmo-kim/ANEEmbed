@@ -61,6 +61,8 @@ s, b = call("/v1/models")
 model = b["data"][0] if s == 200 and len(b.get("data", [])) == 1 else {}
 max_tokens = model.get("max_context_length", 0)
 check("models lists one id with limits", max_tokens >= 512 and model.get("dimensions") == [768, 512, 256, 128], b)
+check("model object has OpenAI's fields", model.get("object") == "model" and isinstance(model.get("created"), int)
+      and isinstance(model.get("owned_by"), str), b)
 
 s, b = call("/v1/embeddings", {"input": "task: search result | query: hello"})
 v = b["data"][0]["embedding"] if s == 200 else []

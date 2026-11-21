@@ -34,6 +34,9 @@ struct HTTPContractTests {
         let model = models["data"]?.arrayValue
         #expect(model?.count == 1)
         #expect(model?[0]["id"] == "embeddinggemma-2")
+        // The fields of OpenAI's model object
+        #expect(model?[0]["object"] == "model" && model?[0]["owned_by"] == "local")
+        #expect(model?[0]["created"]?.intValue == 1_794_700_800)
         #expect(model?[0]["max_context_length"]?.intValue == 2048)
         #expect(model?[0]["max_image_tokens"]?.intValue == 280)
         #expect(model?[0]["dimensions"] == [768, 512, 256, 128])

@@ -67,9 +67,13 @@ public struct Router: Sendable {
         }
     }
 
+    /// `created` of the model object: 2026-11-15T00:00:00Z, the creation date in the manifest of the model package
+    /// this build pins. OpenAI's model object always has it, and strictly typed clients expect it.
+    static let modelCreated = 1_794_700_800
+
     func models() -> HTTPResponse {
         var model: JSONObject = [
-            "id": .string(modelName), "object": "model", "owned_by": "local",
+            "id": .string(modelName), "object": "model", "created": .int(Self.modelCreated), "owned_by": "local",
             "dimensions": .array(Vectors.dimensions.map { .int($0) }), "image_preprocessing": "hf-gemma4-280",
         ]
         if case .ready(let service) = state.status {
