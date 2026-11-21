@@ -208,23 +208,35 @@ public final class BucketBufferPool: @unchecked Sendable {
     private let lock = NSLock()
     private var idle: [Int: [BucketBuffers]] = [:]
     private let maxIdlePerLength: Int
+    private var outstanding = 0
+    private var peakOutstanding = 0
 
     public init(maxIdlePerLength: Int = 4) {
         self.maxIdlePerLength = maxIdlePerLength
     }
 
     public func checkout(length: Int) -> BucketBuffers {
-        if let buffers = lock.withLock({ idle[length]?.popLast() }) { return buffers }
-        return BucketBuffers(length: length)
+        let reused = lock.withLock { () -> BucketBuffers? in
+            outstanding += 1
+            peakOutstanding = max(peakOutstanding, outstanding)
+            return idle[length]?.popLast()
+        }
+        return reused ?? BucketBuffers(length: length)
     }
 
     public func checkin(_ buffers: BucketBuffers) {
         lock.withLock {
+            outstanding -= 1
             var list = idle[buffers.length, default: []]
             if list.count < maxIdlePerLength { list.append(buffers) }
             idle[buffers.length] = list
         }
     }
+
+    /// Buffers checked out and not returned yet.
+    public var checkedOut: Int { lock.withLock { outstanding } }
+    /// The most buffers checked out at once since the pool was made.
+    public var peakCheckedOut: Int { lock.withLock { peakOutstanding } }
 
     public func idleCount(length: Int) -> Int {
         lock.withLock { idle[length]?.count ?? 0 }

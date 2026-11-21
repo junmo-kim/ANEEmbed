@@ -87,9 +87,16 @@ public final class BucketTextRuntime: EmbeddingRuntime {
 
     private let coalescer: Coalescer
     static let coalescedRows = 512
+    /// Calls of one run in flight at once. The Neural Engine executes one call at a time, so more in flight only
+    /// queue: each holds its own filled buffers (1 MiB at 512 rows, up to 16 MiB at 2048), and an unbounded number
+    /// let host memory grow with the batch. Three keep the device busy: one call executing, the next one filled and
+    /// queued behind it, and a third being filled or handing back its rows. Measured on an M4 with requests of 256
+    /// texts of 500 tokens and 2048 of 30: one at a time is 1–4 % slower than unbounded, two to four are as fast;
+    /// three leave one call of slack for a slow fill.
+    static let callsInFlight = 3
 
-    /// Plans the sequences into calls and runs them concurrently (the ANE serializes the work itself;
-    /// overlapping lets one call's host-side filling hide behind another's execution).
+    /// Plans the sequences into calls and runs them, `callsInFlight` at a time: the ANE serializes the work
+    /// itself, and overlapping lets one call's host-side filling hide behind another's execution.
     ///
     /// Requests whose sequences are all short (<= 512 rows: queries, and every image, which takes at most
     /// 284 rows) are coalesced with other such requests that arrive while the Neural Engine is busy, so
@@ -117,23 +124,19 @@ public final class BucketTextRuntime: EmbeddingRuntime {
     {
         let counts = sequences.map(\.count)
         let calls = planner.plan(counts)
+        let results = try await windowedMap(calls, width: callsInFlight) { [buffers, runner, rows] call in
+            let buffer = buffers.checkout(length: call.length)
+            defer { buffers.checkin(buffer) }
+            buffer.prepare(call, sequences: sequences, rows: rows)
+            let output = try await runner.run(buffer)
+            guard output.count >= call.segments.count else {
+                throw RuntimeError.model("embed_\(call.length) returned \(output.count) rows")
+            }
+            return call.segments.enumerated().map { slot, segment in (segment.item, output[slot]) }
+        }
         var vectors = [[Float]](repeating: [], count: sequences.count)
-        try await withThrowingTaskGroup(of: [(Int, [Float])].self) { group in
-            for call in calls {
-                group.addTask { [buffers, runner, rows] in
-                    let buffer = buffers.checkout(length: call.length)
-                    defer { buffers.checkin(buffer) }
-                    buffer.prepare(call, sequences: sequences, rows: rows)
-                    let output = try await runner.run(buffer)
-                    guard output.count >= call.segments.count else {
-                        throw RuntimeError.model("embed_\(call.length) returned \(output.count) rows")
-                    }
-                    return call.segments.enumerated().map { slot, segment in (segment.item, output[slot]) }
-                }
-            }
-            for try await pairs in group {
-                for (item, vector) in pairs { vectors[item] = vector }
-            }
+        for pairs in results {
+            for (item, vector) in pairs { vectors[item] = vector }
         }
         return vectors
     }
