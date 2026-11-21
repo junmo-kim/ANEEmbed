@@ -188,8 +188,9 @@ public enum ImagePrep {
     public static func decode(_ data: Data) throws -> ([UInt8], Int, Int) {
         let (source, orientation) = try open(data)
         // JPEG as libjpeg-turbo decodes it (PIL); other formats and unsupported JPEG variants through ImageIO
-        if let (rgb, width, height) = JPEGDecoder.decode(data, maxPixels: maxSourcePixels) {
-            return orient(rgb, width: width, height: height, orientation: orientation)
+        let collector = RGBCollector()
+        if try JPEGDecoder.decodeRows(data, maxPixels: maxSourcePixels, into: collector) {
+            return orient(collector.rgb, width: collector.width, height: collector.height, orientation: orientation)
         }
         return try imageIODecode(source, orientation: orientation)
     }

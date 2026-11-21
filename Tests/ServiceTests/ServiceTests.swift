@@ -146,6 +146,19 @@ struct ServiceTests {
         #expect(Vectors.cosine(result.vectors[0], result.vectors[1]) > 0.999)
     }
 
+    /// A JPEG the decoder refuses (here 4096 repeated scans) is a client error, like any image that does not decode.
+    @Test func aRefusedJPEGIsAClientError() async throws {
+        let fixture = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent()
+            .appendingPathComponent("Fixtures/repeated-scans.jpg")
+        do {
+            _ = try await TestSupport.service().embedImages([try Data(contentsOf: fixture)])
+            Issue.record("the refused JPEG was embedded")
+        } catch let error as ServiceError {
+            #expect(error.reason == "image_decode_failed" && error.httpStatus == 400)
+            #expect(error.message.contains("JPEG refused: scan 2 "), "\(error.message)")
+        }
+    }
+
     @Test func rejectsBadImagesBeforeAnyModelCall() async {
         let service = TestSupport.service()
         do {

@@ -77,6 +77,19 @@ public enum JPEGDecoder {
 
     struct DecodeError: Error {}
 
+    /// Scans in one file, at most. Each scan is a pass over every block of its components, however few bytes it
+    /// takes (a scan of end-of-block runs is a handful of bytes for millions of blocks), so the number of scans, not
+    /// the file size, bounds the work. libjpeg-turbo leaves the limit to the application, as a guard against the
+    /// attack in its report "Two Issues with the JPEG Standard": TurboJPEG's TJFLAG_LIMITSCANS sets 500
+    /// (src/turbojpeg.c), and its own fuzzers decode with TJPARAM_SCANLIMIT 100 (fuzz/decompress.cc). The standard
+    /// progressive script (cjpeg -progressive) writes 10 scans for colour and 6 for greyscale, so 100 leaves ten
+    /// times that.
+    static let maxScans = 100
+
+    /// A file refused outright rather than handed to ImageIO, which would repeat the work it asks for: more than
+    /// `maxScans` scans, or a progressive scan that repeats or skips part of the progression.
+    static func refused(_ reason: String) -> ImageError { .decode("JPEG refused: \(reason)") }
+
     /// zigzag index -> natural index, with 16 extra entries so corrupt run lengths stay in bounds (jpeg_natural_order)
     static let naturalOrder: [Int] = [
         0, 1, 8, 16, 9, 2, 3, 10, 17, 24, 32, 25, 18, 11, 4, 5, 12, 19, 26, 33, 40, 48, 41, 34, 27, 20, 13, 6, 7, 14, 21,
@@ -199,13 +212,16 @@ public enum JPEGDecoder {
     }
 
     /// Decodes `data` row by row into `sink`. True once every row has been delivered; false for a file this decoder
-    /// does not handle or that turns out to be corrupt, possibly after some rows. Throws what `sink.start` throws.
+    /// does not handle or that turns out to be corrupt, possibly after some rows. Throws what `sink.start` throws,
+    /// and an ImageError for a file no decoder should spend more time on (see `refused`).
     static func decodeRows(_ data: Data, maxPixels: Int, into sink: some JPEGRowSink) throws -> Bool {
         try data.withUnsafeBytes { raw in
             do {
                 return try decode(raw.bindMemory(to: UInt8.self), maxPixels: maxPixels, sink: sink)
             } catch let failure as SinkError {
                 throw failure.error
+            } catch let refusal as ImageError {
+                throw refusal
             } catch {
                 return false
             }
@@ -224,6 +240,9 @@ public enum JPEGDecoder {
         var hmax = 1, vmax = 1, mcusX = 0, mcusY = 0
         var position = 2
         var scans = 0, rgbInput = false
+        /// Progressive: per component and coefficient (zigzag index, as Ss and Se count), the point transform Al of
+        /// the last scan that coded it, -1 before its first scan (libjpeg's coef_bits).
+        var coefficientBits: [[Int]] = []
         /// Set when the first scan holds every component of a sequential image: rows are produced during that scan.
         var singlePass: RowAssembler?
 
@@ -327,6 +346,30 @@ public enum JPEGDecoder {
                 if !progressive { guard ss == 0, se == 63, ah == 0, al == 0 else { throw DecodeError() } }
                 guard ss <= se, se <= 63, al <= 13 else { throw DecodeError() }
                 if progressive, ss > 0, n != 1 { throw DecodeError() }
+                // libjpeg's other parameter checks (jdphuff.c): a DC scan codes coefficient 0 only, and a refinement
+                // scan one more bit than the scan before it.
+                if progressive, (ss == 0 && se != 0) || (ah != 0 && al != ah - 1) { throw DecodeError() }
+                guard scans < maxScans else { throw refused("more than \(maxScans) scans") }
+                if progressive {
+                    // Every coefficient gets one first scan (Ah 0) and then refinements, each continuing from the
+                    // last (Ah = the previous Al), and AC coefficients only after the component's DC. libjpeg decodes
+                    // a scan out of this order anyway (with a warning at most; a repeated first scan with Al 0 gets
+                    // none); refused here, so that no scan repeats work already done.
+                    if coefficientBits.isEmpty {
+                        coefficientBits = [[Int]](repeating: [Int](repeating: -1, count: 64), count: components.count)
+                    }
+                    for (index, _, _) in scan {
+                        if ss > 0, coefficientBits[index][0] < 0 {
+                            throw refused("scan \(scans + 1) codes AC coefficients of component \(components[index].id) before its DC")
+                        }
+                        for k in ss...se {
+                            guard ah == 0 ? coefficientBits[index][k] < 0 : coefficientBits[index][k] == ah else {
+                                throw refused("scan \(scans + 1) repeats or skips a step of component \(components[index].id)'s progression")
+                            }
+                            coefficientBits[index][k] = al
+                        }
+                    }
+                }
                 for (index, _, _) in scan where !components[index].latched {
                     guard let table = quant[components[index].quantTable] else { throw DecodeError() }
                     components[index].quant = table
