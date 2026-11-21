@@ -92,6 +92,14 @@ public enum ModelLayout {
     public static let selfTestState = ".aneembed-selftest.json"
     public static let packages = [textModel, visionModel]
 
+    /// Caps on the files read whole, far above their real size (the published package's in brackets), so that only
+    /// a file that is not what it should be reaches them: manifest.json the cap of its download, 4 MiB
+    /// [24,581 B]; selftest.json 16 MiB [146,366 B]; the state files and models/current 1 MiB [1,251, 451 and 41 B].
+    /// selftest.bin is capped at the size manifest.json declares for it.
+    public static let manifestLimit = DownloadLimit.manifestBytes
+    public static let selfTestLimit = 16 << 20
+    public static let stateLimit = 1 << 20
+
     /// Compiled model when present, else the package (compiled at install/warm time).
     public static func model(_ name: String, in directory: URL) -> URL? {
         for suffix in [".mlmodelc", ".mlpackage"] {
@@ -186,10 +194,13 @@ public struct Manifest: Sendable, Equatable {
     }
 
     public static func load(from directory: URL) throws(ServiceError) -> Manifest {
-        let url = directory.appendingPathComponent(ModelLayout.manifest)
-        guard let data = try? Data(contentsOf: url) else {
-            throw ServiceError(.unavailable, "manifest_missing", "no manifest.json in \(directory.path)",
-                               hint: "install with `aneembed models install` or point --model-dir at a model package")
+        let data: Data
+        do { data = try SmallFile.read(directory.appendingPathComponent(ModelLayout.manifest), limit: ModelLayout.manifestLimit) } catch {
+            guard error != .missing else {
+                throw ServiceError(.unavailable, "manifest_missing", "no manifest.json in \(directory.path)",
+                                   hint: "install with `aneembed models install` or point --model-dir at a model package")
+            }
+            throw ServiceError(.unavailable, "invalid_manifest", "\(directory.path): \(error.describe(ModelLayout.manifest))")
         }
         return try parse(data)
     }
@@ -316,7 +327,7 @@ public struct Manifest: Sendable, Equatable {
     /// A regular file itself, not a symlink, FIFO, socket or device (those could hang the hash or point elsewhere).
     public static func isRegularFile(_ url: URL) -> Bool {
         var info = stat()
-        return lstat(url.path, &info) == 0 && (info.st_mode & S_IFMT) == S_IFREG
+        return lstat(url.path, &info) == 0 && SmallFile.isRegular(info)
     }
 
     /// Checks every file; `hash: false` only checks presence and size (fast, for doctor).
@@ -404,7 +415,7 @@ public struct WarmState: Sendable, Equatable {
     }
 
     public static func load(from directory: URL) -> WarmState? {
-        guard let data = try? Data(contentsOf: directory.appendingPathComponent(ModelLayout.warmState)),
+        guard let data = try? SmallFile.read(directory.appendingPathComponent(ModelLayout.warmState), limit: ModelLayout.stateLimit),
             let root = try? JSONValue.parse(data), let build = root["os_build"]?.stringValue,
             let maxTokens = root["max_tokens"]?.intValue
         else { return nil }
@@ -428,6 +439,50 @@ public struct WarmState: Sendable, Equatable {
     }
 }
 
+/// Reads a small file whole, only if it is a regular file within a size cap. A FIFO, socket or device (or, unless
+/// `followSymlink`, a symlink) is refused before a byte is read, so the read can neither block nor run without end.
+/// The file is opened without blocking and checked through the open descriptor: what is checked is what is read.
+public enum SmallFile {
+    public enum Failure: Error, Equatable {
+        case missing
+        case notRegularFile
+        case tooLarge(limit: Int)
+        case unreadable(String)
+
+        /// What went wrong with the file called `name`.
+        public func describe(_ name: String) -> String {
+            switch self {
+            case .missing: return "\(name) is missing"
+            case .notRegularFile: return "\(name) is not a regular file (a symlink, FIFO, socket or device)"
+            case .tooLarge(let limit): return "\(name) is larger than \(limit) bytes"
+            case .unreadable(let reason): return "cannot read \(name): \(reason)"
+            }
+        }
+    }
+
+    static func isRegular(_ info: stat) -> Bool { (info.st_mode & S_IFMT) == S_IFREG }
+
+    public static func read(_ url: URL, limit: Int, followSymlink: Bool = false) throws(Failure) -> Data {
+        let descriptor = open(url.path, O_RDONLY | O_NONBLOCK | O_NOCTTY | O_CLOEXEC | (followSymlink ? 0 : O_NOFOLLOW))
+        guard descriptor >= 0 else {
+            switch errno {
+            case ENOENT, ENOTDIR: throw .missing
+            case ELOOP: throw .notRegularFile  // a symlink, refused by O_NOFOLLOW
+            default: throw .unreadable(String(cString: strerror(errno)))
+            }
+        }
+        let file = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
+        var info = stat()
+        guard fstat(descriptor, &info) == 0 else { throw .unreadable(String(cString: strerror(errno))) }
+        guard isRegular(info) else { throw .notRegularFile }
+        guard info.st_size <= limit else { throw .tooLarge(limit: limit) }
+        let data: Data
+        do { data = try file.read(upToCount: limit + 1) ?? Data() } catch { throw .unreadable(error.localizedDescription) }
+        guard data.count <= limit else { throw .tooLarge(limit: limit) }  // it grew after the check
+        return data
+    }
+}
+
 /// The running executable, identified by content.
 public enum Executable {
     public static let identity: String = {
@@ -447,10 +502,12 @@ public struct ModelStore: Sendable {
     public var modelsDirectory: URL { dataDirectory.appendingPathComponent("models", isDirectory: true) }
     var currentPointer: URL { modelsDirectory.appendingPathComponent("current") }
 
-    /// The active revision directory (may not exist yet). A `current` that is not a valid revision name is ignored.
+    /// The active revision directory (may not exist yet). `current` counts only as a regular file (or a symlink to
+    /// one) holding a valid revision name; anything else is ignored.
     public var currentDirectory: URL {
-        if let name = try? String(contentsOf: currentPointer, encoding: .utf8)
-            .trimmingCharacters(in: .whitespacesAndNewlines), ModelSource.isValidRevision(name)
+        if let data = try? SmallFile.read(currentPointer, limit: ModelLayout.stateLimit, followSymlink: true),
+            case let name = String(decoding: data, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines),
+            ModelSource.isValidRevision(name)
         {
             return modelsDirectory.appendingPathComponent(name, isDirectory: true)
         }

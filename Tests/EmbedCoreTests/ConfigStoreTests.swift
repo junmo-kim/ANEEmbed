@@ -127,6 +127,130 @@ struct ModelStoreTests {
         #expect(!FileManager.default.fileExists(atPath: store.modelsDirectory.appendingPathComponent("local-x").path))
     }
 
+    /// Replaces `name` in `directory` with a FIFO.
+    func makeFIFO(_ name: String, in directory: URL) throws {
+        try? FileManager.default.removeItem(at: directory.appendingPathComponent(name))
+        #expect(mkfifo(directory.appendingPathComponent(name).path, 0o600) == 0)
+    }
+
+    /// Replaces `name` in `directory` with a symlink to `destination`.
+    func makeSymlink(_ name: String, in directory: URL, to destination: String) throws {
+        try? FileManager.default.removeItem(at: directory.appendingPathComponent(name))
+        try FileManager.default.createSymbolicLink(atPath: directory.appendingPathComponent(name).path, withDestinationPath: destination)
+    }
+
+    /// The small files read whole are read only when they are regular files: a FIFO, or a symlink to a device, is an
+    /// error at once instead of a read that blocks or never ends. A test that hangs here fails at the time limit.
+    @Test(.timeLimit(.minutes(1))) func aFIFOOrDeviceInPlaceOfAStoreFileIsAnError() throws {
+        let package = try DoctorTests.modelDirectory()
+        defer { try? FileManager.default.removeItem(at: package) }
+        let config = try Config(flags: ["model-dir": package.path], environment: [:])
+        try WarmState(osBuild: "b", binaryVersion: "v", manifestSHA256: "m", maxTokens: 2048, functions: [], warmedAt: Date(),
+                      seconds: 1).save(to: package)
+        try SelfTestReport(osBuild: "b", ranAt: Date(), seconds: 0, results: []).save(to: package)
+        #expect(WarmState.load(from: package) != nil && SelfTestReport.load(from: package) != nil)
+        #expect(DoctorTests.problems(config).allSatisfy { !$0.contains("self-test data") && !$0.contains("manifest.json") })
+
+        let specials: [(String) throws -> Void] = [
+            { try makeFIFO($0, in: package) }, { try makeSymlink($0, in: package, to: "/dev/zero") },
+        ]
+        for special in specials {
+            for name in [ModelLayout.selfTest, ModelLayout.selfTestData, ModelLayout.manifest] {
+                let original = try Data(contentsOf: package.appendingPathComponent(name))
+                try special(name)
+                if name == ModelLayout.manifest {
+                    #expect(throws: ServiceError.self) { try Manifest.load(from: package) }
+                    #expect(Doctor.report(config)["model"]?["manifest"] == "invalid")
+                } else {
+                    #expect(Doctor.report(config)["model"]?["selftest_data"] == "invalid_selftest", "\(name)")
+                }
+                try FileManager.default.removeItem(at: package.appendingPathComponent(name))
+                try original.write(to: package.appendingPathComponent(name))
+            }
+            for name in [ModelLayout.warmState, ModelLayout.selfTestState] { try special(name) }
+            #expect(WarmState.load(from: package) == nil && SelfTestReport.load(from: package) == nil)
+        }
+
+        // models/current names the active revision: a FIFO or device there is ignored; a symlink to a regular file
+        // still works.
+        let store = ModelStore(dataDirectory: package)
+        try FileManager.default.createDirectory(at: store.modelsDirectory, withIntermediateDirectories: true)
+        try makeFIFO("current", in: store.modelsDirectory)
+        #expect(store.currentDirectory.lastPathComponent == ModelSource.pinned.revision)
+        try makeSymlink("current", in: store.modelsDirectory, to: "/dev/zero")
+        #expect(store.currentDirectory.lastPathComponent == ModelSource.pinned.revision)
+        try Data("abc123\n".utf8).write(to: package.appendingPathComponent("pointer"))
+        try makeSymlink("current", in: store.modelsDirectory, to: package.appendingPathComponent("pointer").path)
+        #expect(store.currentDirectory.lastPathComponent == "abc123")
+    }
+
+    @Test(.timeLimit(.minutes(1))) func smallFilesAreReadOnlyAsRegularFilesWithinTheCap() throws {
+        let directory = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let file = directory.appendingPathComponent("a.json")
+        try Data("12345".utf8).write(to: file)
+        #expect(try SmallFile.read(file, limit: 5) == Data("12345".utf8))
+        #expect(throws: SmallFile.Failure.tooLarge(limit: 4)) { try SmallFile.read(file, limit: 4) }
+        #expect(throws: SmallFile.Failure.missing) { try SmallFile.read(directory.appendingPathComponent("none"), limit: 5) }
+        try makeFIFO("fifo", in: directory)
+        try makeSymlink("zero", in: directory, to: "/dev/zero")
+        try makeSymlink("link", in: directory, to: file.path)
+        for name in ["fifo", "zero", "link"] {
+            #expect(throws: SmallFile.Failure.notRegularFile, "\(name)") { try SmallFile.read(directory.appendingPathComponent(name), limit: 5) }
+        }
+        #expect(throws: SmallFile.Failure.notRegularFile) {
+            try SmallFile.read(directory.appendingPathComponent("zero"), limit: 5, followSymlink: true)
+        }
+        #expect(try SmallFile.read(directory.appendingPathComponent("link"), limit: 5, followSymlink: true) == Data("12345".utf8))
+    }
+
+    /// Each small file read whole has a cap far above its real size, so a huge file is an error, not a huge read.
+    @Test func anOversizedStoreFileIsAnError() throws {
+        let package = try DoctorTests.modelDirectory()
+        defer { try? FileManager.default.removeItem(at: package) }
+        let config = try Config(flags: ["model-dir": package.path], environment: [:])
+        /// Valid JSON (`value` padded with spaces) of `size` bytes.
+        func padded(_ value: JSONValue, to size: Int) -> Data {
+            let json = value.jsonData()
+            return json + Data(repeating: 0x20, count: size - json.count)
+        }
+
+        // selftest.bin: the size manifest.json declares.
+        let blob = try Data(contentsOf: package.appendingPathComponent(ModelLayout.selfTestData))
+        try (blob + Data(count: 4)).write(to: package.appendingPathComponent(ModelLayout.selfTestData))
+        #expect(Doctor.report(config)["model"]?["selftest_data"] == "invalid_selftest")
+        try blob.write(to: package.appendingPathComponent(ModelLayout.selfTestData))
+        #expect(Doctor.report(config)["model"]?["selftest_data"] == "0 tests")
+        // selftest.json: 16 MiB.
+        let selfTest = try Data(contentsOf: package.appendingPathComponent(ModelLayout.selfTest))
+        try padded(try JSONValue.parse(selfTest), to: (16 << 20) + 1).write(to: package.appendingPathComponent(ModelLayout.selfTest))
+        #expect(Doctor.report(config)["model"]?["selftest_data"] == "invalid_selftest")
+        try selfTest.write(to: package.appendingPathComponent(ModelLayout.selfTest))
+
+        // The state files and models/current: 1 MiB.
+        let state = WarmState(osBuild: "b", binaryVersion: "v", manifestSHA256: "m", maxTokens: 2048, functions: [],
+                              warmedAt: Date(timeIntervalSince1970: 0), seconds: 1)
+        try padded(state.json, to: 1 << 20).write(to: package.appendingPathComponent(ModelLayout.warmState))
+        #expect(WarmState.load(from: package) == state)
+        try padded(state.json, to: (1 << 20) + 1).write(to: package.appendingPathComponent(ModelLayout.warmState))
+        #expect(WarmState.load(from: package) == nil)
+        let report = SelfTestReport(osBuild: "b", ranAt: Date(timeIntervalSince1970: 0), seconds: 0, results: [])
+        try padded(report.json, to: (1 << 20) + 1).write(to: package.appendingPathComponent(ModelLayout.selfTestState))
+        #expect(SelfTestReport.load(from: package) == nil)
+        let store = ModelStore(dataDirectory: package)
+        try FileManager.default.createDirectory(at: store.modelsDirectory, withIntermediateDirectories: true)
+        try (Data("abc123\n".utf8) + Data(repeating: 0x20, count: 1 << 20)).write(to: store.modelsDirectory.appendingPathComponent("current"))
+        #expect(store.currentDirectory.lastPathComponent == ModelSource.pinned.revision)
+
+        // manifest.json: 4 MiB, as for its download.
+        let manifest = try Data(contentsOf: package.appendingPathComponent(ModelLayout.manifest))
+        try padded(try JSONValue.parse(manifest), to: DownloadLimit.manifestBytes).write(to: package.appendingPathComponent(ModelLayout.manifest))
+        #expect(throws: Never.self) { try Manifest.load(from: package) }
+        try padded(try JSONValue.parse(manifest), to: DownloadLimit.manifestBytes + 1)
+            .write(to: package.appendingPathComponent(ModelLayout.manifest))
+        #expect(throws: ServiceError.self) { try Manifest.load(from: package) }
+    }
+
     /// At load: every source file present with its manifest size, and tokenizer.json and the self-test files
     /// (which the self-test cannot check itself) hashed. The full hash pass stays in `models verify`.
     @Test func loadChecksSizesAndTheFilesTheSelfTestCannotSee() throws {

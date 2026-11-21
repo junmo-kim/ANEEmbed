@@ -59,7 +59,7 @@ public enum ModelLoader {
                 + "function returns wrong vectors without an error)")
             suite = nil
         } else {
-            suite = try SelfTestSuite.require(from: directory)
+            suite = try SelfTestSuite.require(from: directory, manifest: manifest)
         }
         do {
             let tokenizer = try GemmaTokenizer(contentsOf: tokenizerURL)

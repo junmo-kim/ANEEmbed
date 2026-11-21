@@ -150,11 +150,14 @@ struct SelfTestTests {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("aneembed-selftest-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: directory) }
-        #expect(throws: ServiceError.self) { try SelfTestSuite.require(from: directory) }
-        do { _ = try SelfTestSuite.require(from: directory) } catch { #expect(error.reason == "selftest_missing") }
+        let manifest = try Manifest.parse(JSONValue.object(["files": [
+            ["path": .string(ModelLayout.selfTestData), "size": 16, "sha256": .string(SHA256Hasher.hex(Data(count: 16)))],
+        ]]).jsonData())
+        #expect(throws: ServiceError.self) { try SelfTestSuite.require(from: directory, manifest: manifest) }
+        do { _ = try SelfTestSuite.require(from: directory, manifest: manifest) } catch { #expect(error.reason == "selftest_missing") }
         try Data("{bad".utf8).write(to: directory.appendingPathComponent(ModelLayout.selfTest))
         try Data(count: 16).write(to: directory.appendingPathComponent(ModelLayout.selfTestData))
-        do { _ = try SelfTestSuite.require(from: directory) } catch { #expect(error.reason == "invalid_selftest") }
+        do { _ = try SelfTestSuite.require(from: directory, manifest: manifest) } catch { #expect(error.reason == "invalid_selftest") }
         #expect(try Config(environment: [:]).skipSelfTest == false)
         #expect(try Config(flags: ["selftest": "skip"], environment: [:]).skipSelfTest)
         #expect(throws: ServiceError.self) { try Config(flags: ["selftest": "maybe"], environment: [:]) }

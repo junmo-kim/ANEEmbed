@@ -96,7 +96,7 @@ public struct SelfTestReport: Sendable, Equatable {
     }
 
     public static func load(from directory: URL) -> SelfTestReport? {
-        guard let data = try? Data(contentsOf: directory.appendingPathComponent(ModelLayout.selfTestState)),
+        guard let data = try? SmallFile.read(directory.appendingPathComponent(ModelLayout.selfTestState), limit: ModelLayout.stateLimit),
             let root = try? JSONValue.parse(data), let build = root["os_build"]?.stringValue
         else { return nil }
         let results = (root["results"]?.arrayValue ?? []).compactMap { item -> SelfTestResult? in
@@ -145,8 +145,9 @@ public struct SelfTestSuite: Sendable {
     static let digestWidth = 8
 
     /// The package's suite. Without one nothing can be checked, so loading stops (`--selftest skip` is the
-    /// explicit, unsafe way around it).
-    public static func require(from directory: URL) throws(ServiceError) -> SelfTestSuite {
+    /// explicit, unsafe way around it). Both files must be regular files: selftest.json of at most
+    /// ModelLayout.selfTestLimit bytes, selftest.bin of at most the size `manifest` declares for it.
+    public static func require(from directory: URL, manifest: Manifest) throws(ServiceError) -> SelfTestSuite {
         let jsonURL = directory.appendingPathComponent(ModelLayout.selfTest)
         let binURL = directory.appendingPathComponent(ModelLayout.selfTestData)
         guard FileManager.default.fileExists(atPath: jsonURL.path), FileManager.default.fileExists(atPath: binURL.path) else {
@@ -155,11 +156,28 @@ public struct SelfTestSuite: Sendable {
                                + "\(ModelLayout.selfTestData)): its functions cannot be checked on this Mac",
                                hint: "reinstall with `aneembed models install`; --selftest skip serves unchecked (unsafe)")
         }
+        func invalid(_ message: String) -> ServiceError {
+            ServiceError(.unavailable, "invalid_selftest", "cannot read the package's self-test: \(message)",
+                         hint: "check the package with `aneembed models verify`, or reinstall it")
+        }
+        guard let declared = manifest.files.first(where: { $0.path == ModelLayout.selfTestData })?.size else {
+            throw invalid("\(ModelLayout.selfTestData) is not listed in \(ModelLayout.manifest)")
+        }
+        let json: Data, blob: Data
         do {
-            return try SelfTestSuite(json: try Data(contentsOf: jsonURL), blob: try Data(contentsOf: binURL, options: .alwaysMapped))
+            json = try SmallFile.read(jsonURL, limit: ModelLayout.selfTestLimit)
         } catch {
-            throw ServiceError(.unavailable, "invalid_selftest", "cannot read the package's self-test: \(error)",
-                               hint: "check the package with `aneembed models verify`, or reinstall it")
+            throw invalid(error.describe(ModelLayout.selfTest))
+        }
+        do {
+            blob = try SmallFile.read(binURL, limit: declared)
+        } catch {
+            throw invalid(error.describe(ModelLayout.selfTestData))
+        }
+        do {
+            return try SelfTestSuite(json: json, blob: blob)
+        } catch {
+            throw invalid("\(error)")
         }
     }
 

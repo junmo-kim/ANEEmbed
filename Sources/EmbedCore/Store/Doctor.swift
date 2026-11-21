@@ -20,8 +20,10 @@ public enum Doctor {
             ]
             model["files"] = .object(JSONObject(files.map { (key: $0.0, value: .string($0.1 ? "present" : "missing")) }))
             for (name, present) in files.prefix(3) where !present { problems.append(.string("model file missing: \(name)")) }
+            var loadedManifest: Manifest?
             do {
                 let manifest = try Manifest.load(from: directory)
+                loadedManifest = manifest
                 let (issues, compiled) = manifest.verifyAll(in: directory, hash: verify)
                 model["name"] = .string(manifest.model)
                 model["manifest_sha256"] = .string(manifest.sha256)
@@ -47,14 +49,16 @@ public enum Doctor {
             }
             if config.skipSelfTest {
                 model["selftest_data"] = "not used (--selftest skip: every function is served unchecked)"
-            } else if !config.useFakeRuntime {
+            } else if !config.useFakeRuntime, let loadedManifest {
                 do {
-                    let suite = try SelfTestSuite.require(from: directory)
+                    let suite = try SelfTestSuite.require(from: directory, manifest: loadedManifest)
                     model["selftest_data"] = .string("\(suite.cases.count) tests")
                 } catch {
                     model["selftest_data"] = .string(error.reason)
                     problems.append(.string(error.message))
                 }
+            } else if !config.useFakeRuntime {
+                model["selftest_data"] = "not checked: no valid manifest.json to check selftest.bin against"
             }
         } else if !config.useFakeRuntime {
             problems.append(.string("no model: run `aneembed models install` or pass --model-dir"))
