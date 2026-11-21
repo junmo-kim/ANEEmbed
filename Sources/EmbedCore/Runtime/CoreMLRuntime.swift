@@ -71,20 +71,10 @@ func checkSignature(_ model: MLModel, name: String, inputs: [(String, [Int])], o
 func loadFunctions<Key: Hashable & Sendable>(_ url: URL, _ names: [(Key, String)], computeUnits: MLComputeUnits,
                                              width: Int = 4) async throws -> [Key: MLModel]
 {
-    var models: [Key: MLModel] = [:]
-    try await withThrowingTaskGroup(of: (Key, MLModel).self) { group in
-        var pending = names[...]
-        func next() {
-            guard let (key, name) = pending.popFirst() else { return }
-            group.addTask { (key, try await loadFunction(url, name: name, computeUnits: computeUnits)) }
-        }
-        for _ in 0..<max(1, width) { next() }
-        while let (key, model) = try await group.next() {
-            models[key] = model
-            next()
-        }
+    let loaded = try await windowedMap(names, width: width) { key, name in
+        (key, try await loadFunction(url, name: name, computeUnits: computeUnits))
     }
-    return models
+    return Dictionary(loaded, uniquingKeysWith: { _, last in last })
 }
 
 /// Copies rows of a 2-D (or batched) fp16/fp32 MLMultiArray into Float arrays.
