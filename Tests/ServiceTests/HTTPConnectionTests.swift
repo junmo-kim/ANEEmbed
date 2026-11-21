@@ -151,6 +151,24 @@ final class ManualClock: @unchecked Sendable {
     }
 }
 
+/// The result of `task`, failing instead of hanging if it has not finished within 10 s. Awaiting the task itself
+/// could outlast the test's time limit: the limit cancels the test, and that does not reach the task.
+@discardableResult
+func finished<Success: Sendable, Failure: Error>(_ task: Task<Success, Failure>,
+                                                  sourceLocation: SourceLocation = #_sourceLocation) async throws
+    -> Result<Success, Failure>
+{
+    let done = Shared(false)
+    Task {
+        _ = await task.result
+        done.value = true
+    }
+    for _ in 0..<100 where !done.value { await Task.yield() }  // most tasks are about to finish
+    for _ in 0..<10_000 where !done.value { try await Task.sleep(for: .milliseconds(1)) }
+    try #require(done.value, "the task did not finish", sourceLocation: sourceLocation)
+    return await task.result
+}
+
 /// A client-side reading of the server's bytes: responses in order, with HEAD responses carrying no body.
 struct ParsedResponse {
     var status: Int
@@ -197,7 +215,7 @@ struct HTTPConnectionTests {
         }
         let server = Task { await HTTPConnection.serve(transport, limits: limits, sleep: sleep) { await Self.router.handle($0) } }
         try await client(transport)
-        await server.value
+        try await finished(server)
         return transport
     }
 
@@ -274,7 +292,7 @@ struct HTTPConnectionTests {
 
     /// A body that keeps arriving, slowly, is not cut by the timeout, however long it takes in total.
     /// These tests run on a ManualClock: the timeouts fire when the test moves time, not when a busy machine gets
-    /// around to it. A connection that should end but does not hangs until the time limit fails the test.
+    /// around to it. A connection that should end but does not fails the test after 10 s.
     @Test(.timeLimit(.minutes(1))) func aSlowButActiveUploadIsNotCut() async throws {
         let body = Array(#"{"input":"slow"}"#.utf8)
         let clock = ManualClock()
@@ -357,7 +375,7 @@ struct HTTPConnectionTests {
         #expect(!transport.isCancelled && limiter.active == 1)
         clock.advance(by: .milliseconds(1))
         try await Self.untilCancelled(transport)
-        await server.value
+        try await finished(server)
         #expect(limiter.active == 0)
     }
 
@@ -377,7 +395,7 @@ struct HTTPConnectionTests {
         try await clock.waitUntilArmed(moreThan: 0)  // the send deadline
         clock.advance(by: limits.sendDeadline(for: try #require(transport.heldSendBytes)))
         try await Self.untilCancelled(transport)
-        await refusal.value
+        try await finished(refusal)
     }
 
     /// Waits for the deadline's task to cancel `transport`, failing (instead of hanging) if it does not within 10 s.

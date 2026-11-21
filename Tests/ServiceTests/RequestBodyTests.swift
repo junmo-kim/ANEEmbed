@@ -173,8 +173,8 @@ struct BodyBudgetTests {
         #expect(budget.waiting == 1 && second.pendingChunks == 4, "the second body was read while the first held the budget")
 
         finishFirst()  // the waiter proceeds once the first body is freed
-        await firstServed.task.value
-        await secondServed.task.value
+        try await finished(firstServed.task)
+        try await finished(secondServed.task)
         #expect(Self.statuses(first) == [200] && Self.statuses(second) == [200])
         #expect(budget.reservedBytes == 0 && budget.waiting == 0)
     }
@@ -189,13 +189,13 @@ struct BodyBudgetTests {
 
         let small = MemoryTransport()
         small.write(Self.head(40) + Self.body(40))
-        await Self.serve(small, budget).task.value
+        try await finished(Self.serve(small, budget).task)
         #expect(Self.statuses(small) == [200])
         #expect(budget.waiting == 1 && !largeServed.done.value)
 
         finishFirst()
-        await firstServed.task.value
-        await largeServed.task.value
+        try await finished(firstServed.task)
+        try await finished(largeServed.task)
         #expect(Self.statuses(large) == [200])
     }
 
@@ -217,7 +217,7 @@ struct BodyBudgetTests {
         #expect(budget.waiting == 2 && quarter.pendingChunks == 1, "the 1024-byte body overtook the waiting one")
 
         finishFirst()
-        for served in [firstServed, fullServed, quarterServed] { await served.task.value }
+        for served in [firstServed, fullServed, quarterServed] { try await finished(served.task) }
         #expect(started.value == ["first", "full", "quarter"])
         #expect([full, quarter].map { Self.statuses($0) } == [[200], [200]])
     }
@@ -248,7 +248,7 @@ struct BodyBudgetTests {
         clock.advance(by: .milliseconds(999))
         #expect(!waiter.isCancelled)
         clock.advance(by: .milliseconds(1))
-        await waiterServed.task.value
+        try await finished(waiterServed.task)
 
         let response = try #require(parseResponses(waiter.sent, methods: ["POST"]).responses.first)
         #expect(response.status == 503 && waiter.isCancelled && waiter.pendingChunks == 1)
@@ -256,7 +256,7 @@ struct BodyBudgetTests {
         #expect(try JSONValue.parse(response.body)["error"]?["code"] == "body_budget_busy")
         #expect(budget.waiting == 0 && budget.reservedBytes == Self.maxBody)
         finishFirst()
-        await firstServed.task.value
+        try await finished(firstServed.task)
         #expect(budget.reservedBytes == 0)
     }
 
@@ -269,12 +269,12 @@ struct BodyBudgetTests {
         let (next, nextServed) = try await Self.waiter(budget, clock: nextClock, started: started, name: "next")
         #expect(budget.waiting == 2)
         firstClock.advance(by: .seconds(1))
-        await timedOutServed.task.value
+        try await finished(timedOutServed.task)
         #expect(Self.statuses(timedOut) == [503] && budget.waiting == 1)
 
         finishFirst()
-        await firstServed.task.value
-        await nextServed.task.value
+        try await finished(firstServed.task)
+        try await finished(nextServed.task)
         #expect(Self.statuses(next) == [200] && started.value == ["next"])
         #expect(budget.reservedBytes == 0 && budget.waiting == 0)
     }
@@ -286,8 +286,8 @@ struct BodyBudgetTests {
         let (waiter, waiterServed) = try await Self.waiter(budget, clock: clock)
         clock.advance(by: .milliseconds(900))
         finishFirst()
-        await firstServed.task.value
-        await waiterServed.task.value
+        try await finished(firstServed.task)
+        try await finished(waiterServed.task)
         #expect(Self.statuses(waiter) == [200])
         #expect(clock.sleeping == 0 && budget.reservedBytes == 0 && budget.waiting == 0)
     }
@@ -299,7 +299,7 @@ struct BodyBudgetTests {
         let connection = MemoryTransport()
         let request = Self.head(Self.maxBody, close: false) + Self.body(Self.maxBody)
         connection.write(request + request + Data("GET /health HTTP/1.1\r\nConnection: close\r\n\r\n".utf8))
-        await Self.serve(connection, budget).task.value
+        try await finished(Self.serve(connection, budget).task)
         #expect(Self.statuses(connection, ["POST", "POST", "GET"]) == [200, 200, 200])
         #expect(budget.reservedBytes == 0)
     }
@@ -309,7 +309,7 @@ struct BodyBudgetTests {
         let (transport, served, _) = try await Self.holder(budget)
         #expect(budget.reservedBytes == Self.maxBody)
         transport.closeInput()
-        await served.task.value
+        try await finished(served.task)
         #expect(budget.reservedBytes == 0 && transport.sent.isEmpty)
     }
 
@@ -322,7 +322,7 @@ struct BodyBudgetTests {
         try await clock.waitUntilArmed(moreThan: 1)  // the head deadline, then the body's idle timeout
         #expect(budget.reservedBytes == Self.maxBody)
         clock.advance(by: .seconds(1))
-        await served.task.value
+        try await finished(served.task)
         #expect(transport.isCancelled && budget.reservedBytes == 0)
     }
 
@@ -334,11 +334,11 @@ struct BodyBudgetTests {
         let waiterServed = Self.serve(waiter, budget)
         try await Self.until { budget.waiting == 1 || waiterServed.done.value }
         waiterServed.task.cancel()
-        await waiterServed.task.value
+        try await finished(waiterServed.task)
         #expect(budget.waiting == 0 && waiter.isCancelled && budget.reservedBytes == Self.maxBody)
 
         finishFirst()
-        await firstServed.task.value
+        try await finished(firstServed.task)
         #expect(Self.statuses(first) == [200] && budget.reservedBytes == 0)
     }
 
@@ -354,7 +354,7 @@ struct BodyBudgetTests {
         try await Self.until { budget.reservedBytes == body.count || served.done.value }
         #expect(budget.reservedBytes == body.count)
         transport.write(Data(body.dropFirst(10)))
-        await served.task.value
+        try await finished(served.task)
         #expect(Self.statuses(transport) == [200])
         #expect(seen.value == [0])
     }
@@ -390,8 +390,8 @@ struct BodyBudgetTests {
         try await Self.until { budget.waiting == 2 }
         #expect(order.value.isEmpty && budget.reservedBytes == 60)
         first = nil  // dropping a reservation releases it; then both fit
-        try await large.value
-        try await small.value
+        try await finished(large).get()
+        try await finished(small).get()
         #expect(order.value.sorted() == ["large", "small"] && budget.reservedBytes == 90)
         held.value = []
         #expect(budget.reservedBytes == 0 && first == nil)
@@ -405,8 +405,9 @@ struct BodyBudgetTests {
         let next = Task { try await budget.reserve(30) }
         try await Self.until { budget.waiting == 2 }
         blocked.cancel()
-        await #expect(throws: CancellationError.self) { try await blocked.value }
-        let granted = try await next.value
+        let cancelled = try await finished(blocked)
+        #expect(throws: CancellationError.self) { try cancelled.get() }
+        let granted = try await finished(next).get()
         #expect(granted?.bytes == 30 && budget.reservedBytes == 90 && budget.waiting == 0)
         _ = holding
     }
@@ -419,8 +420,9 @@ struct BodyBudgetTests {
         let next = Task { try await budget.reserve(30) }
         try await Self.until { budget.waiting == 2 }
         clock.advance(by: .seconds(1))
-        await #expect(throws: BodyBudget.WaitTimedOut.self) { try await blocked.value }
-        let granted = try await next.value
+        let timedOut = try await finished(blocked)
+        #expect(throws: BodyBudget.WaitTimedOut.self) { try timedOut.get() }
+        let granted = try await finished(next).get()
         #expect(granted?.bytes == 30 && budget.reservedBytes == 90 && budget.waiting == 0)
         _ = holding
     }
@@ -436,7 +438,7 @@ struct BodyBudgetTests {
             tasks[round % 4].cancel()
             holding?.release()  // grants race the cancellation
             tasks[(round + 1) % 4].cancel()
-            for task in tasks { _ = try? await task.value }
+            for task in tasks { try await finished(task) }
             #expect(budget.reservedBytes == 0 && budget.waiting == 0, "round \(round)")
         }
     }
