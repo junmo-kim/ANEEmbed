@@ -96,58 +96,68 @@ final class MemoryTransport: HTTPTransport, @unchecked Sendable {
     var pendingChunks: Int { lock.withLock { incoming.count } }
 }
 
-/// A clock the test advances by hand, so timeout tests do not depend on how fast the machine schedules tasks.
-final class ManualClock: @unchecked Sendable {
+/// A clock the test advances by hand, so timeout tests do not depend on how fast the machine schedules work.
+final class ManualClock: DeadlineScheduler, @unchecked Sendable {
     private let lock = NSLock()
     private var now: Duration = .zero
     private var nextID = 0
-    private var sleepers: [Int: (deadline: Duration, continuation: CheckedContinuation<Void, Error>)] = [:]
-    private var cancelledEarly: Set<Int> = []
+    private var pending: [Int: (deadline: Duration, work: @Sendable () -> Void)] = [:]
     private var armedCount = 0
 
-    /// Sleeps armed so far (waiting for their deadline, woken or cancelled).
+    /// Deadlines scheduled so far (waiting, run or cancelled).
     var armed: Int { lock.withLock { armedCount } }
-    /// Sleeps waiting for their deadline now.
-    var sleeping: Int { lock.withLock { sleepers.count } }
+    /// Deadlines waiting to run now.
+    var sleeping: Int { lock.withLock { pending.count } }
 
-    func sleep(for duration: Duration) async throws {
+    func schedule(after delay: Duration, _ work: @escaping @Sendable () -> Void) -> any ScheduledDeadline {
         let id = lock.withLock { () -> Int in
             nextID += 1
+            armedCount += 1
+            pending[nextID] = (now + delay, work)
             return nextID
         }
-        try await withTaskCancellationHandler {
-            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-                let cancelled = lock.withLock { () -> Bool in
-                    armedCount += 1
-                    if cancelledEarly.remove(id) != nil { return true }
-                    sleepers[id] = (now + duration, continuation)
-                    return false
-                }
-                if cancelled { continuation.resume(throwing: CancellationError()) }
-            }
-        } onCancel: {
-            let continuation = lock.withLock { () -> CheckedContinuation<Void, Error>? in
-                if let sleeper = sleepers.removeValue(forKey: id) { return sleeper.continuation }
-                cancelledEarly.insert(id)
-                return nil
-            }
-            continuation?.resume(throwing: CancellationError())
-        }
+        return Deadline { [weak self] in self?.cancel(id) }
     }
 
-    /// Moves time forward and wakes every sleep whose deadline has passed.
+    private func cancel(_ id: Int) {
+        _ = lock.withLock { pending.removeValue(forKey: id) }
+    }
+
+    /// Moves time forward and runs every deadline that has passed, earliest first, outside the lock.
     func advance(by duration: Duration) {
-        let due = lock.withLock { () -> [CheckedContinuation<Void, Error>] in
+        let due = lock.withLock { () -> [@Sendable () -> Void] in
             now += duration
-            let ids = sleepers.filter { $0.value.deadline <= now }.map(\.key)
-            return ids.compactMap { sleepers.removeValue(forKey: $0)?.continuation }
+            let ids = pending.filter { $0.value.deadline <= now }
+                .sorted { ($0.value.deadline, $0.key) < ($1.value.deadline, $1.key) }.map(\.key)
+            return ids.compactMap { pending.removeValue(forKey: $0)?.work }
         }
-        due.forEach { $0.resume() }
+        due.forEach { $0() }
     }
 
-    /// Waits until more than `count` sleeps are armed. Polling only paces the wait; no result depends on its timing.
+    /// Waits until more than `count` deadlines are armed. Polling only paces the wait; no result depends on its timing.
     func waitUntilArmed(moreThan count: Int) async throws {
         while armed <= count { try await Task.sleep(for: .milliseconds(1)) }
+    }
+
+    private struct Deadline: ScheduledDeadline {
+        let cancelling: @Sendable () -> Void
+        init(_ cancelling: @escaping @Sendable () -> Void) { self.cancelling = cancelling }
+        func cancel() { cancelling() }
+    }
+}
+
+/// `clock`, except that cancelling a deadline has no effect: the work runs anyway, as work that was already running
+/// when its deadline was replaced does.
+struct UncancellableDeadlines: DeadlineScheduler {
+    let clock: ManualClock
+
+    func schedule(after delay: Duration, _ work: @escaping @Sendable () -> Void) -> any ScheduledDeadline {
+        _ = clock.schedule(after: delay, work)
+        return Ignored()
+    }
+
+    private struct Ignored: ScheduledDeadline {
+        func cancel() {}
     }
 }
 
@@ -207,13 +217,10 @@ struct HTTPConnectionTests {
                     _ client: @Sendable (MemoryTransport) async throws -> Void) async throws -> MemoryTransport
     {
         let transport = MemoryTransport()
-        let sleep: @Sendable (Duration) async throws -> Void
-        if let clock {
-            sleep = { try await clock.sleep(for: $0) }
-        } else {
-            sleep = { try await Task.sleep(for: $0) }
+        let scheduler: any DeadlineScheduler = clock ?? DispatchDeadlineScheduler()
+        let server = Task {
+            await HTTPConnection.serve(transport, limits: limits, scheduler: scheduler) { await Self.router.handle($0) }
         }
-        let server = Task { await HTTPConnection.serve(transport, limits: limits, sleep: sleep) { await Self.router.handle($0) } }
         try await client(transport)
         try await finished(server)
         return transport
@@ -362,7 +369,7 @@ struct HTTPConnectionTests {
         transport.stopReading()
         transport.write("POST /v1/embeddings HTTP/1.1\r\nContent-Length: \(body.utf8.count)\r\n\r\n\(body)")
         let server = Task {
-            await HTTPConnection.accept(transport, limiter: limiter, limits: limits, sleep: { try await clock.sleep(for: $0) }) {
+            await HTTPConnection.accept(transport, limiter: limiter, limits: limits, scheduler: clock) {
                 await Self.router.handle($0)
             }
         }
@@ -387,7 +394,7 @@ struct HTTPConnectionTests {
         let transport = MemoryTransport()
         transport.stopReading()
         let refusal = Task {
-            await HTTPConnection.accept(transport, limiter: limiter, limits: limits, sleep: { try await clock.sleep(for: $0) }) {
+            await HTTPConnection.accept(transport, limiter: limiter, limits: limits, scheduler: clock) {
                 await Self.router.handle($0)
             }
         }
@@ -398,7 +405,7 @@ struct HTTPConnectionTests {
         try await finished(refusal)
     }
 
-    /// Waits for the deadline's task to cancel `transport`, failing (instead of hanging) if it does not within 10 s.
+    /// Waits for the deadline to cancel `transport`, failing (instead of hanging) if it does not within 10 s.
     static func untilCancelled(_ transport: MemoryTransport) async throws {
         for _ in 0..<10_000 where !transport.isCancelled { try await Task.sleep(for: .milliseconds(1)) }
         try #require(transport.isCancelled, "the send outlived its deadline")
@@ -434,6 +441,45 @@ struct HTTPConnectionTests {
         #expect(limiter.active == 0)
     }
 
+    /// Many refusals at once, on the default Dispatch deadlines: each sends its 503 well within its deadline and
+    /// ends, and refused clients that do not read are cut once their (short) send deadline passes.
+    @Test(.timeLimit(.minutes(1))) func manyRefusedConnectionsEachEndCleanly() async throws {
+        let limiter = ConnectionLimiter(limit: 0)
+        func refuse(_ transports: [MemoryTransport], _ limits: HTTPConnectionLimits) async throws {
+            let refusals = transports.map { transport in
+                Task { await HTTPConnection.accept(transport, limiter: limiter, limits: limits) { await Self.router.handle($0) } }
+            }
+            for refusal in refusals { try await finished(refusal) }
+        }
+        let reading = (0..<400).map { _ in MemoryTransport() }
+        try await refuse(reading, HTTPConnectionLimits(maxBody: 1 << 20))
+        let statuses = reading.map { parseResponses($0.sent, methods: ["GET"]).responses.map(\.status) }
+        #expect(statuses.allSatisfy { $0 == [503] } && reading.allSatisfy(\.isCancelled))
+
+        let stalled = (0..<100).map { _ in MemoryTransport() }
+        stalled.forEach { $0.stopReading() }
+        try await refuse(stalled, HTTPConnectionLimits(maxBody: 1 << 20, sendTimeout: .milliseconds(20)))
+        #expect(stalled.allSatisfy { $0.isCancelled && $0.sent.isEmpty })
+        #expect(limiter.active == 0)
+    }
+
+    /// A deadline that was replaced (restarted or stopped) never cancels the connection, even if its work still
+    /// runs: here cancelling a deadline has no effect, so only the timer's own check stops it.
+    @Test func aReplacedDeadlineNeverCancelsTheConnection() {
+        let clock = ManualClock(), transport = MemoryTransport()
+        let timer = ConnectionTimer(transport, scheduler: UncancellableDeadlines(clock: clock))
+        timer.start(.seconds(1))
+        timer.start(.seconds(2))  // restarted: the first deadline is stale
+        clock.advance(by: .seconds(1))
+        #expect(!transport.isCancelled && clock.sleeping == 1)
+        timer.stop()  // the second one is stale too
+        clock.advance(by: .seconds(1))
+        #expect(!transport.isCancelled && clock.sleeping == 0)
+        timer.start(.seconds(1))
+        clock.advance(by: .seconds(1))
+        #expect(transport.isCancelled)
+    }
+
     /// A body is handed over without a copy, and nothing of a finished request stays buffered.
     @Test func readerReleasesWhatItReturned() throws {
         var reader = HTTPRequestReader(maxBody: 1 << 20)
@@ -455,5 +501,40 @@ struct HTTPConnectionTests {
         reader.append(Data(" HTTP/1.1\r\n\r\n".utf8))
         #expect(try reader.next()?.path == "/c")
         #expect(reader.bufferedBytes == 0)
+    }
+}
+
+@Suite("Dispatch deadlines")
+struct DispatchDeadlineTests {
+    @Test func durationsBecomeWholeNanosecondsRoundedUp() {
+        #expect(DispatchDeadlineScheduler.nanoseconds(.seconds(61) + .milliseconds(5)) == 61_005_000_000)
+        #expect(DispatchDeadlineScheduler.nanoseconds(Duration(secondsComponent: 0, attosecondsComponent: 1)) == 1)
+        #expect(DispatchDeadlineScheduler.nanoseconds(.zero) == 0)
+        #expect(DispatchDeadlineScheduler.nanoseconds(.seconds(-1)) == 0)
+        #expect(DispatchDeadlineScheduler.nanoseconds(.seconds(Int64.max)) == .max)
+    }
+
+    @Test(.timeLimit(.minutes(1))) func aDeadlineRunsItsWorkOnce() async throws {
+        let runs = Shared(0)
+        let deadline = DispatchDeadlineScheduler().schedule(after: .milliseconds(5)) { runs.update { $0 += 1 } }
+        for _ in 0..<10_000 where runs.value == 0 { try await Task.sleep(for: .milliseconds(1)) }
+        deadline.cancel()  // after it ran: nothing to withdraw
+        deadline.cancel()
+        try await Task.sleep(for: .milliseconds(20))
+        #expect(runs.value == 1)
+    }
+
+    /// The queue is held while the first deadline is cancelled, so the test does not depend on how fast it gets there.
+    @Test(.timeLimit(.minutes(1))) func aCancelledDeadlineNeverRuns() async throws {
+        let queue = DispatchQueue(label: "aCancelledDeadlineNeverRuns")
+        queue.suspend()
+        let scheduler = DispatchDeadlineScheduler(queue: queue)
+        let cancelled = Shared(false), later = Shared(false)
+        scheduler.schedule(after: .milliseconds(1)) { cancelled.value = true }.cancel()
+        _ = scheduler.schedule(after: .milliseconds(30)) { later.value = true }
+        queue.resume()
+        for _ in 0..<10_000 where !later.value { try await Task.sleep(for: .milliseconds(1)) }
+        queue.sync {}
+        #expect(later.value && !cancelled.value)
     }
 }

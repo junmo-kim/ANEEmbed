@@ -119,15 +119,10 @@ struct BodyBudgetTests {
                       name: String = "") -> Served
     {
         let done = Shared(false)
-        let sleep: @Sendable (Duration) async throws -> Void
-        if let clock {
-            sleep = { try await clock.sleep(for: $0) }
-        } else {
-            sleep = { try await Task.sleep(for: $0) }
-        }
+        let scheduler: any DeadlineScheduler = clock ?? DispatchDeadlineScheduler()
         let task = Task {
             await HTTPConnection.serve(transport, limits: limits ?? HTTPConnectionLimits(maxBody: maxBody), budget: budget,
-                                       sleep: sleep) { request in
+                                       scheduler: scheduler) { request in
                 started?.update { $0.append(name) }
                 return await router.handle(consume request)
             }
@@ -415,7 +410,7 @@ struct BodyBudgetTests {
     @Test(.timeLimit(.minutes(1))) func aWaitThatTimesOutLetsTheNextOneIn() async throws {
         let budget = BodyBudget(capacity: 100, unreservedLimit: 10), clock = ManualClock()
         let holding = try await budget.reserve(60)
-        let blocked = Task { try await budget.reserve(60, waitingAtMost: .seconds(1)) { try await clock.sleep(for: $0) } }
+        let blocked = Task { try await budget.reserve(60, waitingAtMost: .seconds(1), scheduler: clock) }
         try await Self.until { budget.waiting == 1 && clock.sleeping == 1 }
         let next = Task { try await budget.reserve(30) }
         try await Self.until { budget.waiting == 2 }
@@ -425,6 +420,20 @@ struct BodyBudgetTests {
         let granted = try await finished(next).get()
         #expect(granted?.bytes == 30 && budget.reservedBytes == 90 && budget.waiting == 0)
         _ = holding
+    }
+
+    /// A grant that lands just before the deadline runs is kept: the late deadline finds nothing to take back.
+    @Test(.timeLimit(.minutes(1))) func aDeadlineAfterTheGrantChangesNothing() async throws {
+        let budget = BodyBudget(capacity: 100, unreservedLimit: 10), clock = ManualClock()
+        var holding = try await budget.reserve(60)
+        let blocked = Task {
+            try await budget.reserve(60, waitingAtMost: .seconds(1), scheduler: UncancellableDeadlines(clock: clock))
+        }
+        try await Self.until { budget.waiting == 1 && clock.sleeping == 1 }
+        holding = nil
+        let granted = try await finished(blocked).get()
+        clock.advance(by: .seconds(1))  // the deadline's work runs although the wait is over
+        #expect(granted?.bytes == 60 && budget.reservedBytes == 60 && budget.waiting == 0 && holding == nil)
     }
 
     /// Cancellations that race grants, before, during and after the wait, leave the budget exactly balanced: every
@@ -446,7 +455,7 @@ struct BodyBudgetTests {
     /// Room in the budget is granted at once, without arming a deadline.
     @Test func aReservationWithRoomDoesNotWait() async throws {
         let budget = BodyBudget(capacity: 100, unreservedLimit: 10), clock = ManualClock()
-        let granted = try await budget.reserve(60, waitingAtMost: .seconds(1)) { try await clock.sleep(for: $0) }
+        let granted = try await budget.reserve(60, waitingAtMost: .seconds(1), scheduler: clock)
         #expect(granted?.bytes == 60 && clock.armed == 0)
     }
 }

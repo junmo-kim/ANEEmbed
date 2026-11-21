@@ -207,11 +207,11 @@ public enum HTTPConnection {
     /// Bodies over `budget.unreservedLimit` share `budget` with every other connection's.
     public static func accept(_ transport: some HTTPTransport, limiter: ConnectionLimiter, budget: BodyBudget? = nil,
                               limits: HTTPConnectionLimits,
-                              sleep: @escaping @Sendable (Duration) async throws -> Void = { try await Task.sleep(for: $0) },
+                              scheduler: any DeadlineScheduler = DispatchDeadlineScheduler(),
                               handler: @Sendable (consuming HTTPRequest) async -> HTTPResponse) async
     {
         guard limiter.tryAcquire() else {
-            let timer = ConnectionTimer(transport, sleep: sleep)
+            let timer = ConnectionTimer(transport, scheduler: scheduler)
             _ = await send(retryLater(ServiceError(
                 .unavailable, "too_many_connections", "the server has \(limiter.limit) open connections, its limit; retry shortly")),
                 on: transport, timer: timer, limits: limits)
@@ -219,21 +219,21 @@ public enum HTTPConnection {
             return
         }
         defer { limiter.release() }
-        await serve(transport, limits: limits, budget: budget, sleep: sleep, handler: handler)
+        await serve(transport, limits: limits, budget: budget, scheduler: scheduler, handler: handler)
     }
 
     /// Serves requests on `transport` until the peer closes, a request asks to close, or a limit is hit. A body over
     /// `budget.unreservedLimit` is read only once `budget` has room for it (no budget: every body is read at once);
     /// after waiting `limits.bodyIdleTimeout` for that, it is answered `503 body_budget_busy` (Retry-After: 1).
     /// Every response is sent within `limits.sendDeadline` of its size, or the connection is cancelled.
-    /// `sleep` waits out a timeout; tests pass a clock they advance by hand. `handler` owns the request: a closure
+    /// `scheduler` runs the deadlines; tests pass a clock they advance by hand. `handler` owns the request: a closure
     /// that passes it on should `consume` it, or the closure keeps the body alive until it returns.
     public static func serve(_ transport: some HTTPTransport, limits: HTTPConnectionLimits, budget: BodyBudget? = nil,
-                             sleep: @escaping @Sendable (Duration) async throws -> Void = { try await Task.sleep(for: $0) },
+                             scheduler: any DeadlineScheduler = DispatchDeadlineScheduler(),
                              handler: @Sendable (consuming HTTPRequest) async -> HTTPResponse) async
     {
         var reader = HTTPRequestReader(maxBody: limits.maxBody)
-        let timer = ConnectionTimer(transport, sleep: sleep)
+        let timer = ConnectionTimer(transport, scheduler: scheduler)
         defer {
             timer.stop()
             transport.cancel()
@@ -254,7 +254,8 @@ public enum HTTPConnection {
                         timer.stop()
                         if let budget {
                             do {
-                                reservation = try await budget.reserve(length, waitingAtMost: limits.bodyIdleTimeout, sleep: sleep)
+                                reservation = try await budget.reserve(length, waitingAtMost: limits.bodyIdleTimeout,
+                                                                         scheduler: scheduler)
                             } catch is BodyBudget.WaitTimedOut {
                                 _ = await send(retryLater(ServiceError(
                                     .unavailable, "body_budget_busy",
@@ -310,31 +311,49 @@ public enum HTTPConnection {
 }
 
 /// Cancels a connection when a deadline passes; `start` replaces the running deadline.
+///
+/// A deadline is a scheduled piece of work, not a task: the timer restarts on every received chunk and every send, and
+/// a Swift task per restart is costly and aborted the process in `swift_task_dealloc` on macOS 26. Each `start` and
+/// `stop` begins a new generation; a deadline whose work runs after it was replaced (its cancellation came too late)
+/// finds its generation stale and leaves the connection alone.
 final class ConnectionTimer: @unchecked Sendable {
     private let transport: any HTTPTransport
-    private let sleep: @Sendable (Duration) async throws -> Void
+    private let scheduler: any DeadlineScheduler
     private let lock = NSLock()
-    private var task: Task<Void, Never>?
+    private var generation = 0
+    private var deadline: (any ScheduledDeadline)?
 
-    init(_ transport: any HTTPTransport, sleep: @escaping @Sendable (Duration) async throws -> Void) {
+    init(_ transport: any HTTPTransport, scheduler: any DeadlineScheduler) {
         self.transport = transport
-        self.sleep = sleep
+        self.scheduler = scheduler
     }
 
     func start(_ timeout: Duration) {
-        lock.withLock {
-            task?.cancel()
-            task = Task { [transport, sleep] in
-                try? await sleep(timeout)
-                if !Task.isCancelled { transport.cancel() }
-            }
+        let current = lock.withLock { () -> Int in
+            generation += 1
+            return generation
         }
+        // Scheduled outside the lock: the scheduler takes its own lock, and the work takes this one.
+        let next = scheduler.schedule(after: timeout) { [weak self] in self?.expire(current) }
+        let superseded = lock.withLock { () -> (any ScheduledDeadline)? in
+            guard generation == current else { return next }  // a later start or stop came first
+            defer { deadline = next }
+            return deadline
+        }
+        superseded?.cancel()
     }
 
     func stop() {
-        lock.withLock {
-            task?.cancel()
-            task = nil
+        let superseded = lock.withLock { () -> (any ScheduledDeadline)? in
+            generation += 1
+            defer { deadline = nil }
+            return deadline
         }
+        superseded?.cancel()
+    }
+
+    private func expire(_ generation: Int) {
+        guard lock.withLock({ self.generation == generation }) else { return }
+        transport.cancel()
     }
 }
