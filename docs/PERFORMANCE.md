@@ -1,0 +1,125 @@
+# Performance and memory
+
+## Apple M4 (16 GB): ANEEmbed and the GPU runtimes
+
+Measured on 2026-11-15 on one Mac mini M4 (16 GB, macOS 27). Browsers and other heavy apps were closed, swap was under 4 GB at each start, and the 8192-token cases ran with the user logged out. Every runtime runs the official google/embeddinggemma-2 weights. The inputs are synthetic and public texts cut to exactly N tokens with the official tokenizer (prompt, `<bos>` and `<eos>` included), plus a 640×480 gradient PNG. Each cell is the warm median of 10 runs (3 for 8192 tokens). ANEEmbed and llama.cpp were measured as servers over loopback HTTP, client-side time including JSON. MLX and PyTorch have no embedding server here and were measured in process.
+
+Versions:
+- ANEEmbed: this repository, `--max-tokens 2048` (8192 for the 8192-token row).
+- llama.cpp: b12387 Metal, `ggml-org/embeddinggemma-2-GGUF` BF16 and Q8_0, `--pooling mean -ngl 99`.
+- MLX: 0.32.4 with mlx-vlm at the commit its model card names, `mlx-community/embeddinggemma-2-bf16` and `-8bit`.
+- PyTorch: 2.7.1 with sentence-transformers 6.3.0, `google/embeddinggemma-2`.
+
+| | ANEEmbed | llama.cpp BF16 | llama.cpp Q8_0 | MLX bf16 | MLX 8bit | PyTorch fp32 MPS | PyTorch bf16 MPS | PyTorch fp32 CPU |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| 32-token query | 7.0 ms | 14.3 ms | 14.1 ms | 17 ms | 15 ms | 59–72 ms | 76 ms | 47 ms |
+| 512 tokens | 34.8 ms | | | | | 116 ms | 167 ms | 327 ms |
+| 2048 tokens | 221 ms | 406 ms | | 396 ms | 416 ms | 616 ms | 598 ms | 1,575 ms |
+| 8192 tokens | 1.45 s | 2.94 s | 2.90 s | 3.54 s | 3.68 s | 6.6 s | swap guard | 13.9 s |
+| image (official 280-token layout) | 484 ms | 575 ms (≥ 280 tokens) | | 468 ms | – | 958 ms | 747 ms | 2,065 ms |
+| 10 × 32 tokens | 20 ms | 53 ms | | 41.6 ms | | 75 ms | 120 ms | 201 ms |
+| 10 × 2048 tokens | 2.20 s | 4.03 s | | 4.01 s | 4.14 s | 6.44 s (logged out) | 6.5 s | 15.5 s |
+| 8 clients × 256 queries | 412 req/s | 189 req/s | | – | – | – | – | – |
+| lowest / median text cosine vs fp32 | 0.99997 / 0.99998 | 0.999997 / 0.999998 | 0.99989 / 0.99992 | 0.99994 / 0.99996 | 0.99976 | 1 | | reference |
+
+- **Empty cells** were not measured in that configuration.
+- **"Swap guard"**: the run was stopped once swap grew 2 GB.
+- **Logged out**: the fp32 MPS 8192-token and 10 × 2048 cases completed only with the user logged out (process 13.4 / 13.1 GB); with apps open they ran out of memory.
+- **Images:** llama.cpp's default image budget is 134 tokens: 217 ms, but cosine 0.9963 to the official image vector. At `--image-min-tokens 280` it uses 304 tokens (575 ms, 0.99934). MLX bf16 encodes the image in 468 ms (in process, 270 tokens, PyTorch and torchvision added for its image processor; cosine not measured).
+
+Memory:
+
+| | ANEEmbed | llama.cpp | MLX | PyTorch MPS |
+|---|---|---|---|---|
+| process memory, idle after load | 140–270 MB | 0.8 GB (Q8_0) / 1.2 GB (BF16) | 5.1–5.7 GB held | 6.7 GB |
+| wired while idle | none: Neural Engine buffers (4.7 GB after start) are released 5–10 s after the last call | 2.1 GB (Q8_0) / 2.6 GB (BF16) of Metal buffers, wired through 120 s idle | none | none (Metal memory allocated, not wired) |
+| uses the GPU | no (0 bytes of Metal memory) | yes | yes | yes |
+
+**Start time:** llama.cpp is ready in 2–8 s and MLX in 3.5 s. ANEEmbed starts in 8.5 s with its Neural Engine compile cached. The first start after installing a new binary takes 2.5 minutes (6.5 more for `--max-tokens 8192`).
+
+**`--max-tokens 8192` on 16 GB:** at start the self-test wired 9.4 GB of Neural Engine buffers. They fell to 6.7 GB while running 8192-token texts and to 3.0 GB 30 s later. The process itself peaked at 2.0 GB.
+
+**Bulk images with queries alongside (ANEEmbed, M4).** Synthetic 12–24 MP JPEGs (2–4 MB each), 32 per run, sent to `aneembed serve`, while one client sends a short query every 100 ms:
+
+| image clients × images per request | images/s | query median | query p90 | query p99 |
+|---|---:|---:|---:|---:|
+| 1 × 1 | 1.19 | 5.7 ms | 374 ms | 448 ms |
+| 1 × 2 | 1.42 | 15.6 ms | 389 ms | 438 ms |
+| 1 × 4 | 1.46 | 15.4 ms | 292 ms | 425 ms |
+| 1 × 8 | 1.51 | 15.8 ms | 283 ms | 444 ms |
+| 2 × 4 | 1.56 | 6.7 ms | 698 ms | 805 ms |
+| 3 × 8 | 1.59 | 15.9 ms | 657 ms | 755 ms |
+
+Decoding a large JPEG on the CPU (about 1.8 s for 24 MP) dominates; more clients add 3–5 % throughput and about 2.5× the query tail. The server's footprint peaked at 484 MB.
+
+## M5 Max (64 GB, macOS 26.7)
+
+`aneembed bench`, in process: 32 tokens 3.2 ms; 512 tokens 26.2 ms; 1024 tokens 70.1 ms; 2048 tokens 167 ms; 4096 tokens 410 ms; 8192 tokens 1.16 s; 10 × 32 tokens 13.1 ms; one 640×480 image 383 ms; 8 clients 747 req/s. Every function passed its self-test on this macOS version's Neural Engine compiler. After 2 minutes idle the footprint was 186 MB, and wired memory was 72 MB above where it was before start.
+
+## M5 Ultra, per size
+
+`aneembed bench` measures this binary in process on an M5 Ultra, macOS 27.0.1 (requests go through the same router as `serve`; only the loopback round trip is missing): warm median of 10 runs (3 above 2048 tokens), texts of exactly N tokens including `<bos>`/`<eos>` and the document prompt. Memory is `phys_footprint` after the run and 150 s of idling (freed pages are reclaimed late); see [Memory](#memory) for what it does not include.
+
+| | M5 Ultra |
+|---|---:|
+| 32 tokens | 3.4 ms |
+| 128 tokens | 5.5 ms |
+| 512 tokens | 27.5 ms |
+| 768 / 769 tokens | 46.4 / 70.4 ms |
+| 1024 tokens | 71 ms |
+| 1280 / 1281 tokens | 94.0 / 114.5 ms |
+| 2048 tokens | 168 ms |
+| 2049 / 3072 tokens (`--max-tokens 8192`) | 281 / 287 ms |
+| 3073 / 4096 tokens | 422 / 424 ms |
+| 4097 / 6144 tokens | 769 / 759 ms |
+| 6145 / 8192 tokens | 1168 / 1187 ms |
+| 10 texts of 32 tokens, one request | 8.8 ms |
+| 10 texts of 2048 tokens, one request | 0.86 s |
+| one image (640 × 488, 266 soft tokens) | 378 ms |
+| 8 clients sending single queries | 1325 req/s, 5.9 ms median |
+| process memory at the default `--max-tokens 2048` | 221 MB |
+| process memory with `--max-tokens 8192` | 444 MB |
+
+A text runs in the smallest function that holds it, so latency steps at each function size, for example at 769 (`embed_1024`), 1281 (`winp1536`), 2049 (`winl3072`), 3073, 4097 and 6145 tokens, and stays flat in between. Measured per call (`bench --buckets`): `embed_64` … `embed_1280` 3.2 / 5.2 / 10.7 / 27.3 / 46.1 / 70.7 / 93.5 ms, `winp1536` / `winp2048` 115 / 171 ms, `winl3072` … `winl8192` 286 / 424 / 771 / 1169 ms. The M5 Ultra numbers were taken while another Neural Engine embedding service was running on the same machine.
+
+For the M4 see the comparison above. One request runs on one Neural Engine; the M5 Ultra has two, which helps concurrent and batched work.
+
+## `--max-tokens` trade-offs
+
+The default favours start time and memory; the model's limit is 8192 tokens. Functions above the limit are not loaded or compiled.
+
+| `--max-tokens` | 2048 (default) | 8192 |
+|---|---|---|
+| functions loaded | 12 (7 `embed_S`, 2 `winp`, 3 vision) | 16 (+ 4 `winl`) |
+| first install, compile included (M5 Ultra) | 242 s | + 383 s |
+| start with the compile cached, self-test included | 4.9 s | 9.1 s |
+| self-test at load | 1.1 s | 3.9 s |
+| process memory | 221 MB | 444 MB |
+| text latency | up to 171 ms (2048 tokens) | 2049–3072: 0.28 s, –4096: 0.42 s, –6144: 0.77 s, –8192: 1.19 s |
+
+Functions load four at a time: one by one, a cached start took 10.5 s instead of 4.9 s (default) and 17.5 s instead of 9.1 s (8192), but loading four at a time raises the brief peak of the process's memory during the start from 0.4 GB to 1.4 GB (`/usr/bin/time -l`, peak footprint) before it settles to the numbers above.
+
+## Memory
+
+Measured on an M5 Ultra with `footprint -w` and `vmmap`, macOS 27.0.1, `aneembed serve` with the release binary. An `aneembed` process has two kinds of memory.
+
+**Its own memory** (`phys_footprint`, what Activity Monitor shows): at the default `--max-tokens 2048`, 155–166 MB idle and 267–383 MB five seconds after a mix of 200 requests (221 MB in `bench` after 150 s); with `--max-tokens 8192`, 210–243 MB idle and 283–599 MB after the mix (444 MB in `bench`). It is malloc memory (190–240 MB after the mix at the default settings), the Core ML input/output surfaces (`IOSurface`, 62 MB / 147 MB) and memory-mapped files, mostly the 256 MB token table, of which 9–31 MB was resident, all clean. All of it is pageable: with `memory_pressure -p 12` pushing the system to 12 % available memory, 292 of the process's 294 MB of dirty memory, the IOSurfaces included, was compressed or swapped out; once the pressure was gone, the first requests took 47 / 62 / 143 ms (query / 500 / 1500 tokens; 5 / 47 / 117 ms before), then warm again. Starting needs more for a moment: loading peaks at about 1.4 GB, which falls back within one to two minutes.
+
+**The Neural Engine's buffers.** Core ML gives each loaded function working memory for the Neural Engine. It is owned by the process but not part of its footprint (`footprint` lists it as `Owned physical footprint (unmapped) (neural)`): 5.25 GB at the default settings (12 functions), 13.3 GB with `--max-tokens 8192` (16 functions). It is **wired only while it is used**:
+
+| | default (2048) | `--max-tokens 8192` |
+|---|---:|---:|
+| right after start (the self-test runs every function), for about 60 s | 5.25 GB wired |
+| idle | 0 wired (5.25 GB purgeable) |
+| during and about 10 s after a short query | 266 MB wired |
+| … a 1617-token text | 579 MB wired |
+| … a 6631-token text | |
+| 5 s after a mix of 200 requests (queries, 500/1500-token texts, images; 8192 also 8100-token texts) | 3.1 GB wired |
+
+Idle buffers are purgeable: under the same memory pressure the OS discarded 1.6 GB of them (5.25 → 3.65 GB) without any error, and the next calls recreated them. That has a cost: the first request after the buffers were unwired or discarded took 19–139 ms for a short query (3–5 ms warm) and 0.12–0.14 s more for a 6631-token text. Under steady load the buffers of the functions in use stay wired; the "mix" row, taken 5 s after the last request, shows the scale.
+
+**Request bodies** share one budget across all HTTP connections: one body of `--max-body` (72 MiB by default). A body over 1 MiB (an image upload) reserves its `Content-Length` once its head has arrived and before any of it is read, and waits, first come first served, while the budget is spent. Meanwhile its connection does not read, so TCP flow control slows the client. The wait is bounded by the body idle timeout (60 s): a body still waiting then is answered `503 body_budget_busy` with `Retry-After: 1` and the connection is closed, so connections cannot pile up behind a body that is held for long. A body is freed, returning its share, as soon as it is no longer needed: for `/v1/embeddings` once the request is parsed and its images decoded, for the other routes after the handler. Bodies up to 1 MiB, which covers a single text of up to 8192 tokens (8192 tokens of text is well under 100 KB), never wait; `--max-connections` bounds them (64 MiB at the defaults). Buffered request bodies therefore take at most 72 + 64 MiB at the defaults, instead of 64 × 72 MiB (4.5 GiB).
+
+**Image decoding** is transient malloc memory, up to the 40 megapixel limit. A JPEG goes from the decoder to the resize row by row, so the full-size image never exists. Measured as the peak footprint `ImagePrep.prepare` adds (`jpeg-fuzz --peak`, M4, macOS 27, synthetic photo-like images): a sequential (baseline) JPEG, decoded one MCU row at a time, adds 3–4 MiB at 12, 24 and 40 MP, with 4:4:4 or 4:2:0 chroma, as this does not grow with the image height. A progressive JPEG needs all of its DCT coefficients (2 bytes per sample) before any pixel: 232 MiB at 40 MP with 4:4:4 chroma, 118 MiB with 4:2:0. A 48 MP JPEG (8064 × 6048, over the limit and refused) would take about 4 MiB sequential and 282 / 143 MiB progressive. Other formats go through ImageIO, which decodes the whole image: a 40 MP PNG peaks at 306 MiB. A file of a few hundred bytes can declare 40 MP, so plan for about 310 MiB per concurrent decode: `--image-concurrency` (default 2) bounds them. CI fails if a 40 MP 4:4:4 JPEG adds more than 16 MiB (baseline) or 256 MiB (progressive).
+
+For comparison, a Metal (GPU) LLM server running on the same Mac had 168 GB of `IOAccelerator (graphics)` memory, all of it wired, at the time of the measurement.
