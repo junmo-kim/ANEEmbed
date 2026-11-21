@@ -36,6 +36,21 @@ jobs:
       - name: Test
         run: swift test
 
+      # A test process that aborts (e.g. a Swift runtime check) prints little; macOS writes a crash report a few
+      # seconds later.
+      - name: Wait for crash reports
+        if: failure()
+        run: sleep 20
+
+      - name: Upload test crash reports
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: test-crash-reports-${{ github.job }}
+          path: ~/Library/Logs/DiagnosticReports/*.ips
+          if-no-files-found: ignore
+          retention-days: 7
+
       # Deterministic mutation fuzzing of the JPEG decoder (Sources/jpeg-fuzz, built above but not released).
       # A decoder trap kills the tool, which fails the step; the crashing input is kept as an artifact.
       - name: JPEG decoder fuzz (20k iterations)
@@ -151,3 +166,17 @@ jobs:
         run: swift build -c release
       - name: Test
         run: swift test
+
+      # A test process that aborts (e.g. a Swift runtime check) prints little; macOS writes a crash report.
+      - name: Wait for crash reports
+        if: failure()
+        run: sleep 20
+
+      - name: Upload test crash reports
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: test-crash-reports-${{ github.job }}
+          path: ~/Library/Logs/DiagnosticReports/*.ips
+          if-no-files-found: ignore
+          retention-days: 7
